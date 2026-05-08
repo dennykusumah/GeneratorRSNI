@@ -76,7 +76,7 @@ from engine9 import CustomDictionary, ItalicDictionary, DocxFinalTranslatorEngin
 
 # --- KONFIGURASI HALAMAN ---
 st.set_page_config(
-    page_title="ISO Doc Master",
+    page_title="Generator RSNI",
     page_icon="📑",
     layout="centered",
     initial_sidebar_state="collapsed"
