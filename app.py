@@ -258,6 +258,20 @@ section[data-testid="stFileUploaderDropzone"] p,
 section[data-testid="stFileUploaderDropzone"] span {
     color: rgba(255,255,255,0.5) !important;
 }
+section[data-testid="stFileUploaderDropzone"] button {
+    background: rgba(255,255,255,0.92) !important;
+    color: #000000 !important;
+    border: none !important;
+    font-weight: 600 !important;
+    border-radius: 8px !important;
+}
+section[data-testid="stFileUploaderDropzone"] button:hover {
+    background: #ffffff !important;
+    color: #000000 !important;
+}
+section[data-testid="stFileUploaderDropzone"] button span {
+    color: #000000 !important;
+}
 div[data-testid="stFileUploaderFile"] {
     background: rgba(99,102,241,0.1) !important;
     border: 1px solid rgba(99,102,241,0.3) !important;
@@ -836,12 +850,15 @@ if st.session_state.get('_run_process') and st.session_state.get('_target_file')
     time_placeholder = st.empty()
     # ────────────────────────────────────────────────────────────────────────
 
-    # Helper Update UI — TIDAK menyentuh timer iframe, hanya status & progress
+    # Helper Update UI — status kiri, persen kanan, sejajar di atas progress bar
     def update_ui(pct, msg):
         status_placeholder.markdown(
-            f'<div style="font-size:0.85rem; color:rgba(165,180,252,0.85); '
-            f'font-family:\'Outfit\',sans-serif; font-weight:500; margin-bottom:0.3rem;">'
-            f'⚡ {msg}</div>',
+            f"<div style='display:flex;justify-content:space-between;align-items:center;"
+            f"font-family:Outfit,sans-serif;font-weight:500;margin-bottom:0.3rem;'>"
+            f"<span style='font-size:.85rem;color:rgba(165,180,252,.9);'>&#x26A1; {msg}</span>"
+            f"<span style='font-size:.85rem;font-family:JetBrains Mono,monospace;"
+            f"font-weight:700;color:rgba(110,231,183,.95);'>{pct}%</span>"
+            f"</div>",
             unsafe_allow_html=True
         )
         progress_bar.progress(pct)
