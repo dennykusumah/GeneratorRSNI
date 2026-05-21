@@ -1065,6 +1065,9 @@ class DocxFinalTranslatorEngine:
 
             total = len(items); done = 0; past_bibliography = False
             annex_counter = 0; italic_count = 0; link_count = 0
+            # Statistik detail untuk callback
+            _stat_trans = 0; _stat_skip = 0; _stat_tbl = 0
+            _stat_cover = 0; _stat_annex = 0
 
             for kind, obj, in_cover in items:
                 done += 1; pct = 5 + int(done / max(total, 1) * 60)
@@ -1072,21 +1075,52 @@ class DocxFinalTranslatorEngine:
                     para = obj; is_bib = _is_biblio_title_para(para)
                     is_annex = _get_para_style_id(para) in _ANNEX_STYLE_IDS
                     hl_cnt = 1 if _has_hyperlinks(para) else 0
+                    para_text = para.text.strip()
+                    preview = (para_text[:55] + "…") if len(para_text) > 55 else para_text
 
                     if in_cover and _all_runs_italic(para):
-                        _notify(progress_callback, pct, "[Cover-italic] skip")
+                        _stat_cover += 1
+                        _notify(progress_callback, pct,
+                            f"[cover-italic] skip\t{done}/{total}\t{_stat_trans}\t{_stat_skip}\t{_stat_tbl}\t{preview}")
                     elif is_bib:
                         italic_count += len(_translate_para(para, tr))
                         past_bibliography = True
+                        _stat_trans += 1
+                        _notify(progress_callback, pct,
+                            f"[bibliografi] translate\t{done}/{total}\t{_stat_trans}\t{_stat_skip}\t{_stat_tbl}\t{preview}")
                     elif is_annex and not past_bibliography:
                         _translate_para(para, tr)
                         _fix_annex_style_para(para, chr(ord('A') + annex_counter))
                         annex_counter += 1
-                    elif not _skip_paragraph(para, past_bibliography):
-                        italic_count += len(_translate_para(para, tr))
+                        _stat_annex += 1
+                        _notify(progress_callback, pct,
+                            f"[annex] translate\t{done}/{total}\t{_stat_trans}\t{_stat_skip}\t{_stat_tbl}\t{preview}")
+                    elif _skip_paragraph(para, past_bibliography):
+                        _stat_skip += 1
+                        style_name = (para.style.name or "").lower()
+                        if any(s in style_name for s in ['heading', 'toc', 'header', 'footer']):
+                            reason = style_name.split()[0] if style_name else "style"
+                        elif not para_text:
+                            reason = "kosong"
+                        else:
+                            reason = "skip"
+                        _notify(progress_callback, pct,
+                            f"[{reason}] skip\t{done}/{total}\t{_stat_trans}\t{_stat_skip}\t{_stat_tbl}\t{preview}")
+                    else:
+                        il = len(_translate_para(para, tr))
+                        italic_count += il
                         link_count += hl_cnt
+                        _stat_trans += 1
+                        italic_tag = f" +{il}miring" if il else ""
+                        link_tag = f" +link" if hl_cnt else ""
+                        _notify(progress_callback, pct,
+                            f"[translate{italic_tag}{link_tag}] done\t{done}/{total}\t{_stat_trans}\t{_stat_skip}\t{_stat_tbl}\t{preview}")
                 elif kind == 'table':
-                    if not past_bibliography: _translate_table(obj, tr)
+                    if not past_bibliography:
+                        _translate_table(obj, tr)
+                        _stat_tbl += 1
+                        _notify(progress_callback, pct,
+                            f"[tabel] done\t{done}/{total}\t{_stat_trans}\t{_stat_skip}\t{_stat_tbl}\t-")
 
             _notify(progress_callback, 66, "Em-dash bullets...")
             _convert_emdash_to_bullets(doc)
