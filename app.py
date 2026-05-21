@@ -839,9 +839,12 @@ if st.session_state.get('_run_process') and st.session_state.get('_target_file')
     # Helper Update UI — TIDAK menyentuh timer iframe, hanya status & progress
     def update_ui(pct, msg):
         status_placeholder.markdown(
-            f'<div style="font-size:0.85rem; color:rgba(165,180,252,0.85); '
+            f'<div style="display:flex; justify-content:space-between; align-items:center; '
             f'font-family:\'Outfit\',sans-serif; font-weight:500; margin-bottom:0.3rem;">'
-            f'⚡ {msg}</div>',
+            f'<span style="font-size:0.85rem; color:rgba(165,180,252,0.85);">⚡ {msg}</span>'
+            f'<span style="font-size:0.85rem; color:rgba(110,231,183,0.9); '
+            f'font-family:\'JetBrains Mono\',monospace; font-weight:600;">{pct}%</span>'
+            f'</div>',
             unsafe_allow_html=True
         )
         progress_bar.progress(pct)
