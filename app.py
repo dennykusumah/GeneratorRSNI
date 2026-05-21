@@ -1019,12 +1019,12 @@ if st.session_state.get('_run_process') and st.session_state.get('_target_file')
                 done_str  = frac.split('/')[0] if '/' in frac else frac
 
                 # ── Progress proporsional terhadap elemen done/total ──────────
-                # Rentang 10–99%; 100% hanya saat ok_tr=True (selesai sempurna)
+                # Rentang 10–100% proporsional terhadap elemen done/total
                 if total_ref > 0:
                     elem_ratio = min(done_int / total_ref, 1.0)
-                    final_pct  = 10 + int(elem_ratio * 89)   # 10 → 99
+                    final_pct  = 10 + int(elem_ratio * 90)   # 10 → 100
                 else:
-                    final_pct  = 10 + int(pct * 0.89)        # fallback ke pct engine9
+                    final_pct  = 10 + int(pct * 0.90)        # fallback ke pct engine9
 
                 icon = _ICON.get(tag, _ICON.get(aksi, '🔄'))
 
@@ -1045,7 +1045,7 @@ if st.session_state.get('_run_process') and st.session_state.get('_target_file')
 
             else:
                 # Pesan lama / non-tab (init, selesai, dll)
-                final_pct = 10 + int(pct * 0.89)
+                final_pct = 10 + int(pct * 0.90)
                 line1 = f"[6/6] Translate"
                 line2 = f"🔄 {msg[:100]}"
 
