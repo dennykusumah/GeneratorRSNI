@@ -792,62 +792,155 @@ if st.session_state.get('_run_process') and st.session_state.get('_target_file')
     doc_title_val = st.session_state['_doc_title']
     src_lang_val = st.session_state['_src_lang']
     
-    # UI Progress — 3 elemen terpisah agar tidak saling tumpuk
-    status_placeholder = st.empty()
-    progress_bar = st.progress(0)
+    # ── UI Progress: satu iframe berisi timer + progress bar + persen ──────
     start_time = time.time()
 
-    # ── Live Timer: iframe via components.html agar <script> benar-benar jalan
-    _TIMER_HTML = """
-    <style>
-      #sni-timer-wrap {
-        font-family: 'JetBrains Mono', monospace;
-        font-size: 0.82rem;
-        color: rgba(110,231,183,0.85);
-        text-align: center;
-        letter-spacing: 1px;
-        margin: 0;
-        padding: 0;
-        background: transparent;
-      }
-    </style>
-    <div id="sni-timer-wrap">
-      &#x23F1; <span id="sni-timer">0 detik</span>
-    </div>
-    <script>
-      var start = Date.now();
-      setInterval(function(){
-        var sec = Math.floor((Date.now() - start) / 1000);
-        var el = document.getElementById('sni-timer');
-        if (!el) return;
-        if (sec < 60) {
-          el.textContent = sec + ' detik';
-        } else {
-          var m = Math.floor(sec / 60);
-          var s = sec % 60;
-          el.textContent = m + ' menit ' + s + ' detik';
-        }
-      }, 1000);
-    </script>
-    """
-    # components.html() render ke iframe — script PASTI jalan, tidak disanitasi
-    _components.html(_TIMER_HTML, height=36)
-    # time_placeholder dipakai hanya untuk waktu final statis setelah selesai
-    time_placeholder = st.empty()
-    # ────────────────────────────────────────────────────────────────────────
+    _PROGRESS_IFRAME_HTML = \"\"\"<!DOCTYPE html>
+<html>
+<head>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body { background:transparent; font-family:'Outfit',sans-serif; padding:4px 2px; }
 
-    # Helper Update UI — TIDAK menyentuh timer iframe, hanya status & progress
+  #row-status {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 6px;
+  }
+  #msg {
+    font-size: 0.85rem;
+    color: rgba(165,180,252,0.9);
+    font-weight: 500;
+  }
+  #pct {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.85rem;
+    font-weight: 700;
+    color: rgba(110,231,183,0.95);
+  }
+
+  #bar-track {
+    width: 100%;
+    height: 6px;
+    background: rgba(255,255,255,0.1);
+    border-radius: 999px;
+    overflow: hidden;
+    margin-bottom: 6px;
+  }
+  #bar-fill {
+    height: 100%;
+    width: 0%;
+    background: linear-gradient(90deg, #6366f1, #818cf8);
+    border-radius: 999px;
+    transition: width 0.8s cubic-bezier(0.4,0,0.2,1);
+  }
+
+  #timer-row {
+    text-align: center;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.80rem;
+    color: rgba(110,231,183,0.75);
+    letter-spacing: 1px;
+  }
+</style>
+</head>
+<body>
+  <div id="row-status">
+    <span id="msg">⚡ Memulai...</span>
+    <span id="pct">0%</span>
+  </div>
+  <div id="bar-track"><div id="bar-fill"></div></div>
+  <div id="timer-row">&#x23F1; <span id="sni-timer">0 detik</span></div>
+
+  <script>
+    // ── Timer ──────────────────────────────────────────────────────────────
+    var startTs = Date.now();
+    var timerEl = document.getElementById('sni-timer');
+    var timerDone = false;
+
+    setInterval(function(){
+      if (timerDone) return;
+      var sec = Math.floor((Date.now() - startTs) / 1000);
+      if (sec < 60) {
+        timerEl.textContent = sec + ' detik';
+      } else {
+        var m = Math.floor(sec / 60);
+        var s = sec % 60;
+        timerEl.textContent = m + ' menit ' + s + ' detik';
+      }
+    }, 1000);
+
+    // ── Animasi progress bar palsu antara checkpoint ───────────────────────
+    // Saat Python kirim checkpoint (misal 5%→20%), bar meluncur smooth ke target.
+    // Di antara checkpoint, bar "merangkak" pelan agar terasa hidup.
+    var currentPct  = 0;
+    var targetPct   = 0;
+    var crawlTimer  = null;
+
+    function setTarget(pct) {
+      targetPct = pct;
+      document.getElementById('bar-fill').style.width = pct + '%';
+      document.getElementById('pct').textContent = pct + '%';
+      // Aktifkan crawl ringan setelah CSS transition selesai (~0.9s)
+      clearTimeout(crawlTimer);
+      crawlTimer = setTimeout(startCrawl, 950);
+    }
+
+    function startCrawl() {
+      // Merangkak max 2% di atas target, berhenti di 99%
+      var ceiling = Math.min(targetPct + 2, 99);
+      var displayed = parseFloat(document.getElementById('bar-fill').style.width) || targetPct;
+      if (displayed >= ceiling) return;
+      var next = Math.min(displayed + 0.4, ceiling);
+      document.getElementById('bar-fill').style.width = next + '%';
+      // Persen hanya tampilkan integer
+      document.getElementById('pct').textContent = Math.round(next) + '%';
+      crawlTimer = setTimeout(startCrawl, 400);
+    }
+
+    // ── Terima update dari Python via postMessage ──────────────────────────
+    window.addEventListener('message', function(e){
+      var d = e.data;
+      if (!d) return;
+      if (d.type === 'progress') {
+        setTarget(d.pct);
+        document.getElementById('msg').textContent = '\\u26A1 ' + d.msg;
+      } else if (d.type === 'done') {
+        clearTimeout(crawlTimer);
+        document.getElementById('bar-fill').style.width = '100%';
+        document.getElementById('pct').textContent = '100%';
+        document.getElementById('msg').textContent = '\\u2705 Selesai!';
+        timerDone = true;
+        timerEl.textContent = d.elapsed;
+        document.getElementById('timer-row').style.color = 'rgba(110,231,183,1)';
+      }
+    });
+  </script>
+</body>
+</html>
+\"\"\"
+
+    # Render iframe — timer + progress bar + persen, semua animasi jalan di browser
+    _components.html(_PROGRESS_IFRAME_HTML, height=80)
+    # st.progress native untuk garis biru di bawah iframe (bisa diupdate tiap checkpoint)
+    progress_bar = st.progress(0)
+    # status & persen diupdate via markdown sejajar di bawah garis biru
+    status_placeholder = st.empty()
+    time_placeholder   = st.empty()
+
+    # Helper Update UI
     def update_ui(pct, msg):
+        progress_bar.progress(pct)
         status_placeholder.markdown(
-            f'<div style="display:flex; justify-content:space-between; align-items:center; '
-            f'font-family:\'Outfit\',sans-serif; font-weight:500; margin-bottom:0.3rem;">'
-            f'<span style="font-size:0.85rem; color:rgba(165,180,252,0.85);">⚡ {msg}</span>'
-            f'<span style="font-size:0.85rem; color:rgba(110,231,183,0.9); '
-            f'font-family:\'JetBrains Mono\',monospace; font-weight:600;">{pct}%</span>'
+            f'<div style="display:flex;justify-content:space-between;align-items:center;'
+            f'font-family:\'Outfit\',sans-serif;font-weight:500;margin-top:4px;">'
+            f'<span style="font-size:0.85rem;color:rgba(165,180,252,0.9);">⚡ {msg}</span>'
+            f'<span style="font-size:0.85rem;font-family:\'JetBrains Mono\',monospace;'
+            f'font-weight:700;color:rgba(110,231,183,0.95);">{pct}%</span>'
             f'</div>',
             unsafe_allow_html=True
         )
-        progress_bar.progress(pct)
 
     # Pipeline Optimasi
     def run_optimization(input_file, doc_title):
@@ -912,7 +1005,6 @@ if st.session_state.get('_run_process') and st.session_state.get('_target_file')
         if ok_tr:
             update_ui(100, "✅ Selesai!")
             final_elapsed = get_elapsed_str(start_time)
-            # Ganti JS timer dengan waktu final statis (berhenti otomatis)
             time_placeholder.markdown(
                 f'<div class="timer-text">⏱ {final_elapsed}</div>',
                 unsafe_allow_html=True
@@ -920,7 +1012,6 @@ if st.session_state.get('_run_process') and st.session_state.get('_target_file')
             st.session_state['_final_tr_file'] = tr_out
             st.session_state['_final_time'] = final_elapsed
             st.session_state['_show_results'] = True
-            # Parse dokumen langsung agar chat langsung siap setelah rerun
             st.session_state['_doc_sections'] = _parse_doc_structure(tr_out)
         else:
             raise Exception("Terjemahan gagal.")
