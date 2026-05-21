@@ -258,29 +258,6 @@ section[data-testid="stFileUploaderDropzone"] p,
 section[data-testid="stFileUploaderDropzone"] span {
     color: rgba(255,255,255,0.5) !important;
 }
-
-/* ── Tombol Browse files ── */
-section[data-testid="stFileUploaderDropzone"] button[data-testid="baseButton-secondary"],
-section[data-testid="stFileUploaderDropzone"] button,
-div[data-testid="stFileUploader"] button {
-    background: rgba(99,102,241,0.12) !important;
-    border: 1.5px solid rgba(99,102,241,0.35) !important;
-    color: rgba(165,180,252,0.85) !important;
-    border-radius: 10px !important;
-    font-size: 0.82rem !important;
-    font-weight: 600 !important;
-    font-family: 'Outfit', sans-serif !important;
-    box-shadow: none !important;
-    transition: all 0.2s ease !important;
-    padding: 0.4rem 1rem !important;
-}
-section[data-testid="stFileUploaderDropzone"] button:hover,
-div[data-testid="stFileUploader"] button:hover {
-    background: rgba(99,102,241,0.22) !important;
-    border-color: rgba(99,102,241,0.6) !important;
-    color: #c7d2fe !important;
-}
-
 div[data-testid="stFileUploaderFile"] {
     background: rgba(99,102,241,0.1) !important;
     border: 1px solid rgba(99,102,241,0.3) !important;
@@ -565,10 +542,6 @@ hr {
 @keyframes pulse-green {
     0%, 100% { opacity: 1; transform: scale(1); }
     50% { opacity: 0.5; transform: scale(1.35); }
-}
-@keyframes pulse-dot {
-    0%, 100% { opacity: 1; transform: scale(1); }
-    50% { opacity: 0.4; transform: scale(1.5); }
 }
 
 /* ══════════════════════════════════════════
@@ -863,66 +836,35 @@ if st.session_state.get('_run_process') and st.session_state.get('_target_file')
     time_placeholder = st.empty()
     # ────────────────────────────────────────────────────────────────────────
 
-    # Helper Update UI — single-line status yang berubah in-place, tidak bertambah baris
+    # Helper Update UI — TIDAK menyentuh timer iframe, hanya status & progress
     def update_ui(pct, msg):
-        # Tentukan warna dot berdasarkan persentase
+        parts = msg.split("\n", 1)
+        line1 = parts[0].strip()
+        line2 = parts[1].strip() if len(parts) > 1 else ""
         if pct >= 100:
-            dot_color = "#10b981"
-            dot_shadow = "rgba(16,185,129,0.8)"
-            icon = "✅"
+            dot_color, dot_glow, anim = "#10b981", "rgba(16,185,129,0.9)", ""
         elif pct >= 75:
-            dot_color = "#6366f1"
-            dot_shadow = "rgba(99,102,241,0.8)"
-            icon = "⚡"
+            dot_color, dot_glow, anim = "#6366f1", "rgba(99,102,241,0.9)", "animation:_pd 0.9s infinite;"
         elif pct >= 50:
-            dot_color = "#818cf8"
-            dot_shadow = "rgba(129,140,248,0.7)"
-            icon = "⚡"
+            dot_color, dot_glow, anim = "#818cf8", "rgba(129,140,248,0.8)", "animation:_pd 1s infinite;"
         else:
-            dot_color = "#a5b4fc"
-            dot_shadow = "rgba(165,180,252,0.6)"
-            icon = "⚡"
-
+            dot_color, dot_glow, anim = "#a5b4fc", "rgba(165,180,252,0.7)", "animation:_pd 1.1s infinite;"
+        detail_html = (
+            f'<div style="font-size:0.78rem;color:rgba(199,210,254,0.72);margin-top:0.22rem;'
+            f'white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-style:italic;">{line2}</div>'
+        ) if line2 else ""
         status_placeholder.markdown(
-            f'''<div style="
-                display:flex; align-items:center; gap:0.55rem;
-                background:rgba(15,23,42,0.55);
-                border:1px solid rgba(99,102,241,0.2);
-                border-radius:10px;
-                padding:0.55rem 0.9rem;
-                font-family:\'Outfit\',sans-serif;
-                font-size:0.85rem;
-                font-weight:500;
-                color:rgba(165,180,252,0.9);
-                line-height:1.3;
-                margin-bottom:0.3rem;
-                min-height:2.4rem;
-            ">
-                <span style="
-                    display:inline-block;
-                    width:8px; height:8px;
-                    border-radius:50%;
-                    background:{dot_color};
-                    box-shadow:0 0 7px {dot_shadow};
-                    flex-shrink:0;
-                    {"animation:pulse-dot 1s infinite;" if pct < 100 else ""}
-                "></span>
-                <span style="overflow:hidden; white-space:nowrap; text-overflow:ellipsis; flex:1;">
-                    {icon} {msg}
-                </span>
-                <span style="
-                    font-family:\'JetBrains Mono\',monospace;
-                    font-size:0.75rem;
-                    color:rgba(110,231,183,0.65);
-                    flex-shrink:0;
-                ">{pct}%</span>
-            </div>
-            <style>
-            @keyframes pulse-dot {{
-                0%,100% {{ opacity:1; transform:scale(1); }}
-                50% {{ opacity:0.45; transform:scale(1.4); }}
-            }}
-            </style>''',
+            f'<div style="background:rgba(15,23,42,0.6);border:1px solid rgba(99,102,241,0.22);'
+            f'border-radius:10px;padding:0.5rem 0.9rem;font-family:\'Outfit\',sans-serif;margin-bottom:0.3rem;">'
+            f'<div style="display:flex;align-items:center;gap:0.5rem;">'
+            f'<span style="display:inline-block;width:8px;height:8px;border-radius:50%;flex-shrink:0;'
+            f'background:{dot_color};box-shadow:0 0 7px {dot_glow};{anim}"></span>'
+            f'<span style="font-size:0.85rem;font-weight:600;color:rgba(165,180,252,0.92);'
+            f'flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">{line1}</span>'
+            f'<span style="font-family:\'JetBrains Mono\',monospace;font-size:0.75rem;'
+            f'color:rgba(110,231,183,0.65);flex-shrink:0;">{pct}%</span>'
+            f'</div>{detail_html}</div>'
+            f'<style>@keyframes _pd{{0%,100%{{opacity:1;transform:scale(1);}}50%{{opacity:.3;transform:scale(1.6);}}}}</style>',
             unsafe_allow_html=True
         )
         progress_bar.progress(pct)
@@ -1008,16 +950,75 @@ if st.session_state.get('_run_process') and st.session_state.get('_target_file')
 
         _engine9 = DocxFinalTranslatorEngine(source_lang=src_lang_val, target_lang='id', custom_dict=st.session_state.get('custom_dict'))
 
+        # ── Callback: parse format baru engine9, throttle ≤1x/detik ─────────
+        # Format pesan dari engine9:
+        #   "[tag] aksi\tdone/total\tn_trans\tn_skip\tn_tbl\tpreview"
+        _cb_t0      = [time.time()]   # waktu update terakhir
+        _cb_total   = [0]             # total item (diisi dari pesan pertama)
+
+        _ICON = {
+            'translate': '✏️', 'done': '✏️',
+            'skip': '⏭', 'kosong': '⏭', 'cover-italic': '⏭',
+            'heading': '⏭', 'toc': '⏭', 'header': '⏭', 'footer': '⏭',
+            'tabel': '📊', 'annex': '📎', 'bibliografi': '📚',
+        }
+
         def _cb_tr(pct, msg):
-            # Teruskan semua pesan detail langsung dari engine9 tanpa prefix
             final_pct = 75 + int(pct * 0.25)
-            # Beri konteks step untuk pesan awal
-            if pct <= 5:
-                update_ui(final_pct, f"[6/6] Translate — {msg}")
-            elif pct >= 95:
-                update_ui(final_pct, f"[6/6] Translate — Finalisasi dokumen terjemahan...")
+
+            # ── Parse format tab-separated dari engine9 ──────────────────────
+            parts = msg.split('\t')
+            if len(parts) >= 6:
+                tag_aksi  = parts[0].strip()          # "[cover-italic] skip"
+                frac      = parts[1].strip()          # "42/850"
+                n_trans   = parts[2].strip()          # "12"
+                n_skip    = parts[3].strip()          # "28"
+                n_tbl     = parts[4].strip()          # "3"
+                preview   = parts[5].strip()          # cuplikan teks
+
+                # Ambil tag dalam kurung siku
+                m_tag = re.match(r'\[([^\]]+)\]', tag_aksi)
+                tag   = m_tag.group(1) if m_tag else "?"
+                aksi  = tag_aksi[m_tag.end():].strip() if m_tag else tag_aksi
+
+                # Isi total sekali
+                if _cb_total[0] == 0 and '/' in frac:
+                    try: _cb_total[0] = int(frac.split('/')[1])
+                    except: pass
+                total_str = f"/{_cb_total[0]}" if _cb_total[0] else ""
+
+                done_str  = frac.split('/')[0] if '/' in frac else frac
+                icon      = _ICON.get(tag, _ICON.get(aksi, '🔄'))
+
+                # Baris atas: statistik ringkas
+                stat_parts = []
+                if n_trans and n_trans != '0': stat_parts.append(f"✏️ {n_trans} terjemah")
+                if n_skip  and n_skip  != '0': stat_parts.append(f"⏭ {n_skip} skip")
+                if n_tbl   and n_tbl   != '0': stat_parts.append(f"📊 {n_tbl} tabel")
+                stat_str = "  ·  ".join(stat_parts) if stat_parts else "memulai..."
+
+                line1 = f"[6/6] Translate  ·  elemen {done_str}{total_str}  ·  {stat_str}"
+
+                # Baris bawah: aksi + preview teks saat ini
+                if preview and preview != '-':
+                    line2 = f"{icon} [{tag}] {aksi}  —  \"{preview}\""
+                else:
+                    line2 = f"{icon} [{tag}] {aksi}"
+
             else:
-                update_ui(final_pct, f"[6/6] Translate — {msg}")
+                # Pesan lama / non-tab (init, selesai, dll)
+                line1 = f"[6/6] Translate"
+                line2 = f"🔄 {msg[:100]}"
+
+            # Throttle: max 1x per detik, kecuali pct ≤5 atau ≥96
+            now = time.time()
+            penting = (pct <= 5 or pct >= 96)
+            if not penting and (now - _cb_t0[0]) < 1.0:
+                return
+            _cb_t0[0] = now
+
+            update_ui(final_pct, f"{line1}\n{line2}")
+        # ─────────────────────────────────────────────────────────────────────
 
         ok_tr, _ = _engine9.translate(input_docx=final_opt_file, output_docx=tr_out, progress_callback=_cb_tr, translate_headers=False)
         
