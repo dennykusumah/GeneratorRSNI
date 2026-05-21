@@ -911,64 +911,62 @@ if st.session_state.get('_run_process') and st.session_state.get('_target_file')
             _total_para, _total_tbl = 0, 0
         _doc_info = f"{_total_para} paragraf, {_total_tbl} tabel"
 
+        # Engine 1–5 berbagi 0–10% total progress
+        # E2=1-2, E4=3-4, E5=5-6, E6=7-8, E7=9-10
+
         # 1. Engine 2 — Format Dasar
-        update_ui(5,  f"[1/6] Memuat dokumen... ({_doc_info})")
+        update_ui(1, f"[1/5] Memuat & format dokumen... ({_doc_info})")
         output_file = f"opt_{os.path.basename(input_file)}"
-        update_ui(7,  f"[1/6] Menyetel font & ukuran teks...")
         success, msg = engine2.process(input_file, output_file, ISO_FONT_NAME, ISO_FONT_SIZE, enable_headers=True, doc_title=doc_title, copyright_text=copyright_text)
         if not success: raise Exception(f"Engine 2: {msg}")
-        update_ui(12, f"[1/6] Format dasar selesai ✓ ({_doc_info})")
+        update_ui(2, f"[1/5] Format dasar selesai ✓ ({_doc_info})")
         final_file = output_file
         auto_title_id, auto_title_en = extract_titles_from_docx(output_file)
         _title_info = auto_title_id[:30] + "..." if auto_title_id and len(auto_title_id) > 30 else (auto_title_id or "-")
 
         # 2. Engine 4 — Cover
-        update_ui(20, f"[2/6] Membuat halaman cover...")
+        update_ui(3, f"[2/5] Membuat cover: {cover_settings['sni_number']}")
         cover_out = f"cover_{os.path.basename(final_file)}"
-        update_ui(22, f"[2/6] Menyusun cover: {cover_settings['sni_number']}")
         ok4 = engine4.prepend_cover(input_docx=final_file, output_docx=cover_out, sni_number=cover_settings["sni_number"], bsn_year=cover_settings["bsn_year"], title_id=auto_title_id, title_en=auto_title_en, ref_standard=cover_settings["ref_standard"], ics_number=cover_settings["ics_number"])[0]
         if ok4:
             final_file = cover_out
-            update_ui(28, f"[2/6] Cover selesai ✓ — judul: {_title_info}")
+            update_ui(4, f"[2/5] Cover selesai ✓ — {_title_info}")
 
         # 3. Engine 5 — Daftar Isi
-        update_ui(35, f"[3/6] Membuat daftar isi...")
+        update_ui(5, f"[3/5] Membuat daftar isi dari {_total_para} paragraf...")
         di_out = f"di_{os.path.basename(final_file)}"
-        update_ui(37, f"[3/6] Mengambil heading dari {_total_para} paragraf...")
         ok5 = engine5.insert(input_docx=final_file, output_docx=di_out, doc_title=cover_settings["sni_number"], copyright_text=f"©BSN {cover_settings['bsn_year']}")[0]
         if ok5:
             final_file = di_out
-            update_ui(44, f"[3/6] Daftar isi selesai ✓")
+            update_ui(6, f"[3/5] Daftar isi selesai ✓")
 
         # 4. Engine 6 — Prakata
-        update_ui(50, f"[4/6] Menyisipkan prakata...")
-        pp_out = f"pp_{os.path.basename(final_file)}"
         ref_std = re.sub(r'^SNI\s+', '', cover_settings["sni_number"]).strip()
-        update_ui(52, f"[4/6] Menyusun teks prakata: {ref_std}")
+        update_ui(7, f"[4/5] Menyisipkan prakata: {ref_std}")
+        pp_out = f"pp_{os.path.basename(final_file)}"
         ok6 = engine6.insert(input_docx=final_file, output_docx=pp_out, sni_number=cover_settings["sni_number"], title_id=auto_title_id or 'Judul ID', title_en=auto_title_en or 'Title EN', ref_standard=ref_std, bsn_year=cover_settings["bsn_year"])[0]
         if ok6:
             final_file = pp_out
-            update_ui(58, f"[4/6] Prakata selesai ✓")
+            update_ui(8, f"[4/5] Prakata selesai ✓")
 
         # 5. Engine 7 — Info Pendukung
-        update_ui(65, f"[5/6] Menambahkan info pendukung...")
+        update_ui(9, f"[5/5] Menambahkan info pendukung BSN {_tahun}...")
         ip_out = f"ip_{os.path.basename(final_file)}"
-        update_ui(67, f"[5/6] Menyusun halaman info BSN {_tahun}...")
         ok7 = engine7.append(input_docx=final_file, output_docx=ip_out)[0]
         if ok7:
             final_file = ip_out
-            update_ui(72, f"[5/6] Info pendukung selesai ✓")
+            update_ui(10, f"[5/5] Formatting selesai ✓")
 
         return final_file
 
     try:
-        # --- LANGKAH 1: OPTIMASI ---
-        update_ui(2, "Membaca file dokumen...")
+        # --- LANGKAH 1: OPTIMASI (0–10%) ---
+        update_ui(1, "Membaca file dokumen...")
         final_opt_file = run_optimization(target_file, doc_title_val)
         st.session_state['_final_opt_file'] = final_opt_file
 
-        # --- LANGKAH 2: TERJEMAHAN ---
-        update_ui(75, "[6/6] Menginisialisasi mesin terjemahan...")
+        # --- LANGKAH 2: TERJEMAHAN (10–100%) ---
+        update_ui(10, "[6/6] Menginisialisasi mesin terjemahan...")
         tr_out = f"ID_{os.path.basename(final_opt_file)}"
 
         _engine9 = DocxFinalTranslatorEngine(source_lang=src_lang_val, target_lang='id', custom_dict=st.session_state.get('custom_dict'))
@@ -987,7 +985,8 @@ if st.session_state.get('_run_process') and st.session_state.get('_target_file')
         }
 
         def _cb_tr(pct, msg):
-            final_pct = 75 + int(pct * 0.25)
+            # engine9 pct 0–100 → progress bar 10–100%
+            final_pct = 10 + int(pct * 0.90)
 
             # ── Parse format tab-separated dari engine9 ──────────────────────
             parts = msg.split('\t')
