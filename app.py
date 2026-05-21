@@ -258,6 +258,29 @@ section[data-testid="stFileUploaderDropzone"] p,
 section[data-testid="stFileUploaderDropzone"] span {
     color: rgba(255,255,255,0.5) !important;
 }
+
+/* ── Tombol Browse files ── */
+section[data-testid="stFileUploaderDropzone"] button[data-testid="baseButton-secondary"],
+section[data-testid="stFileUploaderDropzone"] button,
+div[data-testid="stFileUploader"] button {
+    background: rgba(99,102,241,0.12) !important;
+    border: 1.5px solid rgba(99,102,241,0.35) !important;
+    color: rgba(165,180,252,0.85) !important;
+    border-radius: 10px !important;
+    font-size: 0.82rem !important;
+    font-weight: 600 !important;
+    font-family: 'Outfit', sans-serif !important;
+    box-shadow: none !important;
+    transition: all 0.2s ease !important;
+    padding: 0.4rem 1rem !important;
+}
+section[data-testid="stFileUploaderDropzone"] button:hover,
+div[data-testid="stFileUploader"] button:hover {
+    background: rgba(99,102,241,0.22) !important;
+    border-color: rgba(99,102,241,0.6) !important;
+    color: #c7d2fe !important;
+}
+
 div[data-testid="stFileUploaderFile"] {
     background: rgba(99,102,241,0.1) !important;
     border: 1px solid rgba(99,102,241,0.3) !important;
