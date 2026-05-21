@@ -1,4 +1,5 @@
 import streamlit as st
+import streamlit.components.v1 as _components
 import os
 import re
 import time
@@ -794,43 +795,48 @@ if st.session_state.get('_run_process') and st.session_state.get('_target_file')
     # UI Progress — 3 elemen terpisah agar tidak saling tumpuk
     status_placeholder = st.empty()
     progress_bar = st.progress(0)
-    time_placeholder = st.empty()
     start_time = time.time()
 
-    # ── Live Timer: JavaScript client-side, update tiap detik di browser ───
-    _JS_TIMER_HTML = """
-    <div id="sni-timer-wrap" style="
-        font-family:'JetBrains Mono',monospace;
-        font-size:0.82rem;
-        color:rgba(110,231,183,0.85);
-        text-align:center;
-        letter-spacing:1px;
-        margin:0.4rem 0;
-    ">
-      \u23f1 <span id="sni-timer">0 detik</span>
+    # ── Live Timer: iframe via components.html agar <script> benar-benar jalan
+    _TIMER_HTML = """
+    <style>
+      #sni-timer-wrap {
+        font-family: 'JetBrains Mono', monospace;
+        font-size: 0.82rem;
+        color: rgba(110,231,183,0.85);
+        text-align: center;
+        letter-spacing: 1px;
+        margin: 0;
+        padding: 0;
+        background: transparent;
+      }
+    </style>
+    <div id="sni-timer-wrap">
+      &#x23F1; <span id="sni-timer">0 detik</span>
     </div>
     <script>
-    (function(){
       var start = Date.now();
-      var el = document.getElementById('sni-timer');
-      if(!el) return;
       setInterval(function(){
         var sec = Math.floor((Date.now() - start) / 1000);
-        if(sec < 60){
+        var el = document.getElementById('sni-timer');
+        if (!el) return;
+        if (sec < 60) {
           el.textContent = sec + ' detik';
         } else {
-          var m = Math.floor(sec/60);
+          var m = Math.floor(sec / 60);
           var s = sec % 60;
           el.textContent = m + ' menit ' + s + ' detik';
         }
       }, 1000);
-    })();
     </script>
     """
-    time_placeholder.markdown(_JS_TIMER_HTML, unsafe_allow_html=True)
-    # ───────────────────────────────────────────────────────────────────────
+    # components.html() render ke iframe — script PASTI jalan, tidak disanitasi
+    _components.html(_TIMER_HTML, height=36)
+    # time_placeholder dipakai hanya untuk waktu final statis setelah selesai
+    time_placeholder = st.empty()
+    # ────────────────────────────────────────────────────────────────────────
 
-    # Helper Update UI
+    # Helper Update UI — TIDAK menyentuh timer iframe, hanya status & progress
     def update_ui(pct, msg):
         status_placeholder.markdown(
             f'<div style="font-size:0.85rem; color:rgba(165,180,252,0.85); '
@@ -839,7 +845,6 @@ if st.session_state.get('_run_process') and st.session_state.get('_target_file')
             unsafe_allow_html=True
         )
         progress_bar.progress(pct)
-        # Timer berjalan di browser — tidak perlu diupdate dari server
 
     # Pipeline Optimasi
     def run_optimization(input_file, doc_title):
