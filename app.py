@@ -986,15 +986,20 @@ if st.session_state.get('_run_process') and st.session_state.get('_target_file')
         }
 
         def _cb_tr(pct, msg):
+            # ── Petakan pct engine9 (0–100) → progress bar (10–100) ──────────
+            # engine9 pct: 2–5 init, 5–65 loop elemen, 66–100 post-processing
+            final_pct = min(10 + int(pct * 0.90), 100)
+
             # ── Parse format tab-separated dari engine9 ──────────────────────
+            # Format: "[tag] aksi\tdone/total\tn_trans\tn_skip\tn_tbl\tpreview"
             parts = msg.split('\t')
             if len(parts) >= 6:
-                tag_aksi  = parts[0].strip()          # "[cover-italic] skip"
-                frac      = parts[1].strip()          # "42/850"
-                n_trans   = parts[2].strip()          # "12"
-                n_skip    = parts[3].strip()          # "28"
-                n_tbl     = parts[4].strip()          # "3"
-                preview   = parts[5].strip()          # cuplikan teks
+                tag_aksi  = parts[0].strip()   # "[cover-italic] skip"
+                frac      = parts[1].strip()   # "42/567"
+                n_trans   = parts[2].strip()   # "12"
+                n_skip    = parts[3].strip()   # "28"
+                n_tbl     = parts[4].strip()   # "3"
+                preview   = parts[5].strip()   # cuplikan teks
 
                 # Ambil tag dalam kurung siku
                 m_tag = re.match(r'\[([^\]]+)\]', tag_aksi)
@@ -1010,32 +1015,32 @@ if st.session_state.get('_run_process') and st.session_state.get('_target_file')
                     except Exception:
                         pass
 
-                # Simpan total sekali (dipakai untuk display & pct)
+                # Simpan total sekali
                 if _cb_total[0] == 0 and total_int > 0:
                     _cb_total[0] = total_int
-
                 total_ref = _cb_total[0] if _cb_total[0] > 0 else total_int
-                total_str = f"/{total_ref}" if total_ref else ""
-                done_str  = frac.split('/')[0] if '/' in frac else frac
 
-                # ── Progress proporsional terhadap elemen done/total ──────────
-                # Rentang 10–100% proporsional terhadap elemen done/total
-                if total_ref > 0:
+                # ── Progress dihitung dari done/total elemen (fase loop) ──────
+                # engine9 fase loop: pct 5–65, done bergerak 1→total
+                # Petakan: elemen 0/total → 10%, elemen total/total → 65%
+                #   (sisanya 65%→100% dibiarkan dari pct engine9 untuk post-proc)
+                if total_ref > 0 and done_int > 0:
                     elem_ratio = min(done_int / total_ref, 1.0)
-                    final_pct  = 10 + int(elem_ratio * 90)   # 10 → 100
-                else:
-                    final_pct  = 10 + int(pct * 0.90)        # fallback ke pct engine9
+                    # Fase elemen menempati 10–65% progress bar
+                    final_pct = min(10 + int(elem_ratio * 55), 65)
+                # else: final_pct tetap dari rumus pct engine9 di atas
 
                 icon = _ICON.get(tag, _ICON.get(aksi, '🔄'))
 
-                # Baris atas: statistik ringkas
+                # Baris atas: statistik + batch info
                 stat_parts = []
-                if n_trans and n_trans != '0': stat_parts.append(f"✏️ {n_trans} terjemah")
-                if n_skip  and n_skip  != '0': stat_parts.append(f"⏭ {n_skip} skip")
+                if n_trans and n_trans != '0': stat_parts.append(f"✏️ {n_trans} diterjemah")
+                if n_skip  and n_skip  != '0': stat_parts.append(f"⏭ {n_skip} dilewati")
                 if n_tbl   and n_tbl   != '0': stat_parts.append(f"📊 {n_tbl} tabel")
                 stat_str = "  ·  ".join(stat_parts) if stat_parts else "memulai..."
 
-                line1 = f"[6/6] Translate  ·  elemen {done_str}{total_str}  ·  {stat_str}"
+                total_str = f"/{total_ref}" if total_ref else ""
+                line1 = f"[6/6] Translate  ·  elemen {done_int}{total_str}  ·  {stat_str}"
 
                 # Baris bawah: aksi + preview teks saat ini
                 if preview and preview != '-':
@@ -1044,15 +1049,15 @@ if st.session_state.get('_run_process') and st.session_state.get('_target_file')
                     line2 = f"{icon} [{tag}] {aksi}"
 
             else:
-                # Pesan lama / non-tab (init, selesai, dll)
-                final_pct = 10 + int(pct * 0.90)
+                # Pesan non-tab: init (pct 2–5) dan post-processing (pct 66–100)
+                # Progress langsung dari pct engine9 → 10–100%
                 line1 = f"[6/6] Translate"
-                line2 = f"🔄 {msg[:100]}"
+                line2 = f"🔄 {msg.strip()[:100]}"
 
             # ── Selalu update progress bar (tidak ikut throttle) ─────────────
             progress_bar.progress(final_pct)
 
-            # Throttle status teks: max 1x per detik, kecuali pct ≤5 atau ≥96
+            # Throttle status teks: max 1x/detik, kecuali pct ≤5 atau ≥96
             now = time.time()
             penting = (pct <= 5 or pct >= 96)
             if not penting and (now - _cb_t0[0]) < 1.0:
