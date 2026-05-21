@@ -797,22 +797,37 @@ if st.session_state.get('_run_process') and st.session_state.get('_target_file')
     time_placeholder = st.empty()
     start_time = time.time()
 
-    # ── Live Timer: background thread update setiap detik ──────────────────
-    import threading as _threading
-
-    _timer_running = [True]   # list agar bisa dimodifikasi dari dalam closure
-
-    def _live_timer_loop():
-        """Update indikator waktu setiap detik selama proses berjalan."""
-        while _timer_running[0]:
-            time_placeholder.markdown(
-                f'<div class="timer-text">⏱ {get_elapsed_str(start_time)}</div>',
-                unsafe_allow_html=True
-            )
-            time.sleep(1)
-
-    _timer_thread = _threading.Thread(target=_live_timer_loop, daemon=True)
-    _timer_thread.start()
+    # ── Live Timer: JavaScript client-side, update tiap detik di browser ───
+    _JS_TIMER_HTML = """
+    <div id="sni-timer-wrap" style="
+        font-family:'JetBrains Mono',monospace;
+        font-size:0.82rem;
+        color:rgba(110,231,183,0.85);
+        text-align:center;
+        letter-spacing:1px;
+        margin:0.4rem 0;
+    ">
+      \u23f1 <span id="sni-timer">0 detik</span>
+    </div>
+    <script>
+    (function(){
+      var start = Date.now();
+      var el = document.getElementById('sni-timer');
+      if(!el) return;
+      setInterval(function(){
+        var sec = Math.floor((Date.now() - start) / 1000);
+        if(sec < 60){
+          el.textContent = sec + ' detik';
+        } else {
+          var m = Math.floor(sec/60);
+          var s = sec % 60;
+          el.textContent = m + ' menit ' + s + ' detik';
+        }
+      }, 1000);
+    })();
+    </script>
+    """
+    time_placeholder.markdown(_JS_TIMER_HTML, unsafe_allow_html=True)
     # ───────────────────────────────────────────────────────────────────────
 
     # Helper Update UI
@@ -824,7 +839,7 @@ if st.session_state.get('_run_process') and st.session_state.get('_target_file')
             unsafe_allow_html=True
         )
         progress_bar.progress(pct)
-        # Tidak perlu update time_placeholder di sini — sudah ditangani thread
+        # Timer berjalan di browser — tidak perlu diupdate dari server
 
     # Pipeline Optimasi
     def run_optimization(input_file, doc_title):
@@ -887,13 +902,9 @@ if st.session_state.get('_run_process') and st.session_state.get('_target_file')
         ok_tr, _ = _engine9.translate(input_docx=final_opt_file, output_docx=tr_out, progress_callback=_cb_tr, translate_headers=False)
         
         if ok_tr:
-            # Hentikan live timer sebelum update UI terakhir
-            _timer_running[0] = False
-            _timer_thread.join(timeout=2)
-
             update_ui(100, "✅ Selesai!")
             final_elapsed = get_elapsed_str(start_time)
-            # Tampilkan waktu akhir yang statis (tidak berubah lagi)
+            # Ganti JS timer dengan waktu final statis (berhenti otomatis)
             time_placeholder.markdown(
                 f'<div class="timer-text">⏱ {final_elapsed}</div>',
                 unsafe_allow_html=True
@@ -907,9 +918,6 @@ if st.session_state.get('_run_process') and st.session_state.get('_target_file')
             raise Exception("Terjemahan gagal.")
 
     except Exception as e:
-        # Pastikan timer dihentikan jika terjadi error
-        _timer_running[0] = False
-        _timer_thread.join(timeout=2)
         st.error(f"❌ Error Proses: {e}")
         st.session_state['_run_process'] = False
         st.session_state['_show_results'] = False
