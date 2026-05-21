@@ -860,7 +860,7 @@ if st.session_state.get('_run_process') and st.session_state.get('_target_file')
     # ────────────────────────────────────────────────────────────────────────
 
     # Helper Update UI — TIDAK menyentuh timer iframe, hanya status & progress
-    def update_ui(pct, msg):
+    def update_ui(pct, msg, skip_progress=False):
         parts = msg.split("\n", 1)
         line1 = parts[0].strip()
         line2 = parts[1].strip() if len(parts) > 1 else ""
@@ -890,7 +890,8 @@ if st.session_state.get('_run_process') and st.session_state.get('_target_file')
             f'<style>@keyframes _pd{{0%,100%{{opacity:1;transform:scale(1);}}50%{{opacity:.3;transform:scale(1.6);}}}}</style>',
             unsafe_allow_html=True
         )
-        progress_bar.progress(pct)
+        if not skip_progress:
+            progress_bar.progress(pct)
 
     # Pipeline Optimasi
     def run_optimization(input_file, doc_title):
@@ -988,6 +989,9 @@ if st.session_state.get('_run_process') and st.session_state.get('_target_file')
             # engine9 pct 0–100 → progress bar 10–100%
             final_pct = 10 + int(pct * 0.90)
 
+            # ── Selalu update progress bar agar tidak lompat ─────────────────
+            progress_bar.progress(final_pct)
+
             # ── Parse format tab-separated dari engine9 ──────────────────────
             parts = msg.split('\t')
             if len(parts) >= 6:
@@ -1032,14 +1036,15 @@ if st.session_state.get('_run_process') and st.session_state.get('_target_file')
                 line1 = f"[6/6] Translate"
                 line2 = f"🔄 {msg[:100]}"
 
-            # Throttle: max 1x per detik, kecuali pct ≤5 atau ≥96
+            # Throttle status teks: max 1x per detik, kecuali pct ≤5 atau ≥96
             now = time.time()
             penting = (pct <= 5 or pct >= 96)
             if not penting and (now - _cb_t0[0]) < 1.0:
                 return
             _cb_t0[0] = now
 
-            update_ui(final_pct, f"{line1}\n{line2}")
+            # Update status teks saja (progress bar sudah diupdate di atas)
+            update_ui(final_pct, f"{line1}\n{line2}", skip_progress=True)
         # ─────────────────────────────────────────────────────────────────────
 
         ok_tr, _ = _engine9.translate(input_docx=final_opt_file, output_docx=tr_out, progress_callback=_cb_tr, translate_headers=False)
