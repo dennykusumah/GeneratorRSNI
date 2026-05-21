@@ -792,89 +792,76 @@ if st.session_state.get('_run_process') and st.session_state.get('_target_file')
     doc_title_val = st.session_state['_doc_title']
     src_lang_val = st.session_state['_src_lang']
     
-    # ── UI Progress: satu iframe berisi timer + progress bar + persen ──────
+    # ── UI Progress realtime — satu iframe, semua hidup di browser ──────────
     start_time = time.time()
 
-    _PROGRESS_IFRAME_HTML = (
-        '<!DOCTYPE html>\n'
-        '<html>\n'
-        '<head>\n'
-        '<style>\n'
-        '  * { margin:0; padding:0; box-sizing:border-box; }\n'
-        "  body { background:transparent; font-family:'Outfit',sans-serif; padding:4px 2px; }\n"
-        '  #row-status { display:flex; justify-content:space-between; align-items:center; margin-bottom:6px; }\n'
-        '  #msg { font-size:0.85rem; color:rgba(165,180,252,0.9); font-weight:500; }\n'
-        "  #pct { font-family:'JetBrains Mono',monospace; font-size:0.85rem; font-weight:700; color:rgba(110,231,183,0.95); }\n"
-        '  #bar-track { width:100%; height:6px; background:rgba(255,255,255,0.1); border-radius:999px; overflow:hidden; margin-bottom:6px; }\n'
-        '  #bar-fill { height:100%; width:0%; background:linear-gradient(90deg,#6366f1,#818cf8); border-radius:999px; transition:width 0.8s cubic-bezier(0.4,0,0.2,1); }\n'
-        "  #timer-row { text-align:center; font-family:'JetBrains Mono',monospace; font-size:0.80rem; color:rgba(110,231,183,0.75); letter-spacing:1px; }\n"
-        '</style>\n'
-        '</head>\n'
-        '<body>\n'
-        '  <div id="row-status"><span id="msg">&#x26A1; Memulai...</span><span id="pct">0%</span></div>\n'
-        '  <div id="bar-track"><div id="bar-fill"></div></div>\n'
-        '  <div id="timer-row">&#x23F1; <span id="sni-timer">0 detik</span></div>\n'
-        '  <script>\n'
-        '    var startTs = Date.now();\n'
-        '    var timerEl = document.getElementById("sni-timer");\n'
-        '    var timerDone = false;\n'
-        '    setInterval(function(){\n'
-        '      if(timerDone) return;\n'
-        '      var sec = Math.floor((Date.now()-startTs)/1000);\n'
-        '      if(sec<60){ timerEl.textContent = sec+" detik"; }\n'
-        '      else { var m=Math.floor(sec/60),s=sec%60; timerEl.textContent=m+" menit "+s+" detik"; }\n'
-        '    },1000);\n'
-        '    var targetPct=0, crawlTimer=null;\n'
-        '    function setTarget(pct){\n'
-        '      targetPct=pct;\n'
-        '      document.getElementById("bar-fill").style.width=pct+"%";\n'
-        '      document.getElementById("pct").textContent=pct+"%";\n'
-        '      clearTimeout(crawlTimer); crawlTimer=setTimeout(startCrawl,950);\n'
-        '    }\n'
-        '    function startCrawl(){\n'
-        '      var ceiling=Math.min(targetPct+2,99);\n'
-        '      var cur=parseFloat(document.getElementById("bar-fill").style.width)||targetPct;\n'
-        '      if(cur>=ceiling) return;\n'
-        '      var next=Math.min(cur+0.4,ceiling);\n'
-        '      document.getElementById("bar-fill").style.width=next+"%";\n'
-        '      document.getElementById("pct").textContent=Math.round(next)+"%";\n'
-        '      crawlTimer=setTimeout(startCrawl,400);\n'
-        '    }\n'
-        '    window.addEventListener("message",function(e){\n'
-        '      var d=e.data; if(!d) return;\n'
-        '      if(d.type==="progress"){ setTarget(d.pct); document.getElementById("msg").textContent="\\u26A1 "+d.msg; }\n'
-        '      else if(d.type==="done"){\n'
-        '        clearTimeout(crawlTimer);\n'
-        '        document.getElementById("bar-fill").style.width="100%";\n'
-        '        document.getElementById("pct").textContent="100%";\n'
-        '        document.getElementById("msg").textContent="\\u2705 Selesai!";\n'
-        '        timerDone=true; timerEl.textContent=d.elapsed;\n'
-        '        document.getElementById("timer-row").style.color="rgba(110,231,183,1)";\n'
-        '      }\n'
-        '    });\n'
-        '  </script>\n'
-        '</body>\n'
-        '</html>\n'
+    # Checkpoint: (pct_mulai, pct_akhir, durasi_estimasi_detik)
+    # Browser akan animasi bar secara smooth antara checkpoint ini.
+    # Python cukup update teks status; bar & timer jalan sendiri.
+    _PROGRESS_HTML = (
+        '<!DOCTYPE html><html><head><style>' +
+        '*{margin:0;padding:0;box-sizing:border-box}' +
+        'body{background:transparent;padding:2px 0}' +
+        '#row{display:flex;justify-content:space-between;align-items:center;margin-bottom:5px}' +
+        '#msg{font-size:.85rem;font-family:Outfit,sans-serif;font-weight:500;color:rgba(165,180,252,.9)}' +
+        '#pct{font-size:.85rem;font-family:"JetBrains Mono",monospace;font-weight:700;color:rgba(110,231,183,.95)}' +
+        '#track{width:100%;height:6px;background:rgba(255,255,255,.12);border-radius:9px;overflow:hidden;margin-bottom:5px}' +
+        '#fill{height:100%;width:0%;background:linear-gradient(90deg,#6366f1,#818cf8);border-radius:9px;transition:width .6s ease}' +
+        '#timer{text-align:center;font-size:.78rem;font-family:"JetBrains Mono",monospace;' +
+        'color:rgba(110,231,183,.75);letter-spacing:1px}' +
+        '</style></head><body>' +
+        '<div id="row"><span id="msg">&#x26A1; Memulai...</span><span id="pct">0%</span></div>' +
+        '<div id="track"><div id="fill"></div></div>' +
+        '<div id="timer">&#x23F1; <span id="sec">0 detik</span></div>' +
+        '<script>' +
+        'var T0=Date.now(),done=false,cur=0,tgt=0,crawl=null;' +
+        'var fill=document.getElementById("fill");' +
+        'var pctEl=document.getElementById("pct");' +
+        'var secEl=document.getElementById("sec");' +
+        'setInterval(function(){' +
+        '  if(done)return;' +
+        '  var s=Math.floor((Date.now()-T0)/1000);' +
+        '  secEl.textContent=s<60?s+" detik":Math.floor(s/60)+" menit "+(s%60)+" detik";' +
+        '},1000);' +
+        'function moveTo(p){' +
+        '  tgt=p; clearTimeout(crawl);' +
+        '  fill.style.width=p+"%"; pctEl.textContent=p+"%";' +
+        '  crawl=setTimeout(creep,700);' +
+        '}' +
+        'function creep(){' +
+        '  var ceil=Math.min(tgt+3,99);' +
+        '  cur=parseFloat(fill.style.width)||tgt;' +
+        '  if(cur>=ceil)return;' +
+        '  var nx=Math.min(cur+0.5,ceil);' +
+        '  fill.style.width=nx+"%"; pctEl.textContent=Math.round(nx)+"%";' +
+        '  crawl=setTimeout(creep,350);' +
+        '}' +
+        'window.addEventListener("message",function(e){' +
+        '  var d=e.data; if(!d)return;' +
+        '  if(d.type==="p"){document.getElementById("msg").textContent="\u26A1 "+d.msg; moveTo(d.pct);}' +
+        '  else if(d.type==="done"){' +
+        '    done=true; clearTimeout(crawl);' +
+        '    fill.style.width="100%"; pctEl.textContent="100%";' +
+        '    document.getElementById("msg").textContent="\u2705 Selesai!";' +
+        '    secEl.textContent=d.t;' +
+        '    document.getElementById("timer").style.color="rgba(110,231,183,1)";' +
+        '  }' +
+        '});' +
+        '</script></body></html>'
     )
+    _components.html(_PROGRESS_HTML, height=72)
+    # Placeholder untuk waktu final statis (muncul di bawah iframe setelah selesai)
+    time_placeholder = st.empty()
+    # ─────────────────────────────────────────────────────────────────────────
 
-    # Render iframe — timer + progress bar + persen, semua animasi jalan di browser
-    _components.html(_PROGRESS_IFRAME_HTML, height=80)
-    # st.progress native untuk garis biru di bawah iframe (bisa diupdate tiap checkpoint)
-    progress_bar = st.progress(0)
-    # status & persen diupdate via markdown sejajar di bawah garis biru
-    status_placeholder = st.empty()
-    time_placeholder   = st.empty()
-
-    # Helper Update UI
+    # Helper Update UI — hanya update teks status di bawah iframe
     def update_ui(pct, msg):
-        progress_bar.progress(pct)
-        status_placeholder.markdown(
-            f'<div style="display:flex;justify-content:space-between;align-items:center;'
-            f'font-family:\'Outfit\',sans-serif;font-weight:500;margin-top:4px;">'
-            f'<span style="font-size:0.85rem;color:rgba(165,180,252,0.9);">⚡ {msg}</span>'
-            f'<span style="font-size:0.85rem;font-family:\'JetBrains Mono\',monospace;'
-            f'font-weight:700;color:rgba(110,231,183,0.95);">{pct}%</span>'
-            f'</div>',
+        time_placeholder.markdown(
+            f"<div style='display:flex;justify-content:space-between;align-items:center;"
+            f"font-family:Outfit,sans-serif;font-weight:500;margin-top:2px;'>"
+            f"<span style='font-size:.85rem;color:rgba(165,180,252,.9);'>&#x26A1; {msg}</span>"
+            f"<span style='font-size:.85rem;font-family:JetBrains Mono,monospace;"
+            f"font-weight:700;color:rgba(110,231,183,.95);'>{pct}%</span></div>",
             unsafe_allow_html=True
         )
 
@@ -941,6 +928,7 @@ if st.session_state.get('_run_process') and st.session_state.get('_target_file')
         if ok_tr:
             update_ui(100, "✅ Selesai!")
             final_elapsed = get_elapsed_str(start_time)
+            # Ganti JS timer dengan waktu final statis (berhenti otomatis)
             time_placeholder.markdown(
                 f'<div class="timer-text">⏱ {final_elapsed}</div>',
                 unsafe_allow_html=True
@@ -948,6 +936,7 @@ if st.session_state.get('_run_process') and st.session_state.get('_target_file')
             st.session_state['_final_tr_file'] = tr_out
             st.session_state['_final_time'] = final_elapsed
             st.session_state['_show_results'] = True
+            # Parse dokumen langsung agar chat langsung siap setelah rerun
             st.session_state['_doc_sections'] = _parse_doc_structure(tr_out)
         else:
             raise Exception("Terjemahan gagal.")
