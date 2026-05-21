@@ -795,131 +795,67 @@ if st.session_state.get('_run_process') and st.session_state.get('_target_file')
     # ── UI Progress: satu iframe berisi timer + progress bar + persen ──────
     start_time = time.time()
 
-    _PROGRESS_IFRAME_HTML = \"\"\"<!DOCTYPE html>
-<html>
-<head>
-<style>
-  * { margin:0; padding:0; box-sizing:border-box; }
-  body { background:transparent; font-family:'Outfit',sans-serif; padding:4px 2px; }
-
-  #row-status {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    margin-bottom: 6px;
-  }
-  #msg {
-    font-size: 0.85rem;
-    color: rgba(165,180,252,0.9);
-    font-weight: 500;
-  }
-  #pct {
-    font-family: 'JetBrains Mono', monospace;
-    font-size: 0.85rem;
-    font-weight: 700;
-    color: rgba(110,231,183,0.95);
-  }
-
-  #bar-track {
-    width: 100%;
-    height: 6px;
-    background: rgba(255,255,255,0.1);
-    border-radius: 999px;
-    overflow: hidden;
-    margin-bottom: 6px;
-  }
-  #bar-fill {
-    height: 100%;
-    width: 0%;
-    background: linear-gradient(90deg, #6366f1, #818cf8);
-    border-radius: 999px;
-    transition: width 0.8s cubic-bezier(0.4,0,0.2,1);
-  }
-
-  #timer-row {
-    text-align: center;
-    font-family: 'JetBrains Mono', monospace;
-    font-size: 0.80rem;
-    color: rgba(110,231,183,0.75);
-    letter-spacing: 1px;
-  }
-</style>
-</head>
-<body>
-  <div id="row-status">
-    <span id="msg">⚡ Memulai...</span>
-    <span id="pct">0%</span>
-  </div>
-  <div id="bar-track"><div id="bar-fill"></div></div>
-  <div id="timer-row">&#x23F1; <span id="sni-timer">0 detik</span></div>
-
-  <script>
-    // ── Timer ──────────────────────────────────────────────────────────────
-    var startTs = Date.now();
-    var timerEl = document.getElementById('sni-timer');
-    var timerDone = false;
-
-    setInterval(function(){
-      if (timerDone) return;
-      var sec = Math.floor((Date.now() - startTs) / 1000);
-      if (sec < 60) {
-        timerEl.textContent = sec + ' detik';
-      } else {
-        var m = Math.floor(sec / 60);
-        var s = sec % 60;
-        timerEl.textContent = m + ' menit ' + s + ' detik';
-      }
-    }, 1000);
-
-    // ── Animasi progress bar palsu antara checkpoint ───────────────────────
-    // Saat Python kirim checkpoint (misal 5%→20%), bar meluncur smooth ke target.
-    // Di antara checkpoint, bar "merangkak" pelan agar terasa hidup.
-    var currentPct  = 0;
-    var targetPct   = 0;
-    var crawlTimer  = null;
-
-    function setTarget(pct) {
-      targetPct = pct;
-      document.getElementById('bar-fill').style.width = pct + '%';
-      document.getElementById('pct').textContent = pct + '%';
-      // Aktifkan crawl ringan setelah CSS transition selesai (~0.9s)
-      clearTimeout(crawlTimer);
-      crawlTimer = setTimeout(startCrawl, 950);
-    }
-
-    function startCrawl() {
-      // Merangkak max 2% di atas target, berhenti di 99%
-      var ceiling = Math.min(targetPct + 2, 99);
-      var displayed = parseFloat(document.getElementById('bar-fill').style.width) || targetPct;
-      if (displayed >= ceiling) return;
-      var next = Math.min(displayed + 0.4, ceiling);
-      document.getElementById('bar-fill').style.width = next + '%';
-      // Persen hanya tampilkan integer
-      document.getElementById('pct').textContent = Math.round(next) + '%';
-      crawlTimer = setTimeout(startCrawl, 400);
-    }
-
-    // ── Terima update dari Python via postMessage ──────────────────────────
-    window.addEventListener('message', function(e){
-      var d = e.data;
-      if (!d) return;
-      if (d.type === 'progress') {
-        setTarget(d.pct);
-        document.getElementById('msg').textContent = '\\u26A1 ' + d.msg;
-      } else if (d.type === 'done') {
-        clearTimeout(crawlTimer);
-        document.getElementById('bar-fill').style.width = '100%';
-        document.getElementById('pct').textContent = '100%';
-        document.getElementById('msg').textContent = '\\u2705 Selesai!';
-        timerDone = true;
-        timerEl.textContent = d.elapsed;
-        document.getElementById('timer-row').style.color = 'rgba(110,231,183,1)';
-      }
-    });
-  </script>
-</body>
-</html>
-\"\"\"
+    _PROGRESS_IFRAME_HTML = (
+        '<!DOCTYPE html>\n'
+        '<html>\n'
+        '<head>\n'
+        '<style>\n'
+        '  * { margin:0; padding:0; box-sizing:border-box; }\n'
+        "  body { background:transparent; font-family:'Outfit',sans-serif; padding:4px 2px; }\n"
+        '  #row-status { display:flex; justify-content:space-between; align-items:center; margin-bottom:6px; }\n'
+        '  #msg { font-size:0.85rem; color:rgba(165,180,252,0.9); font-weight:500; }\n'
+        "  #pct { font-family:'JetBrains Mono',monospace; font-size:0.85rem; font-weight:700; color:rgba(110,231,183,0.95); }\n"
+        '  #bar-track { width:100%; height:6px; background:rgba(255,255,255,0.1); border-radius:999px; overflow:hidden; margin-bottom:6px; }\n'
+        '  #bar-fill { height:100%; width:0%; background:linear-gradient(90deg,#6366f1,#818cf8); border-radius:999px; transition:width 0.8s cubic-bezier(0.4,0,0.2,1); }\n'
+        "  #timer-row { text-align:center; font-family:'JetBrains Mono',monospace; font-size:0.80rem; color:rgba(110,231,183,0.75); letter-spacing:1px; }\n"
+        '</style>\n'
+        '</head>\n'
+        '<body>\n'
+        '  <div id="row-status"><span id="msg">&#x26A1; Memulai...</span><span id="pct">0%</span></div>\n'
+        '  <div id="bar-track"><div id="bar-fill"></div></div>\n'
+        '  <div id="timer-row">&#x23F1; <span id="sni-timer">0 detik</span></div>\n'
+        '  <script>\n'
+        '    var startTs = Date.now();\n'
+        '    var timerEl = document.getElementById("sni-timer");\n'
+        '    var timerDone = false;\n'
+        '    setInterval(function(){\n'
+        '      if(timerDone) return;\n'
+        '      var sec = Math.floor((Date.now()-startTs)/1000);\n'
+        '      if(sec<60){ timerEl.textContent = sec+" detik"; }\n'
+        '      else { var m=Math.floor(sec/60),s=sec%60; timerEl.textContent=m+" menit "+s+" detik"; }\n'
+        '    },1000);\n'
+        '    var targetPct=0, crawlTimer=null;\n'
+        '    function setTarget(pct){\n'
+        '      targetPct=pct;\n'
+        '      document.getElementById("bar-fill").style.width=pct+"%";\n'
+        '      document.getElementById("pct").textContent=pct+"%";\n'
+        '      clearTimeout(crawlTimer); crawlTimer=setTimeout(startCrawl,950);\n'
+        '    }\n'
+        '    function startCrawl(){\n'
+        '      var ceiling=Math.min(targetPct+2,99);\n'
+        '      var cur=parseFloat(document.getElementById("bar-fill").style.width)||targetPct;\n'
+        '      if(cur>=ceiling) return;\n'
+        '      var next=Math.min(cur+0.4,ceiling);\n'
+        '      document.getElementById("bar-fill").style.width=next+"%";\n'
+        '      document.getElementById("pct").textContent=Math.round(next)+"%";\n'
+        '      crawlTimer=setTimeout(startCrawl,400);\n'
+        '    }\n'
+        '    window.addEventListener("message",function(e){\n'
+        '      var d=e.data; if(!d) return;\n'
+        '      if(d.type==="progress"){ setTarget(d.pct); document.getElementById("msg").textContent="\\u26A1 "+d.msg; }\n'
+        '      else if(d.type==="done"){\n'
+        '        clearTimeout(crawlTimer);\n'
+        '        document.getElementById("bar-fill").style.width="100%";\n'
+        '        document.getElementById("pct").textContent="100%";\n'
+        '        document.getElementById("msg").textContent="\\u2705 Selesai!";\n'
+        '        timerDone=true; timerEl.textContent=d.elapsed;\n'
+        '        document.getElementById("timer-row").style.color="rgba(110,231,183,1)";\n'
+        '      }\n'
+        '    });\n'
+        '  </script>\n'
+        '</body>\n'
+        '</html>\n'
+    )
 
     # Render iframe — timer + progress bar + persen, semua animasi jalan di browser
     _components.html(_PROGRESS_IFRAME_HTML, height=80)
