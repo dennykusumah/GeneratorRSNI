@@ -258,20 +258,29 @@ section[data-testid="stFileUploaderDropzone"] p,
 section[data-testid="stFileUploaderDropzone"] span {
     color: rgba(255,255,255,0.5) !important;
 }
-section[data-testid="stFileUploaderDropzone"] button {
-    background: rgba(255,255,255,0.92) !important;
-    color: #000000 !important;
-    border: none !important;
+
+/* ── Tombol Browse files ── */
+section[data-testid="stFileUploaderDropzone"] button[data-testid="baseButton-secondary"],
+section[data-testid="stFileUploaderDropzone"] button,
+div[data-testid="stFileUploader"] button {
+    background: rgba(99,102,241,0.12) !important;
+    border: 1.5px solid rgba(99,102,241,0.35) !important;
+    color: rgba(165,180,252,0.85) !important;
+    border-radius: 10px !important;
+    font-size: 0.82rem !important;
     font-weight: 600 !important;
-    border-radius: 8px !important;
+    font-family: 'Outfit', sans-serif !important;
+    box-shadow: none !important;
+    transition: all 0.2s ease !important;
+    padding: 0.4rem 1rem !important;
 }
-section[data-testid="stFileUploaderDropzone"] button:hover {
-    background: #ffffff !important;
-    color: #000000 !important;
+section[data-testid="stFileUploaderDropzone"] button:hover,
+div[data-testid="stFileUploader"] button:hover {
+    background: rgba(99,102,241,0.22) !important;
+    border-color: rgba(99,102,241,0.6) !important;
+    color: #c7d2fe !important;
 }
-section[data-testid="stFileUploaderDropzone"] button span {
-    color: #000000 !important;
-}
+
 div[data-testid="stFileUploaderFile"] {
     background: rgba(99,102,241,0.1) !important;
     border: 1px solid rgba(99,102,241,0.3) !important;
@@ -556,6 +565,10 @@ hr {
 @keyframes pulse-green {
     0%, 100% { opacity: 1; transform: scale(1); }
     50% { opacity: 0.5; transform: scale(1.35); }
+}
+@keyframes pulse-dot {
+    0%, 100% { opacity: 1; transform: scale(1); }
+    50% { opacity: 0.4; transform: scale(1.5); }
 }
 
 /* ══════════════════════════════════════════
@@ -850,15 +863,66 @@ if st.session_state.get('_run_process') and st.session_state.get('_target_file')
     time_placeholder = st.empty()
     # ────────────────────────────────────────────────────────────────────────
 
-    # Helper Update UI — status kiri, persen kanan, sejajar di atas progress bar
+    # Helper Update UI — single-line status yang berubah in-place, tidak bertambah baris
     def update_ui(pct, msg):
+        # Tentukan warna dot berdasarkan persentase
+        if pct >= 100:
+            dot_color = "#10b981"
+            dot_shadow = "rgba(16,185,129,0.8)"
+            icon = "✅"
+        elif pct >= 75:
+            dot_color = "#6366f1"
+            dot_shadow = "rgba(99,102,241,0.8)"
+            icon = "⚡"
+        elif pct >= 50:
+            dot_color = "#818cf8"
+            dot_shadow = "rgba(129,140,248,0.7)"
+            icon = "⚡"
+        else:
+            dot_color = "#a5b4fc"
+            dot_shadow = "rgba(165,180,252,0.6)"
+            icon = "⚡"
+
         status_placeholder.markdown(
-            f"<div style='display:flex;justify-content:space-between;align-items:center;"
-            f"font-family:Outfit,sans-serif;font-weight:500;margin-bottom:0.3rem;'>"
-            f"<span style='font-size:.85rem;color:rgba(165,180,252,.9);'>&#x26A1; {msg}</span>"
-            f"<span style='font-size:.85rem;font-family:JetBrains Mono,monospace;"
-            f"font-weight:700;color:rgba(110,231,183,.95);'>{pct}%</span>"
-            f"</div>",
+            f'''<div style="
+                display:flex; align-items:center; gap:0.55rem;
+                background:rgba(15,23,42,0.55);
+                border:1px solid rgba(99,102,241,0.2);
+                border-radius:10px;
+                padding:0.55rem 0.9rem;
+                font-family:\'Outfit\',sans-serif;
+                font-size:0.85rem;
+                font-weight:500;
+                color:rgba(165,180,252,0.9);
+                line-height:1.3;
+                margin-bottom:0.3rem;
+                min-height:2.4rem;
+            ">
+                <span style="
+                    display:inline-block;
+                    width:8px; height:8px;
+                    border-radius:50%;
+                    background:{dot_color};
+                    box-shadow:0 0 7px {dot_shadow};
+                    flex-shrink:0;
+                    {"animation:pulse-dot 1s infinite;" if pct < 100 else ""}
+                "></span>
+                <span style="overflow:hidden; white-space:nowrap; text-overflow:ellipsis; flex:1;">
+                    {icon} {msg}
+                </span>
+                <span style="
+                    font-family:\'JetBrains Mono\',monospace;
+                    font-size:0.75rem;
+                    color:rgba(110,231,183,0.65);
+                    flex-shrink:0;
+                ">{pct}%</span>
+            </div>
+            <style>
+            @keyframes pulse-dot {{
+                0%,100% {{ opacity:1; transform:scale(1); }}
+                50% {{ opacity:0.45; transform:scale(1.4); }}
+            }}
+            </style>''',
             unsafe_allow_html=True
         )
         progress_bar.progress(pct)
@@ -871,55 +935,89 @@ if st.session_state.get('_run_process') and st.session_state.get('_target_file')
             "bsn_year": _tahun, "ics_number": "XX.XXX.XX", "ref_standard": "",
         }
 
-        # 1. Engine 2
-        update_ui(5, "[1/6] Format Dasar...")
+        # Hitung total paragraf dokumen untuk info realtime
+        try:
+            from docx import Document as _DocCount
+            _dc = _DocCount(input_file)
+            _total_para = len(_dc.paragraphs)
+            _total_tbl  = len(_dc.tables)
+            del _dc
+        except Exception:
+            _total_para, _total_tbl = 0, 0
+        _doc_info = f"{_total_para} paragraf, {_total_tbl} tabel"
+
+        # 1. Engine 2 — Format Dasar
+        update_ui(5,  f"[1/6] Memuat dokumen... ({_doc_info})")
         output_file = f"opt_{os.path.basename(input_file)}"
+        update_ui(7,  f"[1/6] Menyetel font & ukuran teks...")
         success, msg = engine2.process(input_file, output_file, ISO_FONT_NAME, ISO_FONT_SIZE, enable_headers=True, doc_title=doc_title, copyright_text=copyright_text)
         if not success: raise Exception(f"Engine 2: {msg}")
+        update_ui(12, f"[1/6] Format dasar selesai ✓ ({_doc_info})")
         final_file = output_file
         auto_title_id, auto_title_en = extract_titles_from_docx(output_file)
+        _title_info = auto_title_id[:30] + "..." if auto_title_id and len(auto_title_id) > 30 else (auto_title_id or "-")
 
-        # 2. Engine 4
-        update_ui(20, "[2/6] Cover...")
+        # 2. Engine 4 — Cover
+        update_ui(20, f"[2/6] Membuat halaman cover...")
         cover_out = f"cover_{os.path.basename(final_file)}"
-        if engine4.prepend_cover(input_docx=final_file, output_docx=cover_out, sni_number=cover_settings["sni_number"], bsn_year=cover_settings["bsn_year"], title_id=auto_title_id, title_en=auto_title_en, ref_standard=cover_settings["ref_standard"], ics_number=cover_settings["ics_number"])[0]:
+        update_ui(22, f"[2/6] Menyusun cover: {cover_settings['sni_number']}")
+        ok4 = engine4.prepend_cover(input_docx=final_file, output_docx=cover_out, sni_number=cover_settings["sni_number"], bsn_year=cover_settings["bsn_year"], title_id=auto_title_id, title_en=auto_title_en, ref_standard=cover_settings["ref_standard"], ics_number=cover_settings["ics_number"])[0]
+        if ok4:
             final_file = cover_out
+            update_ui(28, f"[2/6] Cover selesai ✓ — judul: {_title_info}")
 
-        # 3. Engine 5
-        update_ui(35, "[3/6] Daftar Isi...")
+        # 3. Engine 5 — Daftar Isi
+        update_ui(35, f"[3/6] Membuat daftar isi...")
         di_out = f"di_{os.path.basename(final_file)}"
-        if engine5.insert(input_docx=final_file, output_docx=di_out, doc_title=cover_settings["sni_number"], copyright_text=f"©BSN {cover_settings['bsn_year']}")[0]:
+        update_ui(37, f"[3/6] Mengambil heading dari {_total_para} paragraf...")
+        ok5 = engine5.insert(input_docx=final_file, output_docx=di_out, doc_title=cover_settings["sni_number"], copyright_text=f"©BSN {cover_settings['bsn_year']}")[0]
+        if ok5:
             final_file = di_out
+            update_ui(44, f"[3/6] Daftar isi selesai ✓")
 
-        # 4. Engine 6
-        update_ui(50, "[4/6] Prakata...")
+        # 4. Engine 6 — Prakata
+        update_ui(50, f"[4/6] Menyisipkan prakata...")
         pp_out = f"pp_{os.path.basename(final_file)}"
         ref_std = re.sub(r'^SNI\s+', '', cover_settings["sni_number"]).strip()
-        if engine6.insert(input_docx=final_file, output_docx=pp_out, sni_number=cover_settings["sni_number"], title_id=auto_title_id or 'Judul ID', title_en=auto_title_en or 'Title EN', ref_standard=ref_std, bsn_year=cover_settings["bsn_year"])[0]:
+        update_ui(52, f"[4/6] Menyusun teks prakata: {ref_std}")
+        ok6 = engine6.insert(input_docx=final_file, output_docx=pp_out, sni_number=cover_settings["sni_number"], title_id=auto_title_id or 'Judul ID', title_en=auto_title_en or 'Title EN', ref_standard=ref_std, bsn_year=cover_settings["bsn_year"])[0]
+        if ok6:
             final_file = pp_out
+            update_ui(58, f"[4/6] Prakata selesai ✓")
 
-        # 5. Engine 7
-        update_ui(65, "[5/6] Info Pendukung...")
+        # 5. Engine 7 — Info Pendukung
+        update_ui(65, f"[5/6] Menambahkan info pendukung...")
         ip_out = f"ip_{os.path.basename(final_file)}"
-        if engine7.append(input_docx=final_file, output_docx=ip_out)[0]:
+        update_ui(67, f"[5/6] Menyusun halaman info BSN {_tahun}...")
+        ok7 = engine7.append(input_docx=final_file, output_docx=ip_out)[0]
+        if ok7:
             final_file = ip_out
-        
+            update_ui(72, f"[5/6] Info pendukung selesai ✓")
+
         return final_file
 
     try:
         # --- LANGKAH 1: OPTIMASI ---
+        update_ui(2, "Membaca file dokumen...")
         final_opt_file = run_optimization(target_file, doc_title_val)
         st.session_state['_final_opt_file'] = final_opt_file
-        
+
         # --- LANGKAH 2: TERJEMAHAN ---
-        update_ui(75, "[6/6] Terjemahan...")
+        update_ui(75, "[6/6] Menginisialisasi mesin terjemahan...")
         tr_out = f"ID_{os.path.basename(final_opt_file)}"
-        
+
         _engine9 = DocxFinalTranslatorEngine(source_lang=src_lang_val, target_lang='id', custom_dict=st.session_state.get('custom_dict'))
-        
+
         def _cb_tr(pct, msg):
+            # Teruskan semua pesan detail langsung dari engine9 tanpa prefix
             final_pct = 75 + int(pct * 0.25)
-            update_ui(final_pct, f"[Translate] {msg}")
+            # Beri konteks step untuk pesan awal
+            if pct <= 5:
+                update_ui(final_pct, f"[6/6] Translate — {msg}")
+            elif pct >= 95:
+                update_ui(final_pct, f"[6/6] Translate — Finalisasi dokumen terjemahan...")
+            else:
+                update_ui(final_pct, f"[6/6] Translate — {msg}")
 
         ok_tr, _ = _engine9.translate(input_docx=final_opt_file, output_docx=tr_out, progress_callback=_cb_tr, translate_headers=False)
         
