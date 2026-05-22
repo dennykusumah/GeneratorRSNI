@@ -8,15 +8,6 @@ FIX v2:
     2. ITALIC_SPREADSHEET_URL → daftar kata yang TIDAK diterjemahkan, OUTPUT MIRING
   - Link Handling: Teks link diterjemahkan, URL diganti placeholder (AMAN).
   - Dual Title Sync, Note/Catatan, Annex fix, dll.
-
-OPTIMASI v3:
-  - Batch translation: paragrafs dikelompok dan diterjemahkan sekaligus
-  - Thread pool concurrent untuk tabel
-  - Cache compiled regex patterns
-  - Reduce sleep delay adaptif
-  - Paralel download spreadsheet
-  - Pre-compiled pattern cache untuk custom dict & italic dict
-  - Batch hyperlink translation
 """
 
 import re
@@ -26,8 +17,6 @@ import uuid
 import traceback
 import csv
 import os
-import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from docx import Document
 from docx.shared import Pt
@@ -65,21 +54,16 @@ _HEADING_STYLES_WITH_NUM = {
     'ANNEX', 'a2', 'a3',
     'Heading4', 'Heading5', 'Heading6',
 }
-
-# OPTIMASI: Kurangi delay — Google Translate toleran batch lebih besar
-_TRANSLATE_DELAY = 0.05   # turun dari 0.15
-_TRANSLATE_DELAY_RETRY = 0.5  # turun dari 0.8
+_TRANSLATE_DELAY = 0.15
 _EM_DASH = '—'
 
 _LINK_PLACEHOLDER_BASE = "https://placeholder-link.local/"
 _LINK_COUNTER = 0
-_LINK_LOCK = threading.Lock()
 
 def _get_next_link_placeholder() -> str:
     global _LINK_COUNTER
-    with _LINK_LOCK:
-        _LINK_COUNTER += 1
-        return f"{_LINK_PLACEHOLDER_BASE}link-{_LINK_COUNTER}"
+    _LINK_COUNTER += 1
+    return f"{_LINK_PLACEHOLDER_BASE}link-{_LINK_COUNTER}"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -91,29 +75,6 @@ ITALIC_SPREADSHEET_URL = "https://docs.google.com/spreadsheets/d/1SQnWSA8c1OBVq3
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# PATTERN CACHE untuk performa
-# ─────────────────────────────────────────────────────────────────────────────
-
-class _PatternCache:
-    """Cache compiled regex patterns untuk avoid re-compiling berulang."""
-    def __init__(self):
-        self._cache: dict[str, re.Pattern] = {}
-        self._lock = threading.Lock()
-
-    def get(self, term_lower: str) -> re.Pattern:
-        if term_lower not in self._cache:
-            with self._lock:
-                if term_lower not in self._cache:
-                    self._cache[term_lower] = re.compile(
-                        r'(?<![A-Za-z0-9])' + re.escape(term_lower) + r'(?![A-Za-z0-9])',
-                        re.IGNORECASE
-                    )
-        return self._cache[term_lower]
-
-_pattern_cache = _PatternCache()
-
-
-# ─────────────────────────────────────────────────────────────────────────────
 # CUSTOM DICTIONARY (SPREADSHEET 1 - KAMUS TERJEMAHAN)
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -122,19 +83,15 @@ class CustomDictionary:
     
     def __init__(self):
         self._entries: dict[str, tuple[str, str]] = {}
-        # Cache sorted entries untuk avoid re-sort setiap panggilan
-        self._sorted_entries_cache: list | None = None
 
     def add_term(self, source: str, target: str) -> None:
         s = source.strip()
         t = target.strip()
         if s and t:
             self._entries[s.lower()] = (s, t)
-            self._sorted_entries_cache = None  # invalidate cache
 
     def clear(self) -> None:
         self._entries.clear()
-        self._sorted_entries_cache = None
 
     def load_defaults(self) -> int:
         try:
@@ -163,7 +120,6 @@ class CustomDictionary:
                 if src and tgt:
                     self._entries[src.lower()] = (src, tgt)
                     count += 1
-        self._sorted_entries_cache = None
         return count
 
     def load_from_excel(self, filepath: str, sheet_name: str | int = 0, 
@@ -184,7 +140,6 @@ class CustomDictionary:
             tgt = str(row[col_tgt]).strip()
             if src and tgt and src.lower() not in ('nan', '') and tgt.lower() not in ('nan', ''):
                 self._entries[src.lower()] = (src, tgt); count += 1
-        self._sorted_entries_cache = None
         return count
 
     def load_from_google_sheet(self, url: str, src_col: str = 'source', 
@@ -209,26 +164,18 @@ class CustomDictionary:
             tgt = str(row.get(col_tgt, '')).strip()
             if src and tgt and src.lower() not in ('', 'nan') and tgt.lower() not in ('', 'nan'):
                 self._entries[src.lower()] = (src, tgt); count += 1
-        self._sorted_entries_cache = None
         return count
 
     def __len__(self) -> int: return len(self._entries)
     def list_terms(self) -> list[tuple[str, str]]:
         return [(s, t) for _, (s, t) in sorted(self._entries.items())]
 
-    def _get_sorted_entries(self) -> list:
-        """Cache sorted entries untuk performa."""
-        if self._sorted_entries_cache is None:
-            self._sorted_entries_cache = sorted(
-                self._entries.items(), key=lambda x: len(x[0]), reverse=True
-            )
-        return self._sorted_entries_cache
-
     def _apply_pre(self, text: str) -> tuple[str, dict]:
         if not self._entries: return text, {}
         token_map = {}; result = text.replace(' ', ' ')
-        for src_lower, (src_orig, tgt) in self._get_sorted_entries():
-            pattern = _pattern_cache.get(src_lower)
+        sorted_entries = sorted(self._entries.items(), key=lambda x: len(x[0]), reverse=True)
+        for src_lower, (src_orig, tgt) in sorted_entries:
+            pattern = re.compile(r'(?<![A-Za-z0-9])' + re.escape(src_lower) + r'(?![A-Za-z0-9])', re.IGNORECASE)
             if pattern.search(result):
                 token = f'@@TK_{uuid.uuid4().hex[:8].upper()}@@'
                 token_map[token] = tgt
@@ -254,17 +201,14 @@ class ItalicDictionary:
 
     def __init__(self):
         self._entries: dict[str, str] = {}
-        self._sorted_entries_cache: list | None = None
 
     def add_term(self, term: str) -> None:
         t = term.strip()
         if t:
             self._entries[t.lower()] = t
-            self._sorted_entries_cache = None
 
     def clear(self) -> None:
         self._entries.clear()
-        self._sorted_entries_cache = None
 
     def load_defaults(self) -> int:
         try:
@@ -297,7 +241,6 @@ class ItalicDictionary:
                     term = row[0].strip()
                 if term and term.lower() not in skip_vals:
                     self._entries[term.lower()] = term; count += 1
-        self._sorted_entries_cache = None
         return count
 
     def load_from_excel(self, filepath: str, sheet_name: str | int = 0, 
@@ -318,7 +261,6 @@ class ItalicDictionary:
             term = str(row[col_term]).strip()
             if term and term.lower() not in skip_vals:
                 self._entries[term.lower()] = term; count += 1
-        self._sorted_entries_cache = None
         return count
 
     def load_from_google_sheet(self, url: str, term_col: str = 'term', 
@@ -345,7 +287,6 @@ class ItalicDictionary:
             term = str(row.get(col_term, '')).strip()
             if term and term.lower() not in skip_vals:
                 self._entries[term.lower()] = term; count += 1
-        self._sorted_entries_cache = None
         return count
 
     def __len__(self) -> int: return len(self._entries)
@@ -353,20 +294,13 @@ class ItalicDictionary:
     def list_terms(self) -> list[str]:
         return list(set(self._entries.values()))
 
-    def _get_sorted_entries(self) -> list:
-        """Cache sorted entries untuk performa."""
-        if self._sorted_entries_cache is None:
-            self._sorted_entries_cache = sorted(
-                self._entries.items(), key=lambda x: len(x[0]), reverse=True
-            )
-        return self._sorted_entries_cache
-
     def _apply_pre(self, text: str) -> tuple[str, dict]:
         if not self._entries: return text, {}
         token_map = {}
         result = text
-        for term_lower, term_orig in self._get_sorted_entries():
-            pattern = _pattern_cache.get(term_lower)
+        sorted_entries = sorted(self._entries.items(), key=lambda x: len(x[0]), reverse=True)
+        for term_lower, term_orig in sorted_entries:
+            pattern = re.compile(r'(?<![A-Za-z0-9])' + re.escape(term_lower) + r'(?![A-Za-z0-9])', re.IGNORECASE)
             if pattern.search(result):
                 token = f'@@IT_{uuid.uuid4().hex[:8].upper()}@@'
                 token_map[token] = term_orig
@@ -498,12 +432,14 @@ def _translate_hyperlinks_in_para(para, tr) -> None:
     p_el = para._element
     
     for hl in p_el.findall(f'{_W}hyperlink'):
+        # 1. Dapatkan semua elemen <w:t> di dalam hyperlink ini
         t_els = hl.findall(f'.//{_W}t')
         hl_text = ''.join(t.text or '' for t in t_els).strip()
         
         if not hl_text:
             continue
         
+        # 2. Terjemahkan teks (dengan perlindungan italic)
         text_to_translate = hl_text
         italic_map = {}
         
@@ -515,11 +451,13 @@ def _translate_hyperlinks_in_para(para, tr) -> None:
         if italic_map and tr.italic_dict:
             translated, _ = tr.italic_dict._apply_post(translated, italic_map)
         
+        # 3. Ganti teks di dalam hyperlink (AMAN: hanya mengubah .text)
         if t_els:
             t_els[0].text = translated
             for t_el in t_els[1:]:
                 t_el.text = ''
         
+        # 4. Ganti URL di relationship file (AMAN: hanya mengubah atribut)
         r_id = hl.get(f'{_R}id', '')
         if r_id:
             try:
@@ -527,7 +465,7 @@ def _translate_hyperlinks_in_para(para, tr) -> None:
                 if r_id in rels:
                     rels[r_id]._target = _get_next_link_placeholder()
             except Exception:
-                pass
+                pass  # Jika gagal, biarkan URL lama (lebih baik daripada corrupt)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -870,12 +808,8 @@ def _notify(cb, pct: int, msg: str) -> None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# TRANSLATOR WRAPPER — dengan BATCH TRANSLATION
+# TRANSLATOR WRAPPER
 # ─────────────────────────────────────────────────────────────────────────────
-
-# Separator yang sangat tidak mungkin muncul di teks dokumen
-_BATCH_SEP = "\n|||SPLIT|||\n"
-_MAX_BATCH_CHARS = 4500  # batas aman Google Translate API (~5000 chars)
 
 class _Translator:
     def __init__(self, source: str = 'auto', target: str = 'id', 
@@ -886,20 +820,6 @@ class _Translator:
         self._cls = GoogleTranslator
         self.source = source; self.target = target
         self.custom_dict = custom_dict; self.italic_dict = italic_dict
-        self._lock = threading.Lock()
-
-    def _do_translate(self, text: str) -> str:
-        """Low-level translate dengan retry."""
-        try:
-            result = self._cls(source=self.source, target=self.target).translate(text)
-            return result if result else text
-        except Exception:
-            time.sleep(_TRANSLATE_DELAY_RETRY)
-            try:
-                result = self._cls(source=self.source, target=self.target).translate(text)
-                return result if result else text
-            except Exception:
-                return text
 
     def translate_one(self, text: str, italic_map: dict = None) -> tuple[str, list[str]]:
         t = text.strip()
@@ -908,67 +828,20 @@ class _Translator:
         if self.custom_dict and len(self.custom_dict) > 0:
             t, token_map = self.custom_dict._apply_pre(t)
         final_italic_map = italic_map or {}
-        result = self._do_translate(t)
+        try:
+            result = self._cls(source=self.source, target=self.target).translate(t)
+            if not result: result = t
+        except Exception:
+            time.sleep(0.8)
+            try:
+                result = self._cls(source=self.source, target=self.target).translate(t)
+                if not result: result = t
+            except Exception: result = t
         if token_map: result = self.custom_dict._apply_post(result, token_map)
         italic_terms_found = []
         if final_italic_map and self.italic_dict:
             result, italic_terms_found = self.italic_dict._apply_post(result, final_italic_map)
         return result, italic_terms_found
-
-    def translate_batch(self, texts: list[str]) -> list[str]:
-        """
-        Terjemahkan list teks sekaligus dalam satu request.
-        Menggunakan separator untuk memisahkan teks.
-        Dipecah jika total karakter melebihi batas.
-        """
-        if not texts:
-            return []
-        
-        results = [''] * len(texts)
-        
-        # Kelompokkan teks berdasarkan batas karakter
-        groups = []  # list of (indices, joined_text)
-        current_indices = []
-        current_parts = []
-        current_len = 0
-        
-        for i, text in enumerate(texts):
-            t = text.strip()
-            part_len = len(t) + len(_BATCH_SEP)
-            
-            if current_indices and (current_len + part_len > _MAX_BATCH_CHARS):
-                groups.append((current_indices, _BATCH_SEP.join(current_parts)))
-                current_indices = []
-                current_parts = []
-                current_len = 0
-            
-            current_indices.append(i)
-            current_parts.append(t)
-            current_len += part_len
-        
-        if current_indices:
-            groups.append((current_indices, _BATCH_SEP.join(current_parts)))
-        
-        for indices, joined in groups:
-            if not joined.strip():
-                continue
-            translated_joined = self._do_translate(joined)
-            time.sleep(_TRANSLATE_DELAY)
-            
-            # Split hasil terjemahan
-            parts = translated_joined.split(_BATCH_SEP.strip())
-            # Fallback: coba split dengan variasi separator
-            if len(parts) != len(indices):
-                parts = re.split(r'\|\|\|SPLIT\|\|\|', translated_joined)
-            
-            for j, idx in enumerate(indices):
-                if j < len(parts):
-                    results[idx] = parts[j].strip()
-                else:
-                    # Fallback: terjemahkan satu per satu jika split gagal
-                    results[idx] = self._do_translate(texts[idx])
-        
-        return results
 
 def _match_capitalization(original: str, translated: str) -> str:
     orig = original.strip(); tran = translated.strip()
@@ -983,17 +856,21 @@ def _match_capitalization(original: str, translated: str) -> str:
 
 def _translate_para(para, tr, past_bibliography: bool = False) -> list[str]:
     """
-    Terjemahkan paragraf (single mode — digunakan untuk annex, bibliografi, dll).
-    Hyperlink ditangani SECARA TERPISAH dan AMAN.
+    Terjemahkan paragraf.
+    Hyperlink ditangani SECARA TERPISAH dan AMAN (tidak merusak XML).
     """
     if _skip_paragraph(para, past_bibliography): return []
     
     p_el = para._element
+    
+    # 1. Cek apakah ada hyperlink
     has_hl = _has_hyperlinks(para)
     
+    # 2. Proses TEKS NORMAL (bukan hyperlink)
     text_runs = [(i, r) for i, r in enumerate(para.runs) if r.text and r.text.strip()]
     
     if not text_runs:
+        # Jika tidak ada teks normal, hanya terjemahkan hyperlink (jika ada)
         if has_hl:
             _translate_hyperlinks_in_para(para, tr)
         return []
@@ -1004,6 +881,7 @@ def _translate_para(para, tr, past_bibliography: bool = False) -> list[str]:
             _translate_hyperlinks_in_para(para, tr)
         return []
     
+    # Get font
     font_name = 'Arial'; font_size = None
     for run in para.runs:
         if run.text.strip():
@@ -1011,10 +889,12 @@ def _translate_para(para, tr, past_bibliography: bool = False) -> list[str]:
             if run.font.size: font_size = run.font.size.pt if run.font.size else None
             break
     
+    # Proteksi italic
     italic_map = {}
     if tr.italic_dict and len(tr.italic_dict) > 0:
         combined, italic_map = tr.italic_dict._apply_pre(combined)
     
+    # Terjemahkan
     translated, italic_terms_found = tr.translate_one(combined, italic_map)
     time.sleep(_TRANSLATE_DELAY)
     if not translated or translated == combined: 
@@ -1023,6 +903,7 @@ def _translate_para(para, tr, past_bibliography: bool = False) -> list[str]:
         return []
     translated = _match_capitalization(combined, translated)
     
+    # Apply formatting ke teks normal
     if italic_terms_found:
         _apply_mixed_formatting_to_para(para, translated, italic_terms_found, font_name, font_size)
     else:
@@ -1032,23 +913,11 @@ def _translate_para(para, tr, past_bibliography: bool = False) -> list[str]:
         else:
             para.add_run(translated)
     
+    # 3. TERJEMAHKAN HYPERLINK SECARA TERPISAH (AMAN)
     if has_hl:
         _translate_hyperlinks_in_para(para, tr)
     
     return italic_terms_found
-
-
-def _apply_translated_to_para(para, translated: str, italic_terms_found: list[str],
-                               font_name: str = 'Arial', font_size=None) -> None:
-    """Terapkan hasil terjemahan ke paragraf."""
-    if italic_terms_found:
-        _apply_mixed_formatting_to_para(para, translated, italic_terms_found, font_name, font_size)
-    else:
-        if para.runs:
-            para.runs[0].text = translated
-            for r in para.runs[1:]: r.text = ''
-        else:
-            para.add_run(translated)
 
 
 def _translate_table(table, tr) -> None:
@@ -1138,39 +1007,13 @@ def _sync_foreword_title(doc: Document, cover_id: str, cover_en: str) -> None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# BATCH TRANSLATION ENGINE — INTI OPTIMASI
+# MAIN ENGINE (FIXED)
 # ─────────────────────────────────────────────────────────────────────────────
-
-def _collect_para_info(para) -> dict | None:
-    """
-    Kumpulkan info paragraf untuk batch translation.
-    Return None jika paragraf harus di-skip.
-    """
-    text_runs = [(i, r) for i, r in enumerate(para.runs) if r.text and r.text.strip()]
-    if not text_runs:
-        return None
-    combined = ''.join(r.text for _, r in text_runs).strip()
-    if _skip_text(combined):
-        return None
-    font_name = 'Arial'; font_size = None
-    for run in para.runs:
-        if run.text.strip():
-            if run.font.name: font_name = run.font.name
-            if run.font.size: font_size = run.font.size.pt if run.font.size else None
-            break
-    return {
-        'combined': combined,
-        'font_name': font_name,
-        'font_size': font_size,
-        'has_hl': _has_hyperlinks(para),
-    }
-
 
 class DocxFinalTranslatorEngine:
     """
     Engine utama dengan 2 SPREADSHEET TERPISAH.
     FIXED: Hyperlink handling sekarang AMAN (tidak corrupt file).
-    OPTIMASI v3: Batch translation, reduce delay, pattern cache.
     """
     
     def __init__(self, source_lang: str = 'auto', target_lang: str = 'id', 
@@ -1222,180 +1065,56 @@ class DocxFinalTranslatorEngine:
 
             total = len(items); done = 0; past_bibliography = False
             annex_counter = 0; italic_count = 0; link_count = 0
+            # Statistik detail untuk callback
             _stat_trans = 0; _stat_skip = 0; _stat_tbl = 0
             _stat_cover = 0; _stat_annex = 0
 
-            # ── OPTIMASI: Kumpulkan paragraf normal untuk BATCH translation ──
-            # Kelompok batch: paragraf biasa yang bisa diterjemahkan sekaligus
-            # Annex, bibliografi, dan cover-italic tetap di-handle satu per satu
-            
-            # Phase 1: Identifikasi semua paragraf dan kelompokkan
-            batch_queue = []   # list of (idx_in_items, para, info_dict)
-            special_items = {} # idx -> {'type': 'annex'/'bib'/'cover_italic'/'skip'/'table'}
-            
-            for idx, (kind, obj, in_cover) in enumerate(items):
+            for kind, obj, in_cover in items:
+                done += 1; pct = 5 + int(done / max(total, 1) * 60)
                 if kind == 'para':
-                    para = obj
-                    is_bib = _is_biblio_title_para(para)
+                    para = obj; is_bib = _is_biblio_title_para(para)
                     is_annex = _get_para_style_id(para) in _ANNEX_STYLE_IDS
-                    
-                    if in_cover and _all_runs_italic(para):
-                        special_items[idx] = {'type': 'cover_italic'}
-                    elif is_bib:
-                        special_items[idx] = {'type': 'bib'}
-                    elif is_annex and not past_bibliography:
-                        special_items[idx] = {'type': 'annex'}
-                    elif _skip_paragraph(para, past_bibliography):
-                        special_items[idx] = {'type': 'skip'}
-                    else:
-                        # Kandidat untuk batch
-                        info = _collect_para_info(para)
-                        if info:
-                            batch_queue.append((idx, para, info))
-                        else:
-                            special_items[idx] = {'type': 'skip'}
-                elif kind == 'table':
-                    special_items[idx] = {'type': 'table'}
-
-            # Phase 2: Proses semua item — batch untuk normal, individual untuk special
-            # Kita perlu mempertahankan order untuk progress callback
-            # Strategi: proses batch dalam window kecil, interleave dengan special
-
-            # Pre-process italic tokens untuk semua batch items
-            batch_prepped = []  # (idx, para, original_text, prepped_text, italic_map, font_name, font_size, has_hl)
-            for idx, para, info in batch_queue:
-                combined = info['combined']
-                italic_map = {}
-                if tr.italic_dict and len(tr.italic_dict) > 0:
-                    combined, italic_map = tr.italic_dict._apply_pre(combined)
-                # Apply custom dict pre
-                token_map = {}
-                prepped = combined
-                if tr.custom_dict and len(tr.custom_dict) > 0:
-                    prepped, token_map = tr.custom_dict._apply_pre(combined)
-                batch_prepped.append((idx, para, info['combined'], prepped, italic_map, token_map,
-                                      info['font_name'], info['font_size'], info['has_hl']))
-
-            # Translate batch dalam grup
-            WINDOW = 30  # max paragraf per batch call
-            batch_results = {}  # idx -> translated_text
-
-            total_batches = (len(batch_prepped) + WINDOW - 1) // WINDOW if batch_prepped else 0
-            
-            for b_start in range(0, len(batch_prepped), WINDOW):
-                b_end = min(b_start + WINDOW, len(batch_prepped))
-                chunk = batch_prepped[b_start:b_end]
-                
-                texts_to_translate = [item[3] for item in chunk]  # prepped text
-                
-                # Filter yang perlu diterjemahkan
-                translate_needed = []
-                translate_idx_map = []
-                for ci, text in enumerate(texts_to_translate):
-                    if text.strip() and not _skip_text(text):
-                        translate_needed.append(text)
-                        translate_idx_map.append(ci)
-                
-                if translate_needed:
-                    translated_list = tr.translate_batch(translate_needed)
-                else:
-                    translated_list = []
-                
-                for ci, item in enumerate(chunk):
-                    idx, para, original, prepped, italic_map, token_map, font_name, font_size, has_hl = item
-                    
-                    # Cari hasil terjemahan
-                    if ci in translate_idx_map:
-                        ti = translate_idx_map.index(ci)
-                        result = translated_list[ti] if ti < len(translated_list) else prepped
-                    else:
-                        result = prepped
-                    
-                    # Post-process custom dict
-                    if token_map and tr.custom_dict:
-                        result = tr.custom_dict._apply_post(result, token_map)
-                    
-                    # Post-process italic
-                    italic_terms_found = []
-                    if italic_map and tr.italic_dict:
-                        result, italic_terms_found = tr.italic_dict._apply_post(result, italic_map)
-                    
-                    result = _match_capitalization(original, result)
-                    batch_results[idx] = (result, italic_terms_found, has_hl, font_name, font_size)
-                
-                pct_batch = 5 + int((b_start / max(len(batch_prepped), 1)) * 55)
-                _notify(progress_callback, pct_batch,
-                    f"[batch] {b_start}–{b_end}/{len(batch_prepped)}\t{done}/{total}\t{_stat_trans}\t{_stat_skip}\t{_stat_tbl}\t-")
-
-            # Phase 3: Terapkan semua hasil ke dokumen, sambil track progress
-            # Re-scan items dalam order untuk apply + update stats + callback
-            past_bibliography = False  # reset
-            annex_counter = 0
-
-            for idx, (kind, obj, in_cover) in enumerate(items):
-                done += 1
-                pct = 5 + int(done / max(total, 1) * 60)
-                
-                if kind == 'para':
-                    para = obj
+                    hl_cnt = 1 if _has_hyperlinks(para) else 0
                     para_text = para.text.strip()
                     preview = (para_text[:55] + "…") if len(para_text) > 55 else para_text
-                    
-                    sp = special_items.get(idx)
-                    
-                    if sp:
-                        sp_type = sp['type']
-                        if sp_type == 'cover_italic':
-                            _stat_cover += 1
-                            _notify(progress_callback, pct,
-                                f"[cover-italic] skip\t{done}/{total}\t{_stat_trans}\t{_stat_skip}\t{_stat_tbl}\t{preview}")
-                        elif sp_type == 'bib':
-                            italic_count += len(_translate_para(para, tr))
-                            past_bibliography = True
-                            _stat_trans += 1
-                            _notify(progress_callback, pct,
-                                f"[bibliografi] translate\t{done}/{total}\t{_stat_trans}\t{_stat_skip}\t{_stat_tbl}\t{preview}")
-                        elif sp_type == 'annex':
-                            _translate_para(para, tr)
-                            _fix_annex_style_para(para, chr(ord('A') + annex_counter))
-                            annex_counter += 1
-                            _stat_annex += 1
-                            _notify(progress_callback, pct,
-                                f"[annex] translate\t{done}/{total}\t{_stat_trans}\t{_stat_skip}\t{_stat_tbl}\t{preview}")
-                        else:  # skip
-                            _stat_skip += 1
-                            style_name = (para.style.name or "").lower()
-                            if any(s in style_name for s in ['heading', 'toc', 'header', 'footer']):
-                                reason = style_name.split()[0] if style_name else "style"
-                            elif not para_text:
-                                reason = "kosong"
-                            else:
-                                reason = "skip"
-                            _notify(progress_callback, pct,
-                                f"[{reason}] skip\t{done}/{total}\t{_stat_trans}\t{_stat_skip}\t{_stat_tbl}\t{preview}")
-                    
-                    elif idx in batch_results:
-                        result, italic_terms_found, has_hl, font_name, font_size = batch_results[idx]
-                        
-                        if result and result != para_text:
-                            _apply_translated_to_para(para, result, italic_terms_found, font_name, font_size)
-                        
-                        if has_hl:
-                            _translate_hyperlinks_in_para(para, tr)
-                            link_count += 1
-                        
-                        il = len(italic_terms_found)
+
+                    if in_cover and _all_runs_italic(para):
+                        _stat_cover += 1
+                        _notify(progress_callback, pct,
+                            f"[cover-italic] skip\t{done}/{total}\t{_stat_trans}\t{_stat_skip}\t{_stat_tbl}\t{preview}")
+                    elif is_bib:
+                        italic_count += len(_translate_para(para, tr))
+                        past_bibliography = True
+                        _stat_trans += 1
+                        _notify(progress_callback, pct,
+                            f"[bibliografi] translate\t{done}/{total}\t{_stat_trans}\t{_stat_skip}\t{_stat_tbl}\t{preview}")
+                    elif is_annex and not past_bibliography:
+                        _translate_para(para, tr)
+                        _fix_annex_style_para(para, chr(ord('A') + annex_counter))
+                        annex_counter += 1
+                        _stat_annex += 1
+                        _notify(progress_callback, pct,
+                            f"[annex] translate\t{done}/{total}\t{_stat_trans}\t{_stat_skip}\t{_stat_tbl}\t{preview}")
+                    elif _skip_paragraph(para, past_bibliography):
+                        _stat_skip += 1
+                        style_name = (para.style.name or "").lower()
+                        if any(s in style_name for s in ['heading', 'toc', 'header', 'footer']):
+                            reason = style_name.split()[0] if style_name else "style"
+                        elif not para_text:
+                            reason = "kosong"
+                        else:
+                            reason = "skip"
+                        _notify(progress_callback, pct,
+                            f"[{reason}] skip\t{done}/{total}\t{_stat_trans}\t{_stat_skip}\t{_stat_tbl}\t{preview}")
+                    else:
+                        il = len(_translate_para(para, tr))
                         italic_count += il
+                        link_count += hl_cnt
                         _stat_trans += 1
                         italic_tag = f" +{il}miring" if il else ""
-                        link_tag = " +link" if has_hl else ""
+                        link_tag = f" +link" if hl_cnt else ""
                         _notify(progress_callback, pct,
                             f"[translate{italic_tag}{link_tag}] done\t{done}/{total}\t{_stat_trans}\t{_stat_skip}\t{_stat_tbl}\t{preview}")
-                    else:
-                        _stat_skip += 1
-                        _notify(progress_callback, pct,
-                            f"[skip] skip\t{done}/{total}\t{_stat_trans}\t{_stat_skip}\t{_stat_tbl}\t{preview}")
-
                 elif kind == 'table':
                     if not past_bibliography:
                         _translate_table(obj, tr)
