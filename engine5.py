@@ -226,30 +226,85 @@ def extract_headings_from_docx(docx_path: str) -> list:
 
 # ─────────────────────────────────────────────────────────────────────────────
 # DAFTAR ISI BUILDER
+# Menggunakan Word TOC field sesuai standar:
+#   - TOC dibangun dari style "Title" dan "Subtitle" saja (TOC level 1)
+#   - Style lain (Heading 1/2/3, dll) TIDAK dimasukkan ke TOC
+#   - TOC 1 style: Arial 11pt, Justified, Indent Left 0cm Hanging 1.27cm,
+#     Right 0.88cm, Spacing After 6pt, Single
+#   - Show page numbers, Right align, Tab leader dotted
 # ─────────────────────────────────────────────────────────────────────────────
-# Indent twips per level
-LEVEL_INDENT = {0: 0, 1: 360, 2: 720}
 
 def _build_di_elements(hdr_odd, hdr_even, ftr_odd, ftr_even, heading_entries=None):
     """
-    Return list of raw XML strings untuk paragraf DI + inline sectPr.
+    Return list of raw XML strings untuk halaman Daftar Isi + inline sectPr.
 
-    heading_entries: list of (text, level) dari extract_headings_from_docx().
-                     Jika None → gunakan fallback statis.
+    Menggunakan Word TOC field dengan opsi:
+      - \t "Title,1,Subtitle,1"  → hanya style Title & Subtitle masuk TOC level 1
+      - \z                        → hide tab/page numbers in Web Layout
+      - \h                        → hyperlink entries
+      - page numbers ditampilkan, right-aligned, dengan tab leader titik-titik
     """
-    TAB  = 9061
-    top  = cm_to_twips(3);   bottom = cm_to_twips(2)
-    left = cm_to_twips(3);   right  = cm_to_twips(2)
-    pw   = cm_to_twips(21);  ph     = cm_to_twips(29.7)
+    top   = cm_to_twips(3);   bottom = cm_to_twips(2)
+    left  = cm_to_twips(3);   right  = cm_to_twips(2)
+    pw    = cm_to_twips(21);  ph     = cm_to_twips(29.7)
+
+    # Konversi ke twips:
+    #   Hanging 1.27 cm = 719 twips, Right margin 0.88 cm = 499 twips
+    TOC_LEFT    = 0
+    TOC_HANGING = 719   # 1.27 cm
+    TOC_RIGHT   = 499   # 0.88 cm (right indent dari tepi teks)
+    # Tab stop untuk nomor halaman: lebar area tulis - right indent
+    # lebar tulis = pw - left_margin - right_margin
+    WRITE_WIDTH = pw - left - right          # twips
+    TAB_POS     = WRITE_WIDTH - TOC_RIGHT    # posisi tab nomor halaman
+
+    sz = pt_to_hpts(11)
+
+    def _toc1_rpr():
+        """Run properties untuk style TOC 1: Arial 11pt (tidak bold sesuai Word default)."""
+        return (
+            f'<w:rPr>'
+            f'<w:rFonts w:ascii="Arial" w:hAnsi="Arial" w:cs="Arial"/>'
+            f'<w:sz w:val="{sz}"/><w:szCs w:val="{sz}"/>'
+            f'</w:rPr>'
+        )
+
+    def _toc1_ppr():
+        """
+        Paragraph properties untuk style TOC 1:
+          Justified, Before 0pt After 6pt Single,
+          Indent Left 0cm Hanging 1.27cm,
+          Tab stop: right + dotted leader di TAB_POS
+        """
+        after_twips = pt_to_hpts(6) * 10  # 6pt → twips (6 * 20 = 120)
+        return (
+            f'<w:pPr>'
+            f'<w:pStyle w:val="TOC1"/>'
+            f'<w:jc w:val="both"/>'
+            f'<w:spacing w:before="0" w:after="120" w:line="240" w:lineRule="auto"/>'
+            f'<w:ind w:left="{TOC_LEFT}" w:hanging="{TOC_HANGING}"/>'
+            f'<w:tabs>'
+            f'<w:tab w:val="right" w:leader="dot" w:pos="{TAB_POS}"/>'
+            f'</w:tabs>'
+            f'</w:pPr>'
+        )
 
     def title_p():
+        """Judul halaman 'Daftar Isi': Arial 12pt Bold Centered, style Title."""
+        sz12 = pt_to_hpts(12)
         return (
             f'<w:p><w:pPr>'
+            f'<w:pStyle w:val="Title"/>'
             f'<w:jc w:val="center"/>'
             f'<w:spacing w:before="0" w:after="0"/>'
-            f'<w:tabs><w:tab w:val="right" w:leader="dot" w:pos="{TAB}"/></w:tabs>'
             f'</w:pPr>'
-            f'{_run("Daftar Isi", bold=True, size_pt=12, italic=False)}'
+            f'<w:r><w:rPr>'
+            f'<w:rFonts w:ascii="Arial" w:hAnsi="Arial" w:cs="Arial"/>'
+            f'<w:b/><w:sz w:val="{sz12}"/><w:szCs w:val="{sz12}"/>'
+            f'<w:color w:val="000000"/>'
+            f'<w:spacing w:val="-10"/>'
+            f'<w:kern w:val="28"/>'
+            f'</w:rPr><w:t>Daftar Isi</w:t></w:r>'
             f'</w:p>'
         )
 
@@ -260,24 +315,35 @@ def _build_di_elements(hdr_odd, hdr_even, ftr_odd, ftr_even, heading_entries=Non
             f'</w:pPr></w:p>'
         )
 
-    def entry_p(text, level=0):
-        indent_val = LEVEL_INDENT.get(level, 0)
-        ind = f'<w:ind w:left="{indent_val}"/>' if indent_val else ''
-        sz  = pt_to_hpts(11)
-        run = (
-            f'<w:r><w:rPr>'
-            f'<w:rFonts w:ascii="Arial" w:hAnsi="Arial" w:cs="Arial"/>'
-            f'<w:b/><w:sz w:val="{sz}"/><w:szCs w:val="{sz}"/>'
-            f'</w:rPr><w:t xml:space="preserve">{_esc(text)}</w:t></w:r>'
-        ) if text else ''
+    def toc_field_p():
+        """
+        Paragraf berisi Word TOC field:
+          \\t "Title,1,Subtitle,1"  → hanya style Title & Subtitle di TOC level 1
+          \\z                        → sembunyikan di web view
+          \\h                        → hyperlink
+
+        Menggunakan instruksi TOC standar Word yang menghasilkan daftar isi
+        dengan nomor halaman, right-aligned, tab leader titik-titik (......).
+        """
+        toc_instr = ' TOC \\t "Title,1,Subtitle,1" \\z \\h '
         return (
-            f'<w:p><w:pPr>'
-            f'<w:jc w:val="left"/>'
-            f'<w:spacing w:before="0" w:after="120"/>'
-            f'<w:tabs><w:tab w:val="right" w:leader="dot" w:pos="{TAB}"/></w:tabs>'
-            f'{ind}'
-            f'</w:pPr>'
-            f'{run}<w:r><w:tab/></w:r>'
+            # Paragraf pembuka field TOC dengan pStyle TOC1
+            f'<w:p>'
+            f'{_toc1_ppr()}'
+            # fldChar begin
+            f'<w:r>{_toc1_rpr()}<w:fldChar w:fldCharType="begin" w:dirty="true"/></w:r>'
+            # instrText
+            f'<w:r>{_toc1_rpr()}'
+            f'<w:instrText xml:space="preserve">{_esc(toc_instr)}</w:instrText>'
+            f'</w:r>'
+            # fldChar separate → placeholder hasil lama (kosong, akan diupdate Word)
+            f'<w:r>{_toc1_rpr()}<w:fldChar w:fldCharType="separate"/></w:r>'
+            # Teks placeholder sementara (akan diganti Word saat Update Field)
+            f'<w:r>{_toc1_rpr()}'
+            f'<w:t>[ Klik kanan → Update Field untuk memperbarui Daftar Isi ]</w:t>'
+            f'</w:r>'
+            # fldChar end
+            f'<w:r>{_toc1_rpr()}<w:fldChar w:fldCharType="end"/></w:r>'
             f'</w:p>'
         )
 
@@ -297,32 +363,16 @@ def _build_di_elements(hdr_odd, hdr_even, ftr_odd, ftr_even, heading_entries=Non
             f'</w:sectPr></w:pPr></w:p>'
         )
 
-    # ── Fallback statis jika tidak ada heading yang diekstrak ──
-    if not heading_entries:
-        heading_entries = [
-            ('1    Ruang Lingkup', 0),
-            ('2    Acuan Normatif', 0),
-            ('3    Istilah dan Definisi', 0),
-            ('4    ...', 0),
-            ('5    ...', 0),
-            ('Lampiran A (informatif)', 0),
-            ('Bibliografi', 0),
-        ]
-
-    # ── Header tetap ──
-    fixed_top = [
-        ('Kata Pendahuluan', 0),
-        ('Daftar Isi', 0),
-        ('Pendahuluan', 0),
+    # ── Susun halaman Daftar Isi ──
+    # Judul "Daftar Isi" + 3 baris kosong + TOC field + sectPr
+    xmls = [
+        title_p(),
+        empty_p(),
+        empty_p(),
+        empty_p(),
+        toc_field_p(),
+        sect_p(),
     ]
-
-    all_entries = fixed_top + heading_entries
-
-    xmls = (
-        [title_p(), empty_p(), empty_p(), empty_p()]
-        + [entry_p(text, level) for text, level in all_entries]
-        + [sect_p()]
-    )
     return xmls
 
 
@@ -417,6 +467,44 @@ class DaftarIsiEngine:
             if adds:
                 ct_xml = ct_xml.replace('</Types>', adds + '</Types>')
             files['[Content_Types].xml'] = ct_xml.encode('utf-8')
+
+            # 6b. Inject style TOC1 ke styles.xml jika belum ada
+            # Style TOC 1: Arial 11pt, Justified, Indent Left 0 Hanging 1.27cm,
+            #              Right 0.88cm, Spacing After 6pt (120 twips), Single
+            TOC1_STYLE = (
+                '<w:style w:type="paragraph" w:styleId="TOC1">'
+                '<w:name w:val="toc 1"/>'
+                '<w:basedOn w:val="Normal"/>'
+                '<w:next w:val="Normal"/>'
+                '<w:pPr>'
+                '<w:spacing w:after="120" w:line="240" w:lineRule="auto"/>'
+                '<w:ind w:left="0" w:hanging="719"/>'
+                '<w:jc w:val="both"/>'
+                '<w:tabs>'
+                '<w:tab w:val="right" w:leader="dot" w:pos="8562"/>'
+                '</w:tabs>'
+                '</w:pPr>'
+                '<w:rPr>'
+                '<w:rFonts w:ascii="Arial" w:hAnsi="Arial" w:cs="Arial"/>'
+                '<w:sz w:val="22"/><w:szCs w:val="22"/>'
+                '</w:rPr>'
+                '</w:style>'
+            )
+            if 'word/styles.xml' in files:
+                styles_xml = files['word/styles.xml'].decode('utf-8')
+                if 'styleId="TOC1"' not in styles_xml and '"toc 1"' not in styles_xml:
+                    styles_xml = styles_xml.replace('</w:styles>', TOC1_STYLE + '</w:styles>')
+                files['word/styles.xml'] = styles_xml.encode('utf-8')
+
+            # 6c. Tandai updateFields di settings.xml agar Word refresh TOC otomatis
+            if 'word/settings.xml' in files:
+                settings_xml = files['word/settings.xml'].decode('utf-8')
+                if 'updateFields' not in settings_xml:
+                    update_tag = '<w:updateFields w:val="true"/>'
+                    if '</w:settings>' in settings_xml:
+                        settings_xml = settings_xml.replace('</w:settings>',
+                                                            update_tag + '</w:settings>')
+                files['word/settings.xml'] = settings_xml.encode('utf-8')
 
             # 7. Parse document.xml
             tree = etree.fromstring(files['word/document.xml'])
