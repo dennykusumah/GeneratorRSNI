@@ -345,6 +345,44 @@ class DocxOptimizerEngine:
                     _szCs_new = _etree.SubElement(_rPr, f'{{{_WNS_W}}}szCs')
                     _szCs_new.set(f'{{{_WNS_W}}}val', _sz_val_current)
 
+            def _apply_title_run_format(run, font_name, font_size_pt=12):
+                """
+                Terapkan formatting sesuai style 'Title' pada sebuah run:
+                  - Font: Arial 12pt Bold
+                  - Warna: hitam (000000)
+                  - Character Spacing: Condensed 0.5pt (w:spacing val="-10" twips)
+                  - Kern: 14pt (w:kern val="28" half-points)
+                """
+                W = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
+
+                run.bold = True
+                run.font.name = font_name
+                run.font.size = Pt(font_size_pt)
+
+                rPr = run._r.get_or_add_rPr()
+
+                # Paksa warna hitam
+                for el in rPr.findall(f'{{{W}}}color'):
+                    rPr.remove(el)
+                color_el = OxmlElement('w:color')
+                color_el.set(qn('w:val'), '000000')
+                rPr.insert(0, color_el)
+
+                # Character spacing Condensed 0.5pt
+                # Word menyimpan dalam satuan twips (1/20 pt); -0.5pt = -10 twips
+                for el in rPr.findall(f'{{{W}}}spacing'):
+                    rPr.remove(el)
+                spacing_el = OxmlElement('w:spacing')
+                spacing_el.set(qn('w:val'), '-10')
+                rPr.append(spacing_el)
+
+                # Kern 14pt → w:kern val dalam half-points: 14pt * 2 = 28
+                for el in rPr.findall(f'{{{W}}}kern'):
+                    rPr.remove(el)
+                kern_el = OxmlElement('w:kern')
+                kern_el.set(qn('w:val'), '28')
+                rPr.append(kern_el)
+
             def clean_format(paragraph, is_heading=False):
                 pf = paragraph.paragraph_format
                 pf.space_before = Pt(0)
@@ -545,8 +583,12 @@ class DocxOptimizerEngine:
                     # Special heading
                     _is_biblio_title = p.style and p.style.name == 'Biblio Title'
                     _is_annex_style = p.style and p.style.name.upper() in ('ANNEX', 'ANNEX HEADING')
+                    _is_title_style_heading = bool(re.match(
+                        r'^(daftar\s+isi|pendahuluan|kata\s+pengantar|bibliography|bibliografi)',
+                        txt, re.IGNORECASE
+                    ))
                     _is_special = _is_biblio_title or _is_annex_style or bool(re.match(
-                        r'^(bibliography|bibliografi|annex|lampiran|foreword|kata\s+pengantar|index|indeks)',
+                        r'^(bibliography|bibliografi|annex|lampiran|foreword|kata\s+pengantar|index|indeks|daftar\s+isi|pendahuluan)',
                         txt, re.IGNORECASE
                     ))
                     if _is_special:
@@ -592,8 +634,42 @@ class DocxOptimizerEngine:
                                             # Hapus br dari run berikutnya (br ekstra sebelum judul)
                                             for br in next_brs:
                                                 next_el.remove(br)
+
+                        elif _is_title_style_heading:
+                            # Daftar Isi, Pendahuluan, Kata Pengantar, Bibliografi
+                            # → Terapkan style "Title": Arial 12pt Bold, Centered,
+                            #   Spacing 0/0, Single, Condensed 0.5pt, Kern 14pt
+                            from docx.enum.text import WD_LINE_SPACING
+                            from lxml import etree as _etree
+
+                            pf.line_spacing_rule = WD_LINE_SPACING.SINGLE
+                            pf.line_spacing = None  # reset ke single default
+
+                            # Terapkan style Title jika tersedia di dokumen
+                            try:
+                                p.style = doc.styles['Title']
+                            except (KeyError, Exception):
+                                pass  # jika style tidak ada, lanjut dengan formatting manual
+
+                            # Override formatting runs agar sesuai spesifikasi Title
+                            _title_font_size = 12
+                            if not p.runs:
+                                r = p.add_run(p.text)
+                                _apply_title_run_format(r, font_name, _title_font_size)
+                            else:
+                                for run in p.runs:
+                                    _apply_title_run_format(run, font_name, _title_font_size)
+
+                            # Re-apply paragraph format setelah set style (style bisa override)
+                            pf = p.paragraph_format
+                            p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                            pf.space_before = Pt(0)
+                            pf.space_after = Pt(0)
+                            pf.line_spacing_rule = WD_LINE_SPACING.SINGLE
+                            pf.line_spacing = None
+
                         else:
-                            # Non-ANNEX special headings (Bibliography, Foreword, dll): 11pt
+                            # Non-ANNEX special headings (Foreword, dll): 11pt
                             pf.line_spacing = 1.0
                             if not p.runs:
                                 r = p.add_run(p.text)
