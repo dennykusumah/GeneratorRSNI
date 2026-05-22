@@ -383,6 +383,58 @@ class DocxOptimizerEngine:
                 kern_el.set(qn('w:val'), '28')
                 rPr.append(kern_el)
 
+            def _apply_subtitle_run_format(run, font_name, font_size_pt=11):
+                """
+                Terapkan formatting sesuai style 'Subtitle' pada sebuah run:
+                  - Font: Arial 11pt Bold
+                  - Warna: Text 1 / hitam (000000)
+                  - Character Spacing: Expanded 0.75pt (w:spacing val="15" twips)
+                """
+                W = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
+
+                run.bold = True
+                run.font.name = font_name
+                run.font.size = Pt(font_size_pt)
+
+                rPr = run._r.get_or_add_rPr()
+
+                # Paksa warna hitam (Text 1)
+                for el in rPr.findall(f'{{{W}}}color'):
+                    rPr.remove(el)
+                color_el = OxmlElement('w:color')
+                color_el.set(qn('w:val'), '000000')
+                rPr.insert(0, color_el)
+
+                # Character spacing Expanded 0.75pt
+                # Word menyimpan dalam satuan twips (1/20 pt); +0.75pt ≈ +15 twips
+                for el in rPr.findall(f'{{{W}}}spacing'):
+                    rPr.remove(el)
+                spacing_el = OxmlElement('w:spacing')
+                spacing_el.set(qn('w:val'), '15')
+                rPr.append(spacing_el)
+
+                # Hapus kern jika ada (Subtitle tidak pakai kern)
+                for el in rPr.findall(f'{{{W}}}kern'):
+                    rPr.remove(el)
+
+            def _apply_subtitle_para_format(paragraph):
+                """
+                Terapkan paragraph format sesuai style 'Subtitle':
+                  - Assign style 'Subtitle' jika tersedia di dokumen
+                  - Alignment: Left, Spacing 0/0, Line spacing: Single
+                """
+                from docx.enum.text import WD_LINE_SPACING
+                try:
+                    paragraph.style = doc.styles['Subtitle']
+                except Exception:
+                    pass
+                paragraph.alignment = WD_ALIGN_PARAGRAPH.LEFT
+                pf = paragraph.paragraph_format
+                pf.space_before = Pt(0)
+                pf.space_after = Pt(0)
+                pf.line_spacing_rule = WD_LINE_SPACING.SINGLE
+                pf.line_spacing = None
+
             def clean_format(paragraph, is_heading=False):
                 pf = paragraph.paragraph_format
                 pf.space_before = Pt(0)
@@ -702,11 +754,11 @@ class DocxOptimizerEngine:
                                 p._element.addnext(blank_after._element)
                         continue
 
-                    # Regular heading
-                    p.alignment = WD_ALIGN_PARAGRAPH.LEFT
-                    clean_format(p)
+                    # Regular heading → Pasal / Subpasal / Subsubpasal
+                    # Terapkan style "Subtitle": Arial 11pt Bold, Left, 0/0 spacing, Single, Expanded 0.75pt
+                    _apply_subtitle_para_format(p)
                     for run in p.runs:
-                        run.bold = True
+                        _apply_subtitle_run_format(run, font_name, font_size)
 
                     # Track pasal 3
                     txt_lower = txt.lower()
@@ -762,21 +814,15 @@ class DocxOptimizerEngine:
                         if match_annex_sub:
                             p.text = f"{match_annex_sub.group(1)}    {match_annex_sub.group(2)}"
                         for run in p.runs:
-                            run.bold = True
-                            run.font.name = font_name
-                            run.font.size = Pt(font_size)
+                            _apply_subtitle_run_format(run, font_name, font_size)
                     elif match_annex_sub:
                         p.text = f"{match_annex_sub.group(1)}    {match_annex_sub.group(2)}"
                         for run in p.runs:
-                            run.bold = True
-                            run.font.name = font_name
-                            run.font.size = Pt(font_size)
+                            _apply_subtitle_run_format(run, font_name, font_size)
                     elif match_number and not match_bab:
                         p.text = f"{match_number.group(1)}    {match_number.group(2)}"
                         for run in p.runs:
-                            run.bold = True
-                            run.font.name = font_name
-                            run.font.size = Pt(font_size) # 11pt
+                            _apply_subtitle_run_format(run, font_name, font_size)
 
                     # Spacing setelah
                     # Di area bibliography/tail → jangan tambah blank
