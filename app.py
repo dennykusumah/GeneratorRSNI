@@ -979,8 +979,8 @@ if st.session_state.get('_run_process') and st.session_state.get('_target_file')
         }
 
         def _cb_tr(pct, msg):
-            # ── Petakan pct engine9 (0–100) → progress bar (10–100) ──────────
-            # engine9 pct: 2–5 init, 5–65 loop elemen, 66–100 post-processing
+            # ── Fallback pct (dipakai saat fase init/post-proc, bukan fase elemen) ──
+            # Fase elemen akan override ini dengan kalkulasi done/total di bawah
             final_pct = min(10 + int(pct * 0.90), 100)
 
             # ── Parse format tab-separated dari engine9 ──────────────────────
@@ -1014,14 +1014,12 @@ if st.session_state.get('_run_process') and st.session_state.get('_target_file')
                 total_ref = _cb_total[0] if _cb_total[0] > 0 else total_int
 
                 # ── Progress dihitung dari done/total elemen (fase loop) ──────
-                # engine9 fase loop: pct 5–65, done bergerak 1→total
-                # Petakan: elemen 0/total → 10%, elemen total/total → 65%
-                #   (sisanya 65%→100% dibiarkan dari pct engine9 untuk post-proc)
-                if total_ref > 0 and done_int > 0:
+                # Progress RIIL: elemen done/total → 10%–100%
+                # elemen 0/total = 10%,  elemen total/total = 100%
+                # Tidak ada cap di 65% — progress benar-benar mencerminkan pekerjaan
+                if total_ref > 0 and done_int >= 0:
                     elem_ratio = min(done_int / total_ref, 1.0)
-                    # Fase elemen menempati 10–65% progress bar
-                    final_pct = min(10 + int(elem_ratio * 55), 65)
-                # else: final_pct tetap dari rumus pct engine9 di atas
+                    final_pct  = min(10 + int(elem_ratio * 90), 100)
 
                 icon = _ICON.get(tag, _ICON.get(aksi, '🔄'))
 
