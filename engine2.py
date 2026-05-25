@@ -244,6 +244,211 @@ def setup_headers_footers(doc, doc_title="SNI ISO XXXXX:2025", copyright_text="�
 
 
 
+def _resolve_heading_numbers(doc):
+    """
+    Pra-proses dokumen: heading dengan auto-numbering (numPr) diubah menjadi
+    teks eksplisit 'N    Judul' sehingga engine dapat mendeteksi nomor pasal.
+
+    Mendukung pola %1, %1.%2, %1.%2.%3 dst. (decimal / outline numbering).
+    Nomor dihitung ulang secara manual dengan counter per-level sehingga tidak
+    bergantung pada rendering Word.
+
+    Hanya diterapkan pada paragraf dengan heading style (Heading 1, 2, …) atau
+    paragraf yang numId-nya sama dengan heading numId yang ditemukan dari definisi
+    style — bukan list item biasa.
+    """
+    from lxml import etree as _etree
+    W = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
+
+    # --- 1. Kumpulkan numId dan ilvl dari heading styles ---
+    # Heading 2-9 sering hanya punya ilvl (mewarisi numId dari Heading 1)
+    heading_style_num = {}
+    styles_el = doc.styles.element
+    for style in styles_el.iter(f'{{{W}}}style'):
+        style_id = style.get(f'{{{W}}}styleId', '')
+        if not (style_id.startswith('Heading') and 'Char' not in style_id):
+            continue
+        pPr = style.find(f'{{{W}}}pPr')
+        if pPr is None:
+            continue
+        numPr = pPr.find(f'{{{W}}}numPr')
+        if numPr is None:
+            continue
+        ilvl_el = numPr.find(f'{{{W}}}ilvl')
+        numId_el = numPr.find(f'{{{W}}}numId')
+        nid = numId_el.get(f'{{{W}}}val') if numId_el is not None else None
+        ilvl_val = int(ilvl_el.get(f'{{{W}}}val', '0')) if ilvl_el is not None else None
+        heading_style_num[style_id] = {'numId': nid, 'ilvl': ilvl_val}
+
+    # Warisi numId: Heading 2-9 yang tidak punya numId, ambil dari Heading 1
+    inherited_num_id = None
+    for _sid, _info in heading_style_num.items():
+        if _info['numId'] and _info['numId'] != '0':
+            inherited_num_id = _info['numId']
+            break
+    for _sid, _info in heading_style_num.items():
+        if (not _info['numId'] or _info['numId'] == '0') and inherited_num_id:
+            _info['numId'] = inherited_num_id
+        if _info['ilvl'] is None:
+            try:
+                _info['ilvl'] = int(_sid.replace('Heading', '').strip()) - 1
+            except ValueError:
+                _info['ilvl'] = 0
+
+    heading_num_ids = {_info['numId'] for _info in heading_style_num.values()
+                       if _info['numId'] and _info['numId'] != '0'}
+
+    if not heading_num_ids:
+        return  # Dokumen tidak pakai auto-numbering untuk heading
+
+    # --- 2. Bangun peta numId → abstractNumId → level formats ---
+    num_part = doc.part.numbering_part
+    if num_part is None:
+        return
+
+    num_root = num_part._element
+
+    # abstractNumId → {ilvl: lvlText_pattern}
+    abstract_lvl_text = {}
+    for absNum in num_root.findall(f'{{{W}}}abstractNum'):
+        abs_id = absNum.get(f'{{{W}}}abstractNumId')
+        lvl_map = {}
+        for lvl in absNum.findall(f'{{{W}}}lvl'):
+            ilvl_val = lvl.get(f'{{{W}}}ilvl')
+            lvlText_el = lvl.find(f'{{{W}}}lvlText')
+            numFmt_el = lvl.find(f'{{{W}}}numFmt')
+            pattern = lvlText_el.get(f'{{{W}}}val', '') if lvlText_el is not None else ''
+            fmt = numFmt_el.get(f'{{{W}}}val', '') if numFmt_el is not None else ''
+            lvl_map[int(ilvl_val)] = {'pattern': pattern, 'fmt': fmt}
+        abstract_lvl_text[abs_id] = lvl_map
+
+    # numId → abstractNumId
+    num_id_to_abstract = {}
+    for num_el in num_root.findall(f'{{{W}}}num'):
+        nid = num_el.get(f'{{{W}}}numId')
+        abst_el = num_el.find(f'{{{W}}}abstractNumId')
+        if abst_el is not None:
+            num_id_to_abstract[nid] = abst_el.get(f'{{{W}}}val')
+
+    # --- 3. Resolusi numId → level pattern ---
+    def get_level_pattern(num_id, ilvl):
+        abs_id = num_id_to_abstract.get(num_id)
+        if abs_id is None:
+            return None
+        lvl_map = abstract_lvl_text.get(abs_id, {})
+        return lvl_map.get(ilvl, {}).get('pattern')
+
+    # --- 4. Helper: format nomor dari pattern (misal '%1.%2') ---
+    def format_number(pattern, counters):
+        """Ganti %1, %2, … dengan nilai counter level 0, 1, …"""
+        result = pattern
+        # %N → counter[N-1]
+        for i in range(len(counters), 0, -1):
+            result = result.replace(f'%{i}', str(counters[i - 1]))
+        return result
+
+    # --- 5. Helper: ambil numPr dari paragraf (paragraf bisa override style) ---
+    def get_para_numpr(p):
+        pPr = p._element.find(f'{{{W}}}pPr')
+        if pPr is None:
+            return None, None
+        numPr = pPr.find(f'{{{W}}}numPr')
+        if numPr is None:
+            return None, None
+        ilvl_el = numPr.find(f'{{{W}}}ilvl')
+        numId_el = numPr.find(f'{{{W}}}numId')
+        ilvl = int(ilvl_el.get(f'{{{W}}}val', '0')) if ilvl_el is not None else 0
+        num_id = numId_el.get(f'{{{W}}}val') if numId_el is not None else None
+
+        # Nilai 0 di numId_el berarti "override ke tanpa numbering" → abaikan
+        if num_id == '0' or num_id is None:
+            return None, None
+        return num_id, ilvl
+
+    # Helper: resolusi ilvl heading dari style (jika paragraf sendiri tidak punya ilvl)
+    def get_style_ilvl(p):
+        if not (p.style and p.style.name):
+            return None
+        style_name = p.style.name
+        if 'Heading' not in style_name:
+            return None
+        sn = style_name.replace('Heading', '').strip()
+        try:
+            return int(sn) - 1  # "Heading 1" → ilvl 0
+        except ValueError:
+            return 0
+
+    # --- 6. Iterasi paragraf, hitung counter, sisipkan nomor ---
+    # Counter per-level (indeks 0 = level 1)
+    MAX_LEVELS = 9
+    counters = [0] * MAX_LEVELS
+
+    for p in doc.paragraphs:
+        txt = p.text.strip()
+
+        # Cek apakah paragraf ini adalah heading dengan numbering
+        is_heading_style = p.style and 'Heading' in p.style.name and 'Char' not in p.style.name
+
+        num_id, ilvl = get_para_numpr(p)
+
+        # Jika paragraf tidak punya numPr sendiri, lookup dari heading_style_num
+        if num_id is None and is_heading_style:
+            style_id = p.style.element.get(f'{{{W}}}styleId', '') if p.style.element is not None else ''
+            style_info = heading_style_num.get(style_id)
+            if style_info and style_info['numId'] and style_info['numId'] != '0':
+                num_id = style_info['numId']
+                ilvl = style_info['ilvl'] if style_info['ilvl'] is not None else 0
+
+        # Kalau masih tidak ada num_id, lewati
+        if num_id is None or num_id not in heading_num_ids:
+            continue
+
+        # Pastikan ada teks (skip paragraf kosong)
+        if not txt:
+            continue
+
+        # Kalau teks sudah dimulai dengan angka (sudah ada nomor eksplisit), skip
+        import re as _re
+        if _re.match(r'^\d', txt):
+            continue
+
+        # Update counter: reset level yang lebih dalam, increment level ini
+        counters[ilvl] += 1
+        for deeper in range(ilvl + 1, MAX_LEVELS):
+            counters[deeper] = 0
+
+        # Dapatkan pattern untuk level ini
+        pattern = get_level_pattern(num_id, ilvl)
+        if not pattern:
+            continue
+
+        # Format nomor
+        number_str = format_number(pattern, counters[:ilvl + 1])
+
+        # Sisipkan nomor ke dalam teks paragraf
+        # Hapus semua run, buat ulang dengan format "N    Teks"
+        new_text = f"{number_str}    {txt}"
+
+        # Hapus numPr dari pPr paragraf agar tidak ada double numbering
+        pPr_el = p._element.find(f'{{{W}}}pPr')
+        if pPr_el is not None:
+            for numPr_el in pPr_el.findall(f'{{{W}}}numPr'):
+                pPr_el.remove(numPr_el)
+
+        # Update teks runs: simpan formatting run pertama, hapus sisanya
+        runs = p.runs
+        if runs:
+            # Simpan run pertama dan update teksnya
+            first_run = runs[0]
+            first_run.text = new_text
+            # Hapus run sisanya
+            for run in runs[1:]:
+                run._r.getparent().remove(run._r)
+        else:
+            # Buat run baru
+            run_new = p.add_run(new_text)
+
+
 class DocxOptimizerEngine:
     """
     Engine untuk optimasi dokumen Word sesuai standar ISO/SNI
@@ -272,6 +477,10 @@ class DocxOptimizerEngine:
 
             # Hapus semua hyperlink → jadikan teks biasa
             remove_all_hyperlinks(doc)
+
+            # Konversi auto-numbering heading → nomor eksplisit (pasal/subpasal)
+            # agar engine dapat mendeteksi dan memformat nomor pasal dengan benar
+            _resolve_heading_numbers(doc)
 
             # Fix ukuran font autonumbering "Annex %1" → 12pt (24 half-points)
             # Label "Annex A" dirender dari numbering lvl rPr, bukan dari run paragraf
