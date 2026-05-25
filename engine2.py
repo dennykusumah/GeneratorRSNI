@@ -244,211 +244,6 @@ def setup_headers_footers(doc, doc_title="SNI ISO XXXXX:2025", copyright_text="�
 
 
 
-def _resolve_heading_numbers(doc):
-    """
-    Pra-proses dokumen: heading dengan auto-numbering (numPr) diubah menjadi
-    teks eksplisit 'N    Judul' sehingga engine dapat mendeteksi nomor pasal.
-
-    Mendukung pola %1, %1.%2, %1.%2.%3 dst. (decimal / outline numbering).
-    Nomor dihitung ulang secara manual dengan counter per-level sehingga tidak
-    bergantung pada rendering Word.
-
-    Hanya diterapkan pada paragraf dengan heading style (Heading 1, 2, …) atau
-    paragraf yang numId-nya sama dengan heading numId yang ditemukan dari definisi
-    style — bukan list item biasa.
-    """
-    from lxml import etree as _etree
-    W = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
-
-    # --- 1. Kumpulkan numId dan ilvl dari heading styles ---
-    # Heading 2-9 sering hanya punya ilvl (mewarisi numId dari Heading 1)
-    heading_style_num = {}
-    styles_el = doc.styles.element
-    for style in styles_el.iter(f'{{{W}}}style'):
-        style_id = style.get(f'{{{W}}}styleId', '')
-        if not (style_id.startswith('Heading') and 'Char' not in style_id):
-            continue
-        pPr = style.find(f'{{{W}}}pPr')
-        if pPr is None:
-            continue
-        numPr = pPr.find(f'{{{W}}}numPr')
-        if numPr is None:
-            continue
-        ilvl_el = numPr.find(f'{{{W}}}ilvl')
-        numId_el = numPr.find(f'{{{W}}}numId')
-        nid = numId_el.get(f'{{{W}}}val') if numId_el is not None else None
-        ilvl_val = int(ilvl_el.get(f'{{{W}}}val', '0')) if ilvl_el is not None else None
-        heading_style_num[style_id] = {'numId': nid, 'ilvl': ilvl_val}
-
-    # Warisi numId: Heading 2-9 yang tidak punya numId, ambil dari Heading 1
-    inherited_num_id = None
-    for _sid, _info in heading_style_num.items():
-        if _info['numId'] and _info['numId'] != '0':
-            inherited_num_id = _info['numId']
-            break
-    for _sid, _info in heading_style_num.items():
-        if (not _info['numId'] or _info['numId'] == '0') and inherited_num_id:
-            _info['numId'] = inherited_num_id
-        if _info['ilvl'] is None:
-            try:
-                _info['ilvl'] = int(_sid.replace('Heading', '').strip()) - 1
-            except ValueError:
-                _info['ilvl'] = 0
-
-    heading_num_ids = {_info['numId'] for _info in heading_style_num.values()
-                       if _info['numId'] and _info['numId'] != '0'}
-
-    if not heading_num_ids:
-        return  # Dokumen tidak pakai auto-numbering untuk heading
-
-    # --- 2. Bangun peta numId → abstractNumId → level formats ---
-    num_part = doc.part.numbering_part
-    if num_part is None:
-        return
-
-    num_root = num_part._element
-
-    # abstractNumId → {ilvl: lvlText_pattern}
-    abstract_lvl_text = {}
-    for absNum in num_root.findall(f'{{{W}}}abstractNum'):
-        abs_id = absNum.get(f'{{{W}}}abstractNumId')
-        lvl_map = {}
-        for lvl in absNum.findall(f'{{{W}}}lvl'):
-            ilvl_val = lvl.get(f'{{{W}}}ilvl')
-            lvlText_el = lvl.find(f'{{{W}}}lvlText')
-            numFmt_el = lvl.find(f'{{{W}}}numFmt')
-            pattern = lvlText_el.get(f'{{{W}}}val', '') if lvlText_el is not None else ''
-            fmt = numFmt_el.get(f'{{{W}}}val', '') if numFmt_el is not None else ''
-            lvl_map[int(ilvl_val)] = {'pattern': pattern, 'fmt': fmt}
-        abstract_lvl_text[abs_id] = lvl_map
-
-    # numId → abstractNumId
-    num_id_to_abstract = {}
-    for num_el in num_root.findall(f'{{{W}}}num'):
-        nid = num_el.get(f'{{{W}}}numId')
-        abst_el = num_el.find(f'{{{W}}}abstractNumId')
-        if abst_el is not None:
-            num_id_to_abstract[nid] = abst_el.get(f'{{{W}}}val')
-
-    # --- 3. Resolusi numId → level pattern ---
-    def get_level_pattern(num_id, ilvl):
-        abs_id = num_id_to_abstract.get(num_id)
-        if abs_id is None:
-            return None
-        lvl_map = abstract_lvl_text.get(abs_id, {})
-        return lvl_map.get(ilvl, {}).get('pattern')
-
-    # --- 4. Helper: format nomor dari pattern (misal '%1.%2') ---
-    def format_number(pattern, counters):
-        """Ganti %1, %2, … dengan nilai counter level 0, 1, …"""
-        result = pattern
-        # %N → counter[N-1]
-        for i in range(len(counters), 0, -1):
-            result = result.replace(f'%{i}', str(counters[i - 1]))
-        return result
-
-    # --- 5. Helper: ambil numPr dari paragraf (paragraf bisa override style) ---
-    def get_para_numpr(p):
-        pPr = p._element.find(f'{{{W}}}pPr')
-        if pPr is None:
-            return None, None
-        numPr = pPr.find(f'{{{W}}}numPr')
-        if numPr is None:
-            return None, None
-        ilvl_el = numPr.find(f'{{{W}}}ilvl')
-        numId_el = numPr.find(f'{{{W}}}numId')
-        ilvl = int(ilvl_el.get(f'{{{W}}}val', '0')) if ilvl_el is not None else 0
-        num_id = numId_el.get(f'{{{W}}}val') if numId_el is not None else None
-
-        # Nilai 0 di numId_el berarti "override ke tanpa numbering" → abaikan
-        if num_id == '0' or num_id is None:
-            return None, None
-        return num_id, ilvl
-
-    # Helper: resolusi ilvl heading dari style (jika paragraf sendiri tidak punya ilvl)
-    def get_style_ilvl(p):
-        if not (p.style and p.style.name):
-            return None
-        style_name = p.style.name
-        if 'Heading' not in style_name:
-            return None
-        sn = style_name.replace('Heading', '').strip()
-        try:
-            return int(sn) - 1  # "Heading 1" → ilvl 0
-        except ValueError:
-            return 0
-
-    # --- 6. Iterasi paragraf, hitung counter, sisipkan nomor ---
-    # Counter per-level (indeks 0 = level 1)
-    MAX_LEVELS = 9
-    counters = [0] * MAX_LEVELS
-
-    for p in doc.paragraphs:
-        txt = p.text.strip()
-
-        # Cek apakah paragraf ini adalah heading dengan numbering
-        is_heading_style = p.style and 'Heading' in p.style.name and 'Char' not in p.style.name
-
-        num_id, ilvl = get_para_numpr(p)
-
-        # Jika paragraf tidak punya numPr sendiri, lookup dari heading_style_num
-        if num_id is None and is_heading_style:
-            style_id = p.style.element.get(f'{{{W}}}styleId', '') if p.style.element is not None else ''
-            style_info = heading_style_num.get(style_id)
-            if style_info and style_info['numId'] and style_info['numId'] != '0':
-                num_id = style_info['numId']
-                ilvl = style_info['ilvl'] if style_info['ilvl'] is not None else 0
-
-        # Kalau masih tidak ada num_id, lewati
-        if num_id is None or num_id not in heading_num_ids:
-            continue
-
-        # Pastikan ada teks (skip paragraf kosong)
-        if not txt:
-            continue
-
-        # Kalau teks sudah dimulai dengan angka (sudah ada nomor eksplisit), skip
-        import re as _re
-        if _re.match(r'^\d', txt):
-            continue
-
-        # Update counter: reset level yang lebih dalam, increment level ini
-        counters[ilvl] += 1
-        for deeper in range(ilvl + 1, MAX_LEVELS):
-            counters[deeper] = 0
-
-        # Dapatkan pattern untuk level ini
-        pattern = get_level_pattern(num_id, ilvl)
-        if not pattern:
-            continue
-
-        # Format nomor
-        number_str = format_number(pattern, counters[:ilvl + 1])
-
-        # Sisipkan nomor ke dalam teks paragraf
-        # Hapus semua run, buat ulang dengan format "N    Teks"
-        new_text = f"{number_str}    {txt}"
-
-        # Hapus numPr dari pPr paragraf agar tidak ada double numbering
-        pPr_el = p._element.find(f'{{{W}}}pPr')
-        if pPr_el is not None:
-            for numPr_el in pPr_el.findall(f'{{{W}}}numPr'):
-                pPr_el.remove(numPr_el)
-
-        # Update teks runs: simpan formatting run pertama, hapus sisanya
-        runs = p.runs
-        if runs:
-            # Simpan run pertama dan update teksnya
-            first_run = runs[0]
-            first_run.text = new_text
-            # Hapus run sisanya
-            for run in runs[1:]:
-                run._r.getparent().remove(run._r)
-        else:
-            # Buat run baru
-            run_new = p.add_run(new_text)
-
-
 class DocxOptimizerEngine:
     """
     Engine untuk optimasi dokumen Word sesuai standar ISO/SNI
@@ -477,10 +272,6 @@ class DocxOptimizerEngine:
 
             # Hapus semua hyperlink → jadikan teks biasa
             remove_all_hyperlinks(doc)
-
-            # Konversi auto-numbering heading → nomor eksplisit (pasal/subpasal)
-            # agar engine dapat mendeteksi dan memformat nomor pasal dengan benar
-            _resolve_heading_numbers(doc)
 
             # Fix ukuran font autonumbering "Annex %1" → 12pt (24 half-points)
             # Label "Annex A" dirender dari numbering lvl rPr, bukan dari run paragraf
@@ -553,96 +344,6 @@ class DocxOptimizerEngine:
                     
                     _szCs_new = _etree.SubElement(_rPr, f'{{{_WNS_W}}}szCs')
                     _szCs_new.set(f'{{{_WNS_W}}}val', _sz_val_current)
-
-            def _apply_title_run_format(run, font_name, font_size_pt=12):
-                """
-                Terapkan formatting sesuai style 'Title' pada sebuah run:
-                  - Font: Arial 12pt Bold
-                  - Warna: hitam (000000)
-                  - Character Spacing: Condensed 0.5pt (w:spacing val="-10" twips)
-                  - Kern: 14pt (w:kern val="28" half-points)
-                """
-                W = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
-
-                run.bold = True
-                run.font.name = font_name
-                run.font.size = Pt(font_size_pt)
-
-                rPr = run._r.get_or_add_rPr()
-
-                # Paksa warna hitam
-                for el in rPr.findall(f'{{{W}}}color'):
-                    rPr.remove(el)
-                color_el = OxmlElement('w:color')
-                color_el.set(qn('w:val'), '000000')
-                rPr.insert(0, color_el)
-
-                # Character spacing Condensed 0.5pt
-                # Word menyimpan dalam satuan twips (1/20 pt); -0.5pt = -10 twips
-                for el in rPr.findall(f'{{{W}}}spacing'):
-                    rPr.remove(el)
-                spacing_el = OxmlElement('w:spacing')
-                spacing_el.set(qn('w:val'), '-10')
-                rPr.append(spacing_el)
-
-                # Kern 14pt → w:kern val dalam half-points: 14pt * 2 = 28
-                for el in rPr.findall(f'{{{W}}}kern'):
-                    rPr.remove(el)
-                kern_el = OxmlElement('w:kern')
-                kern_el.set(qn('w:val'), '28')
-                rPr.append(kern_el)
-
-            def _apply_subtitle_run_format(run, font_name, font_size_pt=11):
-                """
-                Terapkan formatting sesuai style 'Subtitle' pada sebuah run:
-                  - Font: Arial 11pt Bold
-                  - Warna: Text 1 / hitam (000000)
-                  - Character Spacing: Expanded 0.75pt (w:spacing val="15" twips)
-                """
-                W = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
-
-                run.bold = True
-                run.font.name = font_name
-                run.font.size = Pt(font_size_pt)
-
-                rPr = run._r.get_or_add_rPr()
-
-                # Paksa warna hitam (Text 1)
-                for el in rPr.findall(f'{{{W}}}color'):
-                    rPr.remove(el)
-                color_el = OxmlElement('w:color')
-                color_el.set(qn('w:val'), '000000')
-                rPr.insert(0, color_el)
-
-                # Character spacing Expanded 0.75pt
-                # Word menyimpan dalam satuan twips (1/20 pt); +0.75pt ≈ +15 twips
-                for el in rPr.findall(f'{{{W}}}spacing'):
-                    rPr.remove(el)
-                spacing_el = OxmlElement('w:spacing')
-                spacing_el.set(qn('w:val'), '15')
-                rPr.append(spacing_el)
-
-                # Hapus kern jika ada (Subtitle tidak pakai kern)
-                for el in rPr.findall(f'{{{W}}}kern'):
-                    rPr.remove(el)
-
-            def _apply_subtitle_para_format(paragraph):
-                """
-                Terapkan paragraph format sesuai style 'Subtitle':
-                  - Assign style 'Subtitle' jika tersedia di dokumen
-                  - Alignment: Left, Spacing 0/0, Line spacing: Single
-                """
-                from docx.enum.text import WD_LINE_SPACING
-                try:
-                    paragraph.style = doc.styles['Subtitle']
-                except Exception:
-                    pass
-                paragraph.alignment = WD_ALIGN_PARAGRAPH.LEFT
-                pf = paragraph.paragraph_format
-                pf.space_before = Pt(0)
-                pf.space_after = Pt(0)
-                pf.line_spacing_rule = WD_LINE_SPACING.SINGLE
-                pf.line_spacing = None
 
             def clean_format(paragraph, is_heading=False):
                 pf = paragraph.paragraph_format
@@ -844,12 +545,8 @@ class DocxOptimizerEngine:
                     # Special heading
                     _is_biblio_title = p.style and p.style.name == 'Biblio Title'
                     _is_annex_style = p.style and p.style.name.upper() in ('ANNEX', 'ANNEX HEADING')
-                    _is_title_style_heading = bool(re.match(
-                        r'^(daftar\s+isi|pendahuluan|kata\s+pengantar|bibliography|bibliografi)',
-                        txt, re.IGNORECASE
-                    ))
                     _is_special = _is_biblio_title or _is_annex_style or bool(re.match(
-                        r'^(bibliography|bibliografi|annex|lampiran|foreword|kata\s+pengantar|index|indeks|daftar\s+isi|pendahuluan)',
+                        r'^(bibliography|bibliografi|annex|lampiran|foreword|kata\s+pengantar|index|indeks)',
                         txt, re.IGNORECASE
                     ))
                     if _is_special:
@@ -895,42 +592,8 @@ class DocxOptimizerEngine:
                                             # Hapus br dari run berikutnya (br ekstra sebelum judul)
                                             for br in next_brs:
                                                 next_el.remove(br)
-
-                        elif _is_title_style_heading:
-                            # Daftar Isi, Pendahuluan, Kata Pengantar, Bibliografi
-                            # → Terapkan style "Title": Arial 12pt Bold, Centered,
-                            #   Spacing 0/0, Single, Condensed 0.5pt, Kern 14pt
-                            from docx.enum.text import WD_LINE_SPACING
-                            from lxml import etree as _etree
-
-                            pf.line_spacing_rule = WD_LINE_SPACING.SINGLE
-                            pf.line_spacing = None  # reset ke single default
-
-                            # Terapkan style Title jika tersedia di dokumen
-                            try:
-                                p.style = doc.styles['Title']
-                            except (KeyError, Exception):
-                                pass  # jika style tidak ada, lanjut dengan formatting manual
-
-                            # Override formatting runs agar sesuai spesifikasi Title
-                            _title_font_size = 12
-                            if not p.runs:
-                                r = p.add_run(p.text)
-                                _apply_title_run_format(r, font_name, _title_font_size)
-                            else:
-                                for run in p.runs:
-                                    _apply_title_run_format(run, font_name, _title_font_size)
-
-                            # Re-apply paragraph format setelah set style (style bisa override)
-                            pf = p.paragraph_format
-                            p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-                            pf.space_before = Pt(0)
-                            pf.space_after = Pt(0)
-                            pf.line_spacing_rule = WD_LINE_SPACING.SINGLE
-                            pf.line_spacing = None
-
                         else:
-                            # Non-ANNEX special headings (Foreword, dll): 11pt
+                            # Non-ANNEX special headings (Bibliography, Foreword, dll): 11pt
                             pf.line_spacing = 1.0
                             if not p.runs:
                                 r = p.add_run(p.text)
@@ -963,11 +626,11 @@ class DocxOptimizerEngine:
                                 p._element.addnext(blank_after._element)
                         continue
 
-                    # Regular heading → Pasal / Subpasal / Subsubpasal
-                    # Terapkan style "Subtitle": Arial 11pt Bold, Left, 0/0 spacing, Single, Expanded 0.75pt
-                    _apply_subtitle_para_format(p)
+                    # Regular heading
+                    p.alignment = WD_ALIGN_PARAGRAPH.LEFT
+                    clean_format(p)
                     for run in p.runs:
-                        _apply_subtitle_run_format(run, font_name, font_size)
+                        run.bold = True
 
                     # Track pasal 3
                     txt_lower = txt.lower()
@@ -1023,15 +686,21 @@ class DocxOptimizerEngine:
                         if match_annex_sub:
                             p.text = f"{match_annex_sub.group(1)}    {match_annex_sub.group(2)}"
                         for run in p.runs:
-                            _apply_subtitle_run_format(run, font_name, font_size)
+                            run.bold = True
+                            run.font.name = font_name
+                            run.font.size = Pt(font_size)
                     elif match_annex_sub:
                         p.text = f"{match_annex_sub.group(1)}    {match_annex_sub.group(2)}"
                         for run in p.runs:
-                            _apply_subtitle_run_format(run, font_name, font_size)
+                            run.bold = True
+                            run.font.name = font_name
+                            run.font.size = Pt(font_size)
                     elif match_number and not match_bab:
                         p.text = f"{match_number.group(1)}    {match_number.group(2)}"
                         for run in p.runs:
-                            _apply_subtitle_run_format(run, font_name, font_size)
+                            run.bold = True
+                            run.font.name = font_name
+                            run.font.size = Pt(font_size) # 11pt
 
                     # Spacing setelah
                     # Di area bibliography/tail → jangan tambah blank
