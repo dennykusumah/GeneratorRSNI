@@ -682,40 +682,24 @@ def load_engines():
 engine2, engine4, engine5, engine6, engine7 = load_engines()
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SOLUSI 1: LOAD KAMUS DENGAN cache_data + TTL
-# Berbeda dengan cache_resource, cache_data akan expire setelah TTL detik
-# sehingga otomatis reload dari Google Sheet tanpa perlu restart server.
-# ─────────────────────────────────────────────────────────────────────────────
-
-@st.cache_data(ttl=_KAMUS_TTL, show_spinner=False)
-def _load_kamus_from_sheet():
-    """
-    Load kamus dari Google Sheet.
-    Cache otomatis expire setiap _KAMUS_TTL detik sehingga
-    selalu membaca data terbaru dari Google Sheet.
-    """
-    d = CustomDictionary()
-    count_kamus = d.load_defaults()
-    i = ItalicDictionary()
-    count_italic = i.load_defaults()
-    return d, count_kamus, i, count_italic
-
-# ─────────────────────────────────────────────────────────────────────────────
 # HEADER DENGAN AUTO-REFRESH KAMUS SETIAP 1 DETIK
-# Menggunakan @st.fragment(run_every=...) agar hanya bagian header yang
-# di-rerender secara periodik tanpa mengganggu state user lainnya.
+# @st.fragment(run_every=N) jalankan ulang setiap N detik.
+# Fetch langsung ke Google Sheet — TANPA @st.cache_data — agar angka
+# selalu fresh dan tidak tertahan oleh cache lama.
 # ─────────────────────────────────────────────────────────────────────────────
 
 @st.fragment(run_every=_KAMUS_TTL)
 def _render_header_with_live_kamus():
     """
     Fragment ini di-rerun setiap _KAMUS_TTL detik secara otomatis.
-    Setiap rerun akan memanggil _load_kamus_from_sheet() yang cache-nya
-    sudah expire, sehingga angka Kamus SNI & Kamus Istilah Asing selalu fresh
-    dari Google Sheet tanpa perlu reload halaman penuh.
+    Fetch langsung ke Google Sheet tanpa cache sehingga perubahan
+    di spreadsheet terlihat dalam <= 1 detik.
     """
-    # Ambil data terbaru dari Google Sheet (via cache TTL)
-    _d, _n, _i, _ni = _load_kamus_from_sheet()
+    # Fetch langsung dari Google Sheet — tanpa cache
+    _d = CustomDictionary()
+    _n = _d.load_defaults()
+    _i = ItalicDictionary()
+    _ni = _i.load_defaults()
 
     # Simpan ke session_state agar engine lain bisa pakai
     st.session_state['custom_dict']      = _d
