@@ -691,7 +691,8 @@ engine2, engine4, engine5, engine6, engine7 = load_engines()
 def _load_kamus_from_sheet():
     """
     Load kamus dari Google Sheet.
-    Otomatis di-refresh setiap _KAMUS_TTL detik (default 1 detik = 1 detik).
+    Cache otomatis expire setiap _KAMUS_TTL detik sehingga
+    selalu membaca data terbaru dari Google Sheet.
     """
     d = CustomDictionary()
     count_kamus = d.load_defaults()
@@ -699,73 +700,81 @@ def _load_kamus_from_sheet():
     count_italic = i.load_defaults()
     return d, count_kamus, i, count_italic
 
-# Reload kamus ke session_state jika:
-#   (a) belum pernah load, ATAU
-#   (b) sudah lebih dari _KAMUS_TTL detik sejak load terakhir
-_needs_reload = (
-    'custom_dict' not in st.session_state or
-    time.time() - st.session_state.get('_kamus_loaded_at', 0) > _KAMUS_TTL
-)
+# ─────────────────────────────────────────────────────────────────────────────
+# HEADER DENGAN AUTO-REFRESH KAMUS SETIAP 1 DETIK
+# Menggunakan @st.fragment(run_every=...) agar hanya bagian header yang
+# di-rerender secara periodik tanpa mengganggu state user lainnya.
+# ─────────────────────────────────────────────────────────────────────────────
 
-if _needs_reload:
+@st.fragment(run_every=_KAMUS_TTL)
+def _render_header_with_live_kamus():
+    """
+    Fragment ini di-rerun setiap _KAMUS_TTL detik secara otomatis.
+    Setiap rerun akan memanggil _load_kamus_from_sheet() yang cache-nya
+    sudah expire, sehingga angka Kamus SNI & Kamus Istilah Asing selalu fresh
+    dari Google Sheet tanpa perlu reload halaman penuh.
+    """
+    # Ambil data terbaru dari Google Sheet (via cache TTL)
     _d, _n, _i, _ni = _load_kamus_from_sheet()
-    st.session_state['custom_dict']    = _d
-    st.session_state['kamus_count']    = _n
-    st.session_state['italic_dict']    = _i
-    st.session_state['italic_count']   = _ni
+
+    # Simpan ke session_state agar engine lain bisa pakai
+    st.session_state['custom_dict']      = _d
+    st.session_state['kamus_count']      = _n
+    st.session_state['italic_dict']      = _i
+    st.session_state['italic_count']     = _ni
     st.session_state['_kamus_loaded_at'] = time.time()
 
-# Ambil nilai untuk ditampilkan di header
-_kamus = st.session_state.get('custom_dict')
-_count = st.session_state.get('kamus_count', 0)
-_italic_count = st.session_state.get('italic_count', 0)
+    _status_html = (
+        f"""<div class="status-pill status-ready">
+            <span class="status-dot"></span>
+            Sistem Siap &nbsp;
+        </div>"""
+        if _n > 0 else
+        """<div class="status-pill status-warn">
+            <span class="status-dot"></span>
+            Kamus Tidak Aktif
+        </div>"""
+    )
 
-# ─────────────────────────────────────────────────────────────────────────────
+    st.markdown(f"""
+        <div class="app-header">
+            <div class="badge">Generator RSNI</div>
+            <h1>📑 ISO to RSNI Converter</h1>
+            <p>Memformat & Menerjemahan Dokumen Standar ISO Menjadi Draft RSNI Secara Otomatis</p>
+            <div class="stats-row">
+                <div class="stat-item">
+                    <div class="stat-num">6</div>
+                    <div class="stat-lbl">Engine</div>
+                </div>
+                <div class="stat-divider"></div>
+                <div class="stat-item">
+                    <div class="stat-num">{_n if _n > 0 else '—'}</div>
+                    <div class="stat-lbl">Kamus SNI</div>
+                </div>
+                <div class="stat-divider"></div>
+                <div class="stat-item">
+                    <div class="stat-num">{_ni if _ni > 0 else '—'}</div>
+                    <div class="stat-lbl">Kamus Istilah Asing</div>
+                </div>
+                <div class="stat-divider"></div>
+                <div class="stat-item">
+                    <div class="stat-num">13</div>
+                    <div class="stat-lbl">Bahasa</div>
+                </div>
+            </div>
+            {_status_html}
+        </div>
+    """, unsafe_allow_html=True)
 
 # --- HALAMAN UTAMA ---
 
-# --- HEADER ---
-_status_html = (
-    f"""<div class="status-pill status-ready">
-        <span class="status-dot"></span>
-        Sistem Siap &nbsp;
-    </div>"""
-    if _count > 0 else
-    """<div class="status-pill status-warn">
-        <span class="status-dot"></span>
-        Kamus Tidak Aktif
-    </div>"""
-)
+# Render header + muat kamus secara live (auto-refresh setiap 1 detik)
+_render_header_with_live_kamus()
 
-st.markdown(f"""
-    <div class="app-header">
-        <div class="badge">Generator RSNI</div>
-        <h1>📑 ISO to RSNI Converter</h1>
-        <p>Memformat & Menerjemahan Dokumen Standar ISO Menjadi Draft RSNI Secara Otomatis</p>
-        <div class="stats-row">
-            <div class="stat-item">
-                <div class="stat-num">6</div>
-                <div class="stat-lbl">Engine</div>
-            </div>
-            <div class="stat-divider"></div>
-            <div class="stat-item">
-                <div class="stat-num">{_count if _count > 0 else '—'}</div>
-                <div class="stat-lbl">Kamus SNI</div>
-            </div>
-            <div class="stat-divider"></div>
-            <div class="stat-item">
-                <div class="stat-num">{_italic_count if _italic_count > 0 else '—'}</div>
-                <div class="stat-lbl">Kamus Istilah Asing</div>
-            </div>
-            <div class="stat-divider"></div>
-            <div class="stat-item">
-                <div class="stat-num">13</div>
-                <div class="stat-lbl">Bahasa</div>
-            </div>
-        </div>
-        {_status_html}
-    </div>
-""", unsafe_allow_html=True)
+# Ambil nilai kamus dari session_state untuk dipakai di bawah
+_kamus = st.session_state.get('custom_dict')
+_count = st.session_state.get('kamus_count', 0)
+_italic_count = st.session_state.get('italic_count', 0)
 
 import datetime
 _tahun = str(datetime.date.today().year)
