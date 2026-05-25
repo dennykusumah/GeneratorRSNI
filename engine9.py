@@ -71,7 +71,7 @@ def _get_next_link_placeholder() -> str:
 # ─────────────────────────────────────────────────────────────────────────────
 
 KAMUS_SPREADSHEET_URL = "https://docs.google.com/spreadsheets/d/1BBPCMPwvbBk5LPdoDQwnjQzcPHv7_RDKENqeMsklF-8/edit?usp=sharing"
-ITALIC_SPREADSHEET_URL = "https://docs.google.com/spreadsheets/d/1SQnWSA8c1OBVq3XYE8CDMumkt0hpFtxKUjdinfWrqak/edit?usp=sharing"
+ITALIC_SPREADSHEET_URL = "https://docs.google.com/spreadsheets/d/1NZm1HjsjxmflxnZlzV_O2XF75ZlMUOu8VVofsKfp_FA/edit#gid=0"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
