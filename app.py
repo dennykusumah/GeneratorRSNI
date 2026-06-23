@@ -727,7 +727,7 @@ def _render_header_with_live_kamus():
             <p>Memformat & Menerjemahan Dokumen Standar ISO Menjadi Draft RSNI Secara Otomatis</p>
             <div class="stats-row">
                 <div class="stat-item">
-                    <div class="stat-num">6</div>
+                    <div class="stat-num">8</div>
                     <div class="stat-lbl">Engine</div>
                 </div>
                 <div class="stat-divider"></div>
