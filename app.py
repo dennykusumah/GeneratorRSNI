@@ -693,6 +693,7 @@ if _needs_reload:
 
 # Ambil nilai untuk ditampilkan di header
 _kamus = st.session_state.get('custom_dict')
+_italic_dict_obj = st.session_state.get('italic_dict')
 _count = st.session_state.get('kamus_count', 0)
 _italic_count = st.session_state.get('italic_count', 0)
 
@@ -713,6 +714,16 @@ _status_html = (
     </div>"""
 )
 
+# FIX: tampilkan alasan jika kamus/istilah asing gagal termuat, agar mudah
+# didiagnosis (mis. sheet belum "Anyone with the link", header kolom tidak
+# terbaca, dsb) -- sebelumnya kegagalan ini disembunyikan total.
+_kamus_err = _kamus.get_last_error() if _kamus and hasattr(_kamus, 'get_last_error') else None
+_italic_err = _italic_dict_obj.get_last_error() if _italic_dict_obj and hasattr(_italic_dict_obj, 'get_last_error') else None
+if _count == 0 and _kamus_err:
+    st.warning(f"⚠️ Kamus SNI gagal dimuat dari Google Sheet: {_kamus_err}")
+if _italic_count == 0 and _italic_err:
+    st.warning(f"⚠️ Kamus Istilah Asing gagal dimuat dari Google Sheet: {_italic_err}")
+
 st.markdown(f"""
     <div class="app-header">
         <div class="badge">Generator RSNI</div>
@@ -720,7 +731,7 @@ st.markdown(f"""
         <p>Memformat & Menerjemahan Dokumen Standar ISO Menjadi Draft RSNI Secara Otomatis</p>
         <div class="stats-row">
             <div class="stat-item">
-                <div class="stat-num">8</div>
+                <div class="stat-num">6</div>
                 <div class="stat-lbl">Engine</div>
             </div>
             <div class="stat-divider"></div>
@@ -863,7 +874,15 @@ if st.session_state.get('_run_process') and st.session_state.get('_target_file')
         update_ui(75, "[6/6] Terjemahan...")
         tr_out = f"ID_{os.path.basename(final_opt_file)}"
         
-        _engine9 = DocxFinalTranslatorEngine(source_lang=src_lang_val, target_lang='id', custom_dict=st.session_state.get('custom_dict'))
+        # FIX KRITIS: sebelumnya italic_dict TIDAK PERNAH dikirim ke engine translasi,
+        # sehingga seluruh isi "Kamus Istilah Asing" (mis. "ISO Online browsing platform")
+        # diabaikan total meskipun sudah berhasil dimuat dari Google Sheet.
+        _engine9 = DocxFinalTranslatorEngine(
+            source_lang=src_lang_val,
+            target_lang='id',
+            custom_dict=st.session_state.get('custom_dict'),
+            italic_dict=st.session_state.get('italic_dict'),
+        )
         
         def _cb_tr(pct, msg):
             final_pct = 75 + int(pct * 0.25)
