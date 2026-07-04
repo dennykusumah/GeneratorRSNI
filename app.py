@@ -76,7 +76,7 @@ from engine9 import CustomDictionary, ItalicDictionary, DocxFinalTranslatorEngin
 
 # --- KONFIGURASI HALAMAN ---
 st.set_page_config(
-    page_title="ISO Doc Master",
+    page_title="Generator RSNI",
     page_icon="📑",
     layout="centered",
     initial_sidebar_state="collapsed"
@@ -720,7 +720,7 @@ st.markdown(f"""
         <p>Memformat & Menerjemahan Dokumen Standar ISO Menjadi Draft RSNI Secara Otomatis</p>
         <div class="stats-row">
             <div class="stat-item">
-                <div class="stat-num">8</div>
+                <div class="stat-num">6</div>
                 <div class="stat-lbl">Engine</div>
             </div>
             <div class="stat-divider"></div>
