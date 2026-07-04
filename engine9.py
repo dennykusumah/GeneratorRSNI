@@ -37,6 +37,11 @@ _R    = f'{{{_NS_R}}}'
 
 _RE_PURE_NUMBER = re.compile(r'^[\d\s\.\,\:\;\-\(\)\[\]\/\\\+\=\*\%\&\^\$\#\@\!\"\'`~<>{}|_]+$')
 _RE_COPYRIGHT = re.compile(r'©|BSN\s*\d{4}', re.IGNORECASE)
+# Teks hyperlink yang berupa URL mentah (contoh: "ISO Online browsing platform:
+# available at https://www.iso.org/obp") TIDAK BOLEH dikirim ke Google Translate.
+# Google Translate kadang mengubah/menambah spasi pada string URL sehingga link
+# tampilan menjadi rusak/tidak sesuai alamat aslinya.
+_RE_URL_LIKE = re.compile(r'^(?:https?://|www\.)\S+$', re.IGNORECASE)
 
 _SKIP_STYLES = {
     'caption', 'header', 'footer',
@@ -65,29 +70,59 @@ def _get_next_link_placeholder() -> str:
     _LINK_COUNTER += 1
     return f"{_LINK_PLACEHOLDER_BASE}link-{_LINK_COUNTER}"
 
-# FIX: token pelindung kamus/istilah sekarang berbentuk URL palsu (bukan "@@TK_..@@").
-# Google Translate sering "membetulkan"/mengubah token aneh semacam "@@TK_AB12CD34@@"
-# (menghapus '@', mengubah huruf besar-kecil, menambah spasi), sehingga substitusi
-# balik via regex GAGAL dan istilah dari kamus tidak pernah muncul di hasil akhir --
-# inilah sebab utama kata seperti "Prakata"/istilah asing "hilang" dari output.
-# Pola URL ini sama dengan trik yang sudah dipakai & terbukti aman untuk hyperlink
-# (lihat _get_next_link_placeholder): Google Translate mengenali pola URL dan
-# membiarkannya apa adanya.
-_DICT_TOKEN_BASE = "https://kamus-lock.local/k-"
-_ITALIC_TOKEN_BASE = "https://istilah-lock.local/i-"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TOKEN PLACEHOLDER YANG AMAN UNTUK GOOGLE TRANSLATE
+# ─────────────────────────────────────────────────────────────────────────────
+# FIX KRITIS: token lama berbentuk "@@TK_ABC12345@@" / "@@IT_ABC12345@@" (mengandung
+# simbol "@" dan "_" serta ANGKA). Google Translate cukup sering:
+#   - membuang / merapikan simbol "@@" dan "_"
+#   - mengeja ulang digit angka ke dalam bahasa target
+#   - menyisipkan spasi di tengah token
+# Akibatnya token tidak ditemukan lagi saat proses "_apply_post", sehingga
+# substitusi kamus (SNI maupun Istilah Asing) GAGAL SENYAP dan token mentah bisa
+# ikut muncul di dokumen hasil.
+#
+# SOLUSI: token dibuat HANYA dari huruf (tanpa simbol/angka) sehingga jauh lebih
+# kecil kemungkinan diubah oleh mesin terjemahan, ditambah sebuah fallback regex
+# "longgar" (mengizinkan spasi sisipan di antara setiap huruf token) saat
+# pencocokan persis gagal.
+
+_TOKEN_HEXMAP = {
+    '0': 'q', '1': 'x', '2': 'z', '3': 'v', '4': 'k', '5': 'j', '6': 'w', '7': 'y',
+    '8': 'h', '9': 'b', 'a': 'g', 'b': 'f', 'c': 'p', 'd': 'd', 'e': 'c', 'f': 't',
+}
+
+def _make_safe_token(prefix: str) -> str:
+    """Buat token placeholder unik yang HANYA berisi huruf (tanpa simbol/angka)."""
+    raw_hex = uuid.uuid4().hex[:12]
+    body = ''.join(_TOKEN_HEXMAP[c] for c in raw_hex)
+    # Prefix di awal & akhir (huruf besar) sebagai penanda batas token
+    return f"{prefix}{body.capitalize()}{prefix}"
+
+def _substitute_token(text: str, token: str, replacement: str) -> tuple[str, bool]:
+    """
+    Ganti `token` di dalam `text` dengan `replacement`.
+    1) Coba pencocokan persis (case-insensitive).
+    2) Jika gagal, coba pencocokan LONGGAR: mengizinkan spasi/line-break yang
+       tersisip di antara tiap huruf token (akibat proses terjemahan).
+    Mengembalikan (text_baru, ditemukan_atau_tidak).
+    """
+    exact_pattern = re.compile(re.escape(token), re.IGNORECASE)
+    if exact_pattern.search(text):
+        return exact_pattern.sub(replacement, text), True
+    loose_pattern = re.compile(r'\s*'.join(re.escape(c) for c in token), re.IGNORECASE)
+    if loose_pattern.search(text):
+        return loose_pattern.sub(replacement, text), True
+    return text, False
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 2 URL SPREADSHEET TERPISAH
 # ─────────────────────────────────────────────────────────────────────────────
-# PENTING: URL berikut HARUS SAMA dengan link "Kamus SNI" / "Kamus Istilah Asing"
-# yang ditampilkan & bisa diedit pengguna di footer app.py. Sebelumnya URL kamus
-# istilah asing di sini BERBEDA dengan spreadsheet yang ditautkan di app.py,
-# sehingga perubahan yang diketik pengguna di Google Sheet tidak pernah terbaca
-# oleh engine ini.
 
 KAMUS_SPREADSHEET_URL = "https://docs.google.com/spreadsheets/d/1BBPCMPwvbBk5LPdoDQwnjQzcPHv7_RDKENqeMsklF-8/edit?usp=sharing"
-ITALIC_SPREADSHEET_URL = "https://docs.google.com/spreadsheets/d/1NZm1HjsjxmflxnZlzV_O2XF75ZlMUOu8VVofsKfp_FA/edit?usp=sharing"
+ITALIC_SPREADSHEET_URL = "https://docs.google.com/spreadsheets/d/1NZm1HjsjxmflxnZlzV_O2XF75ZlMUOu8VVofsKfp_FA/edit#gid=0"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -99,7 +134,6 @@ class CustomDictionary:
     
     def __init__(self):
         self._entries: dict[str, tuple[str, str]] = {}
-        self.last_error: str | None = None
 
     def add_term(self, source: str, target: str) -> None:
         s = source.strip()
@@ -111,17 +145,10 @@ class CustomDictionary:
         self._entries.clear()
 
     def load_defaults(self) -> int:
-        # FIX: error sebelumnya ditelan diam-diam (except Exception: return 0),
-        # membuat kegagalan load kamus (mis. sheet tidak bisa diakses/publik,
-        # header kolom tidak dikenali) tidak pernah terlihat oleh pengguna.
         try:
             return self.load_from_google_sheet(KAMUS_SPREADSHEET_URL)
-        except Exception as e:
-            self.last_error = str(e)
+        except Exception:
             return 0
-
-    def get_last_error(self) -> str | None:
-        return self.last_error
 
     def load_from_csv(self, filepath: str, src_col: str = 'source', 
                       tgt_col: str = 'target', delimiter: str = ',', 
@@ -153,14 +180,11 @@ class CustomDictionary:
         try: import pandas as pd
         except ImportError: raise ImportError("Jalankan: pip install pandas openpyxl")
         df = pd.read_excel(filepath, sheet_name=sheet_name, dtype=str).fillna('')
-        cols = df.columns.tolist()
-        col_src = _find_col(cols, [src_col, 'source', 'inggris', 'english', 'istilah asing',
-                                    'istilah', 'bahasa inggris', 'asing', 'kata asing'])
-        col_tgt = _find_col(cols, [tgt_col, 'target', 'indonesia', 'terjemahan',
-                                    'bahasa indonesia', 'padanan', 'arti'])
-        if col_src is None: col_src = _pick_fallback_col(cols, [c for c in [col_tgt] if c])
-        if col_tgt is None: col_tgt = _pick_fallback_col(cols, [c for c in [col_src] if c])
-        if col_tgt is None: raise ValueError(f"Kolom target tidak ditemukan. Header: {cols}")
+        col_src = _find_col(df.columns.tolist(), [src_col, 'source', 'Inggris'])
+        col_tgt = _find_col(df.columns.tolist(), [tgt_col, 'target', 'Indonesia'])
+        if col_src is None: col_src = df.columns[0]
+        if col_tgt is None and len(df.columns) >= 2: col_tgt = df.columns[1]
+        if col_tgt is None: raise ValueError("Kolom target tidak ditemukan.")
         count = 0
         for _, row in df.iterrows():
             src = str(row[col_src]).strip()
@@ -171,7 +195,6 @@ class CustomDictionary:
 
     def load_from_google_sheet(self, url: str, src_col: str = 'source', 
                                tgt_col: str = 'target', timeout: int = 15) -> int:
-        self.last_error = None
         try: import urllib.request, io
         except ImportError: raise ImportError("urllib tidak tersedia.")
         csv_url = _google_sheet_to_csv_url(url)
@@ -179,30 +202,19 @@ class CustomDictionary:
             req = urllib.request.Request(csv_url, headers={'User-Agent': 'Mozilla/5.0'})
             with urllib.request.urlopen(req, timeout=timeout) as resp: 
                 raw = resp.read().decode('utf-8-sig')
-        except Exception as e:
-            self.last_error = f"Gagal mengambil data dari Spreadsheet Kamus: {e}"
-            raise ConnectionError(self.last_error)
+        except Exception as e: raise ConnectionError(f"Gagal mengambil data: {e}")
         f = io.StringIO(raw); reader = csv.DictReader(f); fieldnames = reader.fieldnames or []
-        # FIX: pencarian kolom sekarang case-insensitive & mengenali banyak sinonim
-        # header berbahasa Indonesia, plus fallback yang menghindari kolom nomor urut.
-        col_src = _find_col(fieldnames, [src_col, 'source', 'inggris', 'english', 'istilah asing',
-                                          'istilah', 'bahasa inggris', 'asing', 'kata asing'])
-        col_tgt = _find_col(fieldnames, [tgt_col, 'target', 'indonesia', 'terjemahan',
-                                          'bahasa indonesia', 'padanan', 'arti'])
-        if col_src is None: col_src = _pick_fallback_col(fieldnames, [c for c in [col_tgt] if c])
-        if col_tgt is None: col_tgt = _pick_fallback_col(fieldnames, [c for c in [col_src] if c])
-        if col_tgt is None or col_src is None:
-            self.last_error = f"Kolom source/target tidak ditemukan. Header sheet: {fieldnames}"
-            raise ValueError(self.last_error)
+        col_src = _find_col(fieldnames, [src_col, 'source', 'Inggris'])
+        col_tgt = _find_col(fieldnames, [tgt_col, 'target', 'Indonesia'])
+        if col_src is None and len(fieldnames) >= 1: col_src = fieldnames[0]
+        if col_tgt is None and len(fieldnames) >= 2: col_tgt = fieldnames[1]
+        if col_tgt is None: raise ValueError(f"Kolom target tidak ditemukan. Header: {fieldnames}")
         count = 0
         for row in reader:
-            src = str(row.get(col_src, '') or '').strip()
-            tgt = str(row.get(col_tgt, '') or '').strip()
+            src = str(row.get(col_src, '')).strip()
+            tgt = str(row.get(col_tgt, '')).strip()
             if src and tgt and src.lower() not in ('', 'nan') and tgt.lower() not in ('', 'nan'):
                 self._entries[src.lower()] = (src, tgt); count += 1
-        if count == 0:
-            self.last_error = (f"Sheet terbaca tapi 0 baris valid. Kolom terpakai: "
-                                f"source='{col_src}', target='{col_tgt}'. Header: {fieldnames}")
         return count
 
     def __len__(self) -> int: return len(self._entries)
@@ -216,17 +228,15 @@ class CustomDictionary:
         for src_lower, (src_orig, tgt) in sorted_entries:
             pattern = re.compile(r'(?<![A-Za-z0-9])' + re.escape(src_lower) + r'(?![A-Za-z0-9])', re.IGNORECASE)
             if pattern.search(result):
-                # FIX: token berbentuk URL palsu, bukan "@@TK_..@@" (lihat catatan
-                # _DICT_TOKEN_BASE) supaya selamat melewati Google Translate.
-                token = f'{_DICT_TOKEN_BASE}{uuid.uuid4().hex[:10]}'
+                token = _make_safe_token('Kms')
                 token_map[token] = tgt
                 result = pattern.sub(token, result)
         return result, token_map
 
     def _apply_post(self, translated: str, token_map: dict) -> str:
         result = translated
-        for token, tgt in token_map.items(): 
-            result = re.sub(re.escape(token), tgt, result, flags=re.IGNORECASE)
+        for token, tgt in token_map.items():
+            result, _found = _substitute_token(result, token, tgt)
         return result
 
 
@@ -242,7 +252,6 @@ class ItalicDictionary:
 
     def __init__(self):
         self._entries: dict[str, str] = {}
-        self.last_error: str | None = None
 
     def add_term(self, term: str) -> None:
         t = term.strip()
@@ -255,12 +264,8 @@ class ItalicDictionary:
     def load_defaults(self) -> int:
         try:
             return self.load_from_google_sheet(ITALIC_SPREADSHEET_URL)
-        except Exception as e:
-            self.last_error = str(e)
+        except Exception:
             return 0
-
-    def get_last_error(self) -> str | None:
-        return self.last_error
 
     def load_from_csv(self, filepath: str, term_col: str = 'term', 
                       delimiter: str = ',', encoding: str = 'utf-8-sig') -> int:
@@ -296,10 +301,11 @@ class ItalicDictionary:
         try: import pandas as pd
         except ImportError: raise ImportError("Jalankan: pip install pandas openpyxl")
         df = pd.read_excel(filepath, sheet_name=sheet_name, dtype=str).fillna('')
-        cols = df.columns.tolist()
-        col_term = _find_col(cols, [term_col, 'term', 'kata', 'italic', 'word', 'text',
-                                     'istilah', 'istilah asing', 'kata asing', 'asing'])
-        if col_term is None: col_term = _pick_fallback_col(cols, [])
+        col_term = None
+        for col_name in [term_col, 'term', 'kata', 'italic', 'word', 'text']:
+            if col_name in df.columns:
+                col_term = col_name; break
+        if col_term is None: col_term = df.columns[0]
         count = 0
         skip_vals = {'nan', '', 'term', 'kata', 'italic'}
         for _, row in df.iterrows():
@@ -310,7 +316,6 @@ class ItalicDictionary:
 
     def load_from_google_sheet(self, url: str, term_col: str = 'term', 
                                timeout: int = 15) -> int:
-        self.last_error = None
         try: import urllib.request, io
         except ImportError: raise ImportError("urllib tidak tersedia.")
         csv_url = _google_sheet_to_csv_url(url)
@@ -318,26 +323,21 @@ class ItalicDictionary:
             req = urllib.request.Request(csv_url, headers={'User-Agent': 'Mozilla/5.0'})
             with urllib.request.urlopen(req, timeout=timeout) as resp: 
                 raw = resp.read().decode('utf-8-sig')
-        except Exception as e:
-            self.last_error = f"Gagal mengambil data dari Spreadsheet Istilah Asing: {e}"
-            raise ConnectionError(self.last_error)
+        except Exception as e: raise ConnectionError(f"Gagal mengambil data dari Spreadsheet Italic: {e}")
         f = io.StringIO(raw); reader = csv.DictReader(f); fieldnames = reader.fieldnames or []
-        # FIX: case-insensitive + sinonim header Indonesia, fallback hindari kolom nomor urut.
-        col_term = _find_col(fieldnames, [term_col, 'term', 'kata', 'italic', 'word', 'text',
-                                           'istilah', 'istilah asing', 'kata asing', 'asing'])
-        if col_term is None: col_term = _pick_fallback_col(fieldnames, [])
-        if col_term is None:
-            self.last_error = f"Tidak ada kolom yang cocok. Header sheet: {fieldnames}"
-            raise ValueError(self.last_error)
+        col_term = None
+        for col_name in [term_col, 'term', 'kata', 'italic', 'word', 'text']:
+            if col_name in fieldnames:
+                col_term = col_name; break
+        if col_term is None and len(fieldnames) >= 1:
+            col_term = fieldnames[0]
+        if col_term is None: raise ValueError(f"Tidak ada kolom. Header: {fieldnames}")
         count = 0
         skip_vals = {'nan', '', 'term', 'kata', 'italic', 'word', 'text'}
         for row in reader:
-            term = str(row.get(col_term, '') or '').strip()
+            term = str(row.get(col_term, '')).strip()
             if term and term.lower() not in skip_vals:
                 self._entries[term.lower()] = term; count += 1
-        if count == 0:
-            self.last_error = (f"Sheet terbaca tapi 0 istilah valid. Kolom terpakai: "
-                                f"'{col_term}'. Header: {fieldnames}")
         return count
 
     def __len__(self) -> int: return len(self._entries)
@@ -353,9 +353,7 @@ class ItalicDictionary:
         for term_lower, term_orig in sorted_entries:
             pattern = re.compile(r'(?<![A-Za-z0-9])' + re.escape(term_lower) + r'(?![A-Za-z0-9])', re.IGNORECASE)
             if pattern.search(result):
-                # FIX: token berbentuk URL palsu (lihat _ITALIC_TOKEN_BASE) supaya
-                # tidak dirusak Google Translate seperti token "@@IT_..@@" sebelumnya.
-                token = f'{_ITALIC_TOKEN_BASE}{uuid.uuid4().hex[:10]}'
+                token = _make_safe_token('Itl')
                 token_map[token] = term_orig
                 result = pattern.sub(token, result)
         return result, token_map
@@ -364,10 +362,9 @@ class ItalicDictionary:
         result = translated
         italic_terms_found = []
         for token, original in italic_map.items():
-            if re.search(re.escape(token), result, re.IGNORECASE):
-                result = re.sub(re.escape(token), original, result, flags=re.IGNORECASE)
-                if original not in italic_terms_found:
-                    italic_terms_found.append(original)
+            result, found = _substitute_token(result, token, original)
+            if found and original not in italic_terms_found:
+                italic_terms_found.append(original)
         return result, italic_terms_found
 
 
@@ -375,39 +372,9 @@ class ItalicDictionary:
 # SHARED HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
 
-_COL_SKIP_TOKENS = {'no', 'no.', 'nomor', '#', 'number', 'id'}
-
 def _find_col(columns: list, candidates: list) -> str | None:
-    """
-    Cari nama kolom yang cocok, TANPA peduli huruf besar/kecil maupun spasi
-    di awal/akhir header. FIX: sebelumnya perbandingan case-sensitive persis
-    ('Source' != 'source'), sehingga header sheet buatan pengguna (mis. "Istilah
-    Asing", "Bahasa Indonesia", "Source ") nyaris tidak pernah cocok dan kolom
-    salah/kolom pertama dipakai secara asal (bisa jadi kolom nomor urut),
-    membuat seluruh isi kamus gagal terbaca dengan benar.
-    """
-    norm_map = {str(c).strip().lower(): c for c in columns}
-    for cand in candidates:
-        key = cand.strip().lower()
-        if key in norm_map:
-            return norm_map[key]
-    # fallback: cocokkan sebagian (mis. header "Istilah Asing (Inggris)")
-    for cand in candidates:
-        key = cand.strip().lower()
-        for norm_key, orig in norm_map.items():
-            if key and key in norm_key:
-                return orig
-    return None
-
-def _is_index_like_col(colname: str) -> bool:
-    return colname.strip().lower() in _COL_SKIP_TOKENS
-
-def _pick_fallback_col(columns: list, exclude: list) -> str | None:
-    """Ambil kolom pertama yang BUKAN kolom nomor urut/id dan belum terpakai."""
-    for c in columns:
-        if c in exclude: continue
-        if _is_index_like_col(c): continue
-        return c
+    for c in candidates:
+        if c in columns: return c
     return None
 
 def _google_sheet_to_csv_url(url: str) -> str:
@@ -523,16 +490,22 @@ def _translate_hyperlinks_in_para(para, tr) -> None:
             continue
         
         # 2. Terjemahkan teks (dengan perlindungan italic)
-        text_to_translate = hl_text
-        italic_map = {}
-        
-        if tr.italic_dict and len(tr.italic_dict) > 0:
-            text_to_translate, italic_map = tr.italic_dict._apply_pre(text_to_translate)
-        
-        translated, _ = tr.translate_one(text_to_translate, italic_map)
-        
-        if italic_map and tr.italic_dict:
-            translated, _ = tr.italic_dict._apply_post(translated, italic_map)
+        #    FIX: jika teks tampilan hyperlink adalah URL mentah (mis. "https://www.iso.org/obp"),
+        #    JANGAN diterjemahkan — biarkan apa adanya. Mengirim URL ke Google Translate
+        #    berisiko merusak alamatnya (spasi/karakter tersisip), menyebabkan link tampak salah.
+        if _RE_URL_LIKE.match(hl_text):
+            translated = hl_text
+        else:
+            text_to_translate = hl_text
+            italic_map = {}
+
+            if tr.italic_dict and len(tr.italic_dict) > 0:
+                text_to_translate, italic_map = tr.italic_dict._apply_pre(text_to_translate)
+
+            translated, _ = tr.translate_one(text_to_translate, italic_map)
+
+            if italic_map and tr.italic_dict:
+                translated, _ = tr.italic_dict._apply_post(translated, italic_map)
         
         # 3. Ganti teks di dalam hyperlink (AMAN: hanya mengubah .text)
         if t_els:
@@ -958,11 +931,17 @@ def _translate_para(para, tr, past_bibliography: bool = False) -> list[str]:
             _translate_hyperlinks_in_para(para, tr)
         return []
     
-    combined = ''.join(r.text for _, r in text_runs).strip()
+    raw_combined = ''.join(r.text for _, r in text_runs)
+    combined = raw_combined.strip()
     if _skip_text(combined): 
         if has_hl:
             _translate_hyperlinks_in_para(para, tr)
         return []
+    # FIX: jika ada hyperlink SETELAH teks normal ini (mis. "...available at " + link),
+    # dan teks normal aslinya diakhiri spasi, pastikan spasi itu tetap ada setelah
+    # diterjemahkan — kalau tidak, teks akan menempel langsung ke URL
+    # (contoh bug: "available athttps://www.iso.org/obp").
+    needs_trailing_space = has_hl and raw_combined != combined and raw_combined.endswith((' ', '\u00a0', '\t'))
     
     # Get font
     font_name = 'Arial'; font_size = None
@@ -985,6 +964,8 @@ def _translate_para(para, tr, past_bibliography: bool = False) -> list[str]:
             _translate_hyperlinks_in_para(para, tr)
         return []
     translated = _match_capitalization(combined, translated)
+    if needs_trailing_space and not translated.endswith((' ', '\u00a0')):
+        translated += ' '
     
     # Apply formatting ke teks normal
     if italic_terms_found:
@@ -1137,39 +1118,94 @@ class DocxFinalTranslatorEngine:
             para_map = {p._element: p for p in doc.paragraphs}
             tbl_map = {t._element: t for t in doc.tables}
 
-            items = []; sec_brks = 0; COVER_END = 1
+            # ── Deteksi section front-matter (hasil sisipan Engine 4/5/6) ──────────
+            # Section 0 = Cover (Engine 4)                       -> proteksi parsial (hanya baris italic)
+            # Section 1 = Hak Cipta (Engine 4)                   -> proteksi penuh (statis, Bahasa Indonesia)
+            # Section 2 = Daftar Isi + Prakata + Pendahuluan     -> proteksi penuh (statis, Bahasa Indonesia)
+            #             (Engine 5 & Engine 6 berbagi 1 section yang sama)
+            # Section 3+ = badan dokumen ASLI yang WAJIB diterjemahkan.
+            # FIX: sebelumnya hanya section 0 yang diproteksi (dan hanya baris italic-nya),
+            # sehingga label "Prakata"/"Pendahuluan" dan seluruh isi Daftar Isi ikut
+            # dikirim ke Google Translate dan berisiko rusak/salah terjemah.
+            _FRONTMATTER_FULL_SKIP_SECTIONS = {1, 2}
+            items = []; sec_brks = 0
             for child in body:
                 if child in para_map:
-                    in_cover = (sec_brks < COVER_END)
-                    items.append(('para', para_map[child], in_cover))
+                    cur_sec = sec_brks
+                    items.append(('para', para_map[child], cur_sec))
                     if _has_inline_sectpr(para_map[child]): sec_brks += 1
                 elif child in tbl_map:
-                    items.append(('table', tbl_map[child], sec_brks < COVER_END))
+                    items.append(('table', tbl_map[child], sec_brks))
 
             total = len(items); done = 0; past_bibliography = False
             annex_counter = 0; italic_count = 0; link_count = 0
+            # Statistik detail untuk callback
+            _stat_trans = 0; _stat_skip = 0; _stat_tbl = 0
+            _stat_cover = 0; _stat_annex = 0
 
-            for kind, obj, in_cover in items:
+            for kind, obj, sec_idx in items:
                 done += 1; pct = 5 + int(done / max(total, 1) * 60)
                 if kind == 'para':
                     para = obj; is_bib = _is_biblio_title_para(para)
                     is_annex = _get_para_style_id(para) in _ANNEX_STYLE_IDS
                     hl_cnt = 1 if _has_hyperlinks(para) else 0
+                    para_text = para.text.strip()
+                    preview = (para_text[:55] + "…") if len(para_text) > 55 else para_text
 
-                    if in_cover and _all_runs_italic(para):
-                        _notify(progress_callback, pct, "[Cover-italic] skip")
+                    if sec_idx == 0 and _all_runs_italic(para):
+                        _stat_cover += 1
+                        _notify(progress_callback, pct,
+                            f"[cover-italic] skip\t{done}/{total}\t{_stat_trans}\t{_stat_skip}\t{_stat_tbl}\t{preview}")
+                    elif sec_idx in _FRONTMATTER_FULL_SKIP_SECTIONS:
+                        # Hak Cipta / Daftar Isi / Prakata / Pendahuluan: konten statis
+                        # hasil generate pipeline sendiri (sudah Bahasa Indonesia) —
+                        # JANGAN dikirim ke Google Translate sama sekali.
+                        _stat_skip += 1
+                        _notify(progress_callback, pct,
+                            f"[frontmatter] skip\t{done}/{total}\t{_stat_trans}\t{_stat_skip}\t{_stat_tbl}\t{preview}")
                     elif is_bib:
                         italic_count += len(_translate_para(para, tr))
                         past_bibliography = True
+                        _stat_trans += 1
+                        _notify(progress_callback, pct,
+                            f"[bibliografi] translate\t{done}/{total}\t{_stat_trans}\t{_stat_skip}\t{_stat_tbl}\t{preview}")
                     elif is_annex and not past_bibliography:
                         _translate_para(para, tr)
                         _fix_annex_style_para(para, chr(ord('A') + annex_counter))
                         annex_counter += 1
-                    elif not _skip_paragraph(para, past_bibliography):
-                        italic_count += len(_translate_para(para, tr))
+                        _stat_annex += 1
+                        _notify(progress_callback, pct,
+                            f"[annex] translate\t{done}/{total}\t{_stat_trans}\t{_stat_skip}\t{_stat_tbl}\t{preview}")
+                    elif _skip_paragraph(para, past_bibliography):
+                        _stat_skip += 1
+                        style_name = (para.style.name or "").lower()
+                        if any(s in style_name for s in ['heading', 'toc', 'header', 'footer']):
+                            reason = style_name.split()[0] if style_name else "style"
+                        elif not para_text:
+                            reason = "kosong"
+                        else:
+                            reason = "skip"
+                        _notify(progress_callback, pct,
+                            f"[{reason}] skip\t{done}/{total}\t{_stat_trans}\t{_stat_skip}\t{_stat_tbl}\t{preview}")
+                    else:
+                        il = len(_translate_para(para, tr))
+                        italic_count += il
                         link_count += hl_cnt
+                        _stat_trans += 1
+                        italic_tag = f" +{il}miring" if il else ""
+                        link_tag = f" +link" if hl_cnt else ""
+                        _notify(progress_callback, pct,
+                            f"[translate{italic_tag}{link_tag}] done\t{done}/{total}\t{_stat_trans}\t{_stat_skip}\t{_stat_tbl}\t{preview}")
                 elif kind == 'table':
-                    if not past_bibliography: _translate_table(obj, tr)
+                    if sec_idx in _FRONTMATTER_FULL_SKIP_SECTIONS:
+                        _stat_skip += 1
+                        _notify(progress_callback, pct,
+                            f"[frontmatter] skip\t{done}/{total}\t{_stat_trans}\t{_stat_skip}\t{_stat_tbl}\t-")
+                    elif not past_bibliography:
+                        _translate_table(obj, tr)
+                        _stat_tbl += 1
+                        _notify(progress_callback, pct,
+                            f"[tabel] done\t{done}/{total}\t{_stat_trans}\t{_stat_skip}\t{_stat_tbl}\t-")
 
             _notify(progress_callback, 66, "Em-dash bullets...")
             _convert_emdash_to_bullets(doc)
