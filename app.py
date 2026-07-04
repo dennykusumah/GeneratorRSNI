@@ -1,4 +1,5 @@
 import streamlit as st
+import streamlit.components.v1 as _components
 import os
 import re
 import time
@@ -257,6 +258,29 @@ section[data-testid="stFileUploaderDropzone"] p,
 section[data-testid="stFileUploaderDropzone"] span {
     color: rgba(255,255,255,0.5) !important;
 }
+
+/* ── Tombol Browse files ── */
+section[data-testid="stFileUploaderDropzone"] button[data-testid="baseButton-secondary"],
+section[data-testid="stFileUploaderDropzone"] button,
+div[data-testid="stFileUploader"] button {
+    background: rgba(99,102,241,0.12) !important;
+    border: 1.5px solid rgba(99,102,241,0.35) !important;
+    color: rgba(165,180,252,0.85) !important;
+    border-radius: 10px !important;
+    font-size: 0.82rem !important;
+    font-weight: 600 !important;
+    font-family: 'Outfit', sans-serif !important;
+    box-shadow: none !important;
+    transition: all 0.2s ease !important;
+    padding: 0.4rem 1rem !important;
+}
+section[data-testid="stFileUploaderDropzone"] button:hover,
+div[data-testid="stFileUploader"] button:hover {
+    background: rgba(99,102,241,0.22) !important;
+    border-color: rgba(99,102,241,0.6) !important;
+    color: #c7d2fe !important;
+}
+
 div[data-testid="stFileUploaderFile"] {
     background: rgba(99,102,241,0.1) !important;
     border: 1px solid rgba(99,102,241,0.3) !important;
@@ -658,101 +682,83 @@ def load_engines():
 engine2, engine4, engine5, engine6, engine7 = load_engines()
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SOLUSI 1: LOAD KAMUS DENGAN cache_data + TTL
-# Berbeda dengan cache_resource, cache_data akan expire setelah TTL detik
-# sehingga otomatis reload dari Google Sheet tanpa perlu restart server.
+# HEADER DENGAN AUTO-REFRESH KAMUS SETIAP 1 DETIK
+# @st.fragment(run_every=N) jalankan ulang setiap N detik.
+# Fetch langsung ke Google Sheet — TANPA @st.cache_data — agar angka
+# selalu fresh dan tidak tertahan oleh cache lama.
 # ─────────────────────────────────────────────────────────────────────────────
 
-@st.cache_data(ttl=_KAMUS_TTL, show_spinner=False)
-def _load_kamus_from_sheet():
+@st.fragment(run_every=_KAMUS_TTL)
+def _render_header_with_live_kamus():
     """
-    Load kamus dari Google Sheet.
-    Otomatis di-refresh setiap _KAMUS_TTL detik (default 1 detik = 1 detik).
+    Fragment ini di-rerun setiap _KAMUS_TTL detik secara otomatis.
+    Fetch langsung ke Google Sheet tanpa cache sehingga perubahan
+    di spreadsheet terlihat dalam <= 1 detik.
     """
-    d = CustomDictionary()
-    count_kamus = d.load_defaults()
-    i = ItalicDictionary()
-    count_italic = i.load_defaults()
-    return d, count_kamus, i, count_italic
+    # Fetch langsung dari Google Sheet — tanpa cache
+    _d = CustomDictionary()
+    _n = _d.load_defaults()
+    _i = ItalicDictionary()
+    _ni = _i.load_defaults()
 
-# Reload kamus ke session_state jika:
-#   (a) belum pernah load, ATAU
-#   (b) sudah lebih dari _KAMUS_TTL detik sejak load terakhir
-_needs_reload = (
-    'custom_dict' not in st.session_state or
-    time.time() - st.session_state.get('_kamus_loaded_at', 0) > _KAMUS_TTL
-)
-
-if _needs_reload:
-    _d, _n, _i, _ni = _load_kamus_from_sheet()
-    st.session_state['custom_dict']    = _d
-    st.session_state['kamus_count']    = _n
-    st.session_state['italic_dict']    = _i
-    st.session_state['italic_count']   = _ni
+    # Simpan ke session_state agar engine lain bisa pakai
+    st.session_state['custom_dict']      = _d
+    st.session_state['kamus_count']      = _n
+    st.session_state['italic_dict']      = _i
+    st.session_state['italic_count']     = _ni
     st.session_state['_kamus_loaded_at'] = time.time()
 
-# Ambil nilai untuk ditampilkan di header
-_kamus = st.session_state.get('custom_dict')
-_italic_dict_obj = st.session_state.get('italic_dict')
-_count = st.session_state.get('kamus_count', 0)
-_italic_count = st.session_state.get('italic_count', 0)
+    _status_html = (
+        f"""<div class="status-pill status-ready">
+            <span class="status-dot"></span>
+            Sistem Siap &nbsp;
+        </div>"""
+        if _n > 0 else
+        """<div class="status-pill status-warn">
+            <span class="status-dot"></span>
+            Kamus Tidak Aktif
+        </div>"""
+    )
 
-# ─────────────────────────────────────────────────────────────────────────────
+    st.markdown(f"""
+        <div class="app-header">
+            <div class="badge">Generator RSNI</div>
+            <h1>📑 ISO to RSNI Converter</h1>
+            <p>Memformat & Menerjemahan Dokumen Standar ISO Menjadi Draft RSNI Secara Otomatis</p>
+            <div class="stats-row">
+                <div class="stat-item">
+                    <div class="stat-num">8</div>
+                    <div class="stat-lbl">Engine</div>
+                </div>
+                <div class="stat-divider"></div>
+                <div class="stat-item">
+                    <div class="stat-num">{_n if _n > 0 else '—'}</div>
+                    <div class="stat-lbl">Kamus SNI</div>
+                </div>
+                <div class="stat-divider"></div>
+                <div class="stat-item">
+                    <div class="stat-num">{_ni if _ni > 0 else '—'}</div>
+                    <div class="stat-lbl">Kamus Istilah Asing</div>
+                </div>
+                <div class="stat-divider"></div>
+                <div class="stat-item">
+                    <div class="stat-num">13</div>
+                    <div class="stat-lbl">Bahasa</div>
+                </div>
+            </div>
+            {_status_html}
+        </div>
+    """, unsafe_allow_html=True)
 
 # --- HALAMAN UTAMA ---
 
-# --- HEADER ---
-_status_html = (
-    f"""<div class="status-pill status-ready">
-        <span class="status-dot"></span>
-        Sistem Siap &nbsp;
-    </div>"""
-    if _count > 0 else
-    """<div class="status-pill status-warn">
-        <span class="status-dot"></span>
-        Kamus Tidak Aktif
-    </div>"""
-)
+# Render header + muat kamus secara live (auto-refresh setiap 1 detik)
+_render_header_with_live_kamus()
 
-# FIX: tampilkan alasan jika kamus/istilah asing gagal termuat, agar mudah
-# didiagnosis (mis. sheet belum "Anyone with the link", header kolom tidak
-# terbaca, dsb) -- sebelumnya kegagalan ini disembunyikan total.
-_kamus_err = _kamus.get_last_error() if _kamus and hasattr(_kamus, 'get_last_error') else None
-_italic_err = _italic_dict_obj.get_last_error() if _italic_dict_obj and hasattr(_italic_dict_obj, 'get_last_error') else None
-if _count == 0 and _kamus_err:
-    st.warning(f"⚠️ Kamus SNI gagal dimuat dari Google Sheet: {_kamus_err}")
-if _italic_count == 0 and _italic_err:
-    st.warning(f"⚠️ Kamus Istilah Asing gagal dimuat dari Google Sheet: {_italic_err}")
-
-st.markdown(f"""
-    <div class="app-header">
-        <div class="badge">Generator RSNI</div>
-        <h1>📑 ISO to RSNI Converter</h1>
-        <p>Memformat & Menerjemahan Dokumen Standar ISO Menjadi Draft RSNI Secara Otomatis</p>
-        <div class="stats-row">
-            <div class="stat-item">
-                <div class="stat-num">8</div>
-                <div class="stat-lbl">Engine</div>
-            </div>
-            <div class="stat-divider"></div>
-            <div class="stat-item">
-                <div class="stat-num">{_count if _count > 0 else '—'}</div>
-                <div class="stat-lbl">Kamus SNI</div>
-            </div>
-            <div class="stat-divider"></div>
-            <div class="stat-item">
-                <div class="stat-num">{_italic_count if _italic_count > 0 else '—'}</div>
-                <div class="stat-lbl">Kamus Istilah Asing</div>
-            </div>
-            <div class="stat-divider"></div>
-            <div class="stat-item">
-                <div class="stat-num">13</div>
-                <div class="stat-lbl">Bahasa</div>
-            </div>
-        </div>
-        {_status_html}
-    </div>
-""", unsafe_allow_html=True)
+# Ambil nilai kamus dari session_state untuk dipakai di bawah
+_kamus = st.session_state.get('custom_dict')
+_count = st.session_state.get('kamus_count', 0)
+_italic_count = st.session_state.get('italic_count', 0)
 
 import datetime
 _tahun = str(datetime.date.today().year)
@@ -805,22 +811,80 @@ if st.session_state.get('_run_process') and st.session_state.get('_target_file')
     # UI Progress — 3 elemen terpisah agar tidak saling tumpuk
     status_placeholder = st.empty()
     progress_bar = st.progress(0)
-    time_placeholder = st.empty()
     start_time = time.time()
-    
-    # Helper Update UI
-    def update_ui(pct, msg):
+
+    # ── Live Timer: iframe via components.html agar <script> benar-benar jalan
+    _TIMER_HTML = """
+    <style>
+      #sni-timer-wrap {
+        font-family: 'JetBrains Mono', monospace;
+        font-size: 0.82rem;
+        color: rgba(110,231,183,0.85);
+        text-align: center;
+        letter-spacing: 1px;
+        margin: 0;
+        padding: 0;
+        background: transparent;
+      }
+    </style>
+    <div id="sni-timer-wrap">
+      &#x23F1; <span id="sni-timer">0 detik</span>
+    </div>
+    <script>
+      var start = Date.now();
+      setInterval(function(){
+        var sec = Math.floor((Date.now() - start) / 1000);
+        var el = document.getElementById('sni-timer');
+        if (!el) return;
+        if (sec < 60) {
+          el.textContent = sec + ' detik';
+        } else {
+          var m = Math.floor(sec / 60);
+          var s = sec % 60;
+          el.textContent = m + ' menit ' + s + ' detik';
+        }
+      }, 1000);
+    </script>
+    """
+    # components.html() render ke iframe — script PASTI jalan, tidak disanitasi
+    _components.html(_TIMER_HTML, height=36)
+    # time_placeholder dipakai hanya untuk waktu final statis setelah selesai
+    time_placeholder = st.empty()
+    # ────────────────────────────────────────────────────────────────────────
+
+    # Helper Update UI — TIDAK menyentuh timer iframe, hanya status & progress
+    def update_ui(pct, msg, skip_progress=False):
+        parts = msg.split("\n", 1)
+        line1 = parts[0].strip()
+        line2 = parts[1].strip() if len(parts) > 1 else ""
+        if pct >= 100:
+            dot_color, dot_glow, anim = "#10b981", "rgba(16,185,129,0.9)", ""
+        elif pct >= 75:
+            dot_color, dot_glow, anim = "#6366f1", "rgba(99,102,241,0.9)", "animation:_pd 0.9s infinite;"
+        elif pct >= 50:
+            dot_color, dot_glow, anim = "#818cf8", "rgba(129,140,248,0.8)", "animation:_pd 1s infinite;"
+        else:
+            dot_color, dot_glow, anim = "#a5b4fc", "rgba(165,180,252,0.7)", "animation:_pd 1.1s infinite;"
+        detail_html = (
+            f'<div style="font-size:0.78rem;color:rgba(199,210,254,0.72);margin-top:0.22rem;'
+            f'white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-style:italic;">{line2}</div>'
+        ) if line2 else ""
         status_placeholder.markdown(
-            f'<div style="font-size:0.85rem; color:rgba(165,180,252,0.85); '
-            f'font-family:\'Outfit\',sans-serif; font-weight:500; margin-bottom:0.3rem;">'
-            f'⚡ {msg}</div>',
+            f'<div style="background:rgba(15,23,42,0.6);border:1px solid rgba(99,102,241,0.22);'
+            f'border-radius:10px;padding:0.5rem 0.9rem;font-family:\'Outfit\',sans-serif;margin-bottom:0.3rem;">'
+            f'<div style="display:flex;align-items:center;gap:0.5rem;">'
+            f'<span style="display:inline-block;width:8px;height:8px;border-radius:50%;flex-shrink:0;'
+            f'background:{dot_color};box-shadow:0 0 7px {dot_glow};{anim}"></span>'
+            f'<span style="font-size:0.85rem;font-weight:600;color:rgba(165,180,252,0.92);'
+            f'flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">{line1}</span>'
+            f'<span style="font-family:\'JetBrains Mono\',monospace;font-size:0.75rem;'
+            f'color:rgba(110,231,183,0.65);flex-shrink:0;">{pct}%</span>'
+            f'</div>{detail_html}</div>'
+            f'<style>@keyframes _pd{{0%,100%{{opacity:1;transform:scale(1);}}50%{{opacity:.3;transform:scale(1.6);}}}}</style>',
             unsafe_allow_html=True
         )
-        progress_bar.progress(pct)
-        time_placeholder.markdown(
-            f'<div class="timer-text">⏱ {get_elapsed_str(start_time)}</div>',
-            unsafe_allow_html=True
-        )
+        if not skip_progress:
+            progress_bar.progress(pct)
 
     # Pipeline Optimasi
     def run_optimization(input_file, doc_title):
@@ -830,70 +894,188 @@ if st.session_state.get('_run_process') and st.session_state.get('_target_file')
             "bsn_year": _tahun, "ics_number": "XX.XXX.XX", "ref_standard": "",
         }
 
-        # 1. Engine 2
-        update_ui(5, "[1/6] Format Dasar...")
+        # Hitung total paragraf dokumen untuk info realtime
+        try:
+            from docx import Document as _DocCount
+            _dc = _DocCount(input_file)
+            _total_para = len(_dc.paragraphs)
+            _total_tbl  = len(_dc.tables)
+            del _dc
+        except Exception:
+            _total_para, _total_tbl = 0, 0
+        _doc_info = f"{_total_para} paragraf, {_total_tbl} tabel"
+
+        # Engine 1–5 berbagi 0–10% total progress
+        # E2=1-2, E4=3-4, E5=5-6, E6=7-8, E7=9-10
+
+        # 1. Engine 2 — Format Dasar
+        update_ui(1, f"[1/5] Memuat & format dokumen... ({_doc_info})")
         output_file = f"opt_{os.path.basename(input_file)}"
         success, msg = engine2.process(input_file, output_file, ISO_FONT_NAME, ISO_FONT_SIZE, enable_headers=True, doc_title=doc_title, copyright_text=copyright_text)
         if not success: raise Exception(f"Engine 2: {msg}")
+        update_ui(2, f"[1/5] Format dasar selesai ✓ ({_doc_info})")
         final_file = output_file
         auto_title_id, auto_title_en = extract_titles_from_docx(output_file)
+        _title_info = auto_title_id[:30] + "..." if auto_title_id and len(auto_title_id) > 30 else (auto_title_id or "-")
 
-        # 2. Engine 4
-        update_ui(20, "[2/6] Cover...")
+        # 2. Engine 4 — Cover
+        update_ui(3, f"[2/5] Membuat cover: {cover_settings['sni_number']}")
         cover_out = f"cover_{os.path.basename(final_file)}"
-        if engine4.prepend_cover(input_docx=final_file, output_docx=cover_out, sni_number=cover_settings["sni_number"], bsn_year=cover_settings["bsn_year"], title_id=auto_title_id, title_en=auto_title_en, ref_standard=cover_settings["ref_standard"], ics_number=cover_settings["ics_number"])[0]:
+        ok4 = engine4.prepend_cover(input_docx=final_file, output_docx=cover_out, sni_number=cover_settings["sni_number"], bsn_year=cover_settings["bsn_year"], title_id=auto_title_id, title_en=auto_title_en, ref_standard=cover_settings["ref_standard"], ics_number=cover_settings["ics_number"])[0]
+        if ok4:
             final_file = cover_out
+            update_ui(4, f"[2/5] Cover selesai ✓ — {_title_info}")
 
-        # 3. Engine 5
-        update_ui(35, "[3/6] Daftar Isi...")
+        # 3. Engine 5 — Daftar Isi
+        update_ui(5, f"[3/5] Membuat daftar isi dari {_total_para} paragraf...")
         di_out = f"di_{os.path.basename(final_file)}"
-        if engine5.insert(input_docx=final_file, output_docx=di_out, doc_title=cover_settings["sni_number"], copyright_text=f"©BSN {cover_settings['bsn_year']}")[0]:
+        ok5 = engine5.insert(input_docx=final_file, output_docx=di_out, doc_title=cover_settings["sni_number"], copyright_text=f"©BSN {cover_settings['bsn_year']}")[0]
+        if ok5:
             final_file = di_out
+            update_ui(6, f"[3/5] Daftar isi selesai ✓")
 
-        # 4. Engine 6
-        update_ui(50, "[4/6] Prakata...")
-        pp_out = f"pp_{os.path.basename(final_file)}"
+        # 4. Engine 6 — Prakata
         ref_std = re.sub(r'^SNI\s+', '', cover_settings["sni_number"]).strip()
-        if engine6.insert(input_docx=final_file, output_docx=pp_out, sni_number=cover_settings["sni_number"], title_id=auto_title_id or 'Judul ID', title_en=auto_title_en or 'Title EN', ref_standard=ref_std, bsn_year=cover_settings["bsn_year"])[0]:
+        update_ui(7, f"[4/5] Menyisipkan prakata: {ref_std}")
+        pp_out = f"pp_{os.path.basename(final_file)}"
+        ok6 = engine6.insert(input_docx=final_file, output_docx=pp_out, sni_number=cover_settings["sni_number"], title_id=auto_title_id or 'Judul ID', title_en=auto_title_en or 'Title EN', ref_standard=ref_std, bsn_year=cover_settings["bsn_year"])[0]
+        if ok6:
             final_file = pp_out
+            update_ui(8, f"[4/5] Prakata selesai ✓")
 
-        # 5. Engine 7
-        update_ui(65, "[5/6] Info Pendukung...")
+        # 5. Engine 7 — Info Pendukung
+        update_ui(9, f"[5/5] Menambahkan info pendukung BSN {_tahun}...")
         ip_out = f"ip_{os.path.basename(final_file)}"
-        if engine7.append(input_docx=final_file, output_docx=ip_out)[0]:
+        ok7 = engine7.append(input_docx=final_file, output_docx=ip_out)[0]
+        if ok7:
             final_file = ip_out
-        
+            update_ui(10, f"[5/5] Formatting selesai ✓")
+
         return final_file
 
     try:
-        # --- LANGKAH 1: OPTIMASI ---
+        # --- LANGKAH 1: OPTIMASI (0–10%) ---
+        update_ui(1, "Membaca file dokumen...")
         final_opt_file = run_optimization(target_file, doc_title_val)
         st.session_state['_final_opt_file'] = final_opt_file
-        
-        # --- LANGKAH 2: TERJEMAHAN ---
-        update_ui(75, "[6/6] Terjemahan...")
+
+        # --- LANGKAH 2: TERJEMAHAN (10–100%) ---
+        update_ui(10, "[6/6] Menginisialisasi mesin terjemahan...")
         tr_out = f"ID_{os.path.basename(final_opt_file)}"
-        
-        # FIX KRITIS: sebelumnya italic_dict TIDAK PERNAH dikirim ke engine translasi,
-        # sehingga seluruh isi "Kamus Istilah Asing" (mis. "ISO Online browsing platform")
-        # diabaikan total meskipun sudah berhasil dimuat dari Google Sheet.
+
         _engine9 = DocxFinalTranslatorEngine(
             source_lang=src_lang_val,
             target_lang='id',
             custom_dict=st.session_state.get('custom_dict'),
             italic_dict=st.session_state.get('italic_dict'),
         )
-        
+
+        # ── Callback: parse format baru engine9, throttle ≤1x/detik ─────────
+        # Format pesan dari engine9:
+        #   "[tag] aksi\tdone/total\tn_trans\tn_skip\tn_tbl\tpreview"
+        _cb_t0      = [time.time()]   # waktu update terakhir
+        _cb_total   = [0]             # total item (diisi dari pesan pertama)
+
+        _ICON = {
+            'translate': '✏️', 'done': '✏️',
+            'skip': '⏭', 'kosong': '⏭', 'cover-italic': '⏭',
+            'heading': '⏭', 'toc': '⏭', 'header': '⏭', 'footer': '⏭',
+            'tabel': '📊', 'annex': '📎', 'bibliografi': '📚',
+        }
+
         def _cb_tr(pct, msg):
-            final_pct = 75 + int(pct * 0.25)
-            update_ui(final_pct, f"[Translate] {msg}")
+            # ── Fallback pct (dipakai saat fase init/post-proc, bukan fase elemen) ──
+            # Fase elemen akan override ini dengan kalkulasi done/total di bawah
+            final_pct = min(10 + int(pct * 0.90), 100)
+
+            # ── Parse format tab-separated dari engine9 ──────────────────────
+            # Format: "[tag] aksi\tdone/total\tn_trans\tn_skip\tn_tbl\tpreview"
+            parts = msg.split('\t')
+            if len(parts) >= 6:
+                tag_aksi  = parts[0].strip()   # "[cover-italic] skip"
+                frac      = parts[1].strip()   # "42/567"
+                n_trans   = parts[2].strip()   # "12"
+                n_skip    = parts[3].strip()   # "28"
+                n_tbl     = parts[4].strip()   # "3"
+                preview   = parts[5].strip()   # cuplikan teks
+
+                # Ambil tag dalam kurung siku
+                m_tag = re.match(r'\[([^\]]+)\]', tag_aksi)
+                tag   = m_tag.group(1) if m_tag else "?"
+                aksi  = tag_aksi[m_tag.end():].strip() if m_tag else tag_aksi
+
+                # Parse done & total dari fraksi "42/567"
+                done_int, total_int = 0, 0
+                if '/' in frac:
+                    try:
+                        done_int  = int(frac.split('/')[0])
+                        total_int = int(frac.split('/')[1])
+                    except Exception:
+                        pass
+
+                # Simpan total sekali
+                if _cb_total[0] == 0 and total_int > 0:
+                    _cb_total[0] = total_int
+                total_ref = _cb_total[0] if _cb_total[0] > 0 else total_int
+
+                # ── Progress dihitung dari done/total elemen (fase loop) ──────
+                # Progress RIIL: elemen done/total → 10%–100%
+                # elemen 0/total = 10%,  elemen total/total = 100%
+                # Tidak ada cap di 65% — progress benar-benar mencerminkan pekerjaan
+                if total_ref > 0 and done_int >= 0:
+                    elem_ratio = min(done_int / total_ref, 1.0)
+                    final_pct  = min(10 + int(elem_ratio * 90), 100)
+
+                icon = _ICON.get(tag, _ICON.get(aksi, '🔄'))
+
+                # Baris atas: statistik + batch info
+                stat_parts = []
+                if n_trans and n_trans != '0': stat_parts.append(f"✏️ {n_trans} diterjemah")
+                if n_skip  and n_skip  != '0': stat_parts.append(f"⏭ {n_skip} dilewati")
+                if n_tbl   and n_tbl   != '0': stat_parts.append(f"📊 {n_tbl} tabel")
+                stat_str = "  ·  ".join(stat_parts) if stat_parts else "memulai..."
+
+                total_str = f"/{total_ref}" if total_ref else ""
+                line1 = f"[6/6] Translate  ·  elemen {done_int}{total_str}  ·  {stat_str}"
+
+                # Baris bawah: aksi + preview teks saat ini
+                if preview and preview != '-':
+                    line2 = f"{icon} [{tag}] {aksi}  —  \"{preview}\""
+                else:
+                    line2 = f"{icon} [{tag}] {aksi}"
+
+            else:
+                # Pesan non-tab: init (pct 2–5) dan post-processing (pct 66–100)
+                # Progress langsung dari pct engine9 → 10–100%
+                line1 = f"[6/6] Translate"
+                line2 = f"🔄 {msg.strip()[:100]}"
+
+            # ── Selalu update progress bar (tidak ikut throttle) ─────────────
+            progress_bar.progress(final_pct)
+
+            # Throttle status teks: max 1x/detik, kecuali pct ≤5 atau ≥96
+            now = time.time()
+            penting = (pct <= 5 or pct >= 96)
+            if not penting and (now - _cb_t0[0]) < 1.0:
+                return
+            _cb_t0[0] = now
+
+            # Update status teks saja (progress bar sudah diupdate di atas)
+            update_ui(final_pct, f"{line1}\n{line2}", skip_progress=True)
+        # ─────────────────────────────────────────────────────────────────────
 
         ok_tr, _ = _engine9.translate(input_docx=final_opt_file, output_docx=tr_out, progress_callback=_cb_tr, translate_headers=False)
         
         if ok_tr:
             update_ui(100, "✅ Selesai!")
+            final_elapsed = get_elapsed_str(start_time)
+            # Ganti JS timer dengan waktu final statis (berhenti otomatis)
+            time_placeholder.markdown(
+                f'<div class="timer-text">⏱ {final_elapsed}</div>',
+                unsafe_allow_html=True
+            )
             st.session_state['_final_tr_file'] = tr_out
-            st.session_state['_final_time'] = get_elapsed_str(start_time)
+            st.session_state['_final_time'] = final_elapsed
             st.session_state['_show_results'] = True
             # Parse dokumen langsung agar chat langsung siap setelah rerun
             st.session_state['_doc_sections'] = _parse_doc_structure(tr_out)
