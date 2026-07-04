@@ -1,5 +1,4 @@
 import streamlit as st
-import streamlit.components.v1 as _components
 import os
 import re
 import time
@@ -77,7 +76,7 @@ from engine9 import CustomDictionary, ItalicDictionary, DocxFinalTranslatorEngin
 
 # --- KONFIGURASI HALAMAN ---
 st.set_page_config(
-    page_title="Generator RSNI",
+    page_title="ISO Doc Master",
     page_icon="📑",
     layout="centered",
     initial_sidebar_state="collapsed"
@@ -258,29 +257,6 @@ section[data-testid="stFileUploaderDropzone"] p,
 section[data-testid="stFileUploaderDropzone"] span {
     color: rgba(255,255,255,0.5) !important;
 }
-
-/* ── Tombol Browse files ── */
-section[data-testid="stFileUploaderDropzone"] button[data-testid="baseButton-secondary"],
-section[data-testid="stFileUploaderDropzone"] button,
-div[data-testid="stFileUploader"] button {
-    background: rgba(99,102,241,0.12) !important;
-    border: 1.5px solid rgba(99,102,241,0.35) !important;
-    color: rgba(165,180,252,0.85) !important;
-    border-radius: 10px !important;
-    font-size: 0.82rem !important;
-    font-weight: 600 !important;
-    font-family: 'Outfit', sans-serif !important;
-    box-shadow: none !important;
-    transition: all 0.2s ease !important;
-    padding: 0.4rem 1rem !important;
-}
-section[data-testid="stFileUploaderDropzone"] button:hover,
-div[data-testid="stFileUploader"] button:hover {
-    background: rgba(99,102,241,0.22) !important;
-    border-color: rgba(99,102,241,0.6) !important;
-    color: #c7d2fe !important;
-}
-
 div[data-testid="stFileUploaderFile"] {
     background: rgba(99,102,241,0.1) !important;
     border: 1px solid rgba(99,102,241,0.3) !important;
@@ -682,83 +658,90 @@ def load_engines():
 engine2, engine4, engine5, engine6, engine7 = load_engines()
 
 # ─────────────────────────────────────────────────────────────────────────────
-# HEADER DENGAN AUTO-REFRESH KAMUS SETIAP 1 DETIK
-# @st.fragment(run_every=N) jalankan ulang setiap N detik.
-# Fetch langsung ke Google Sheet — TANPA @st.cache_data — agar angka
-# selalu fresh dan tidak tertahan oleh cache lama.
+# SOLUSI 1: LOAD KAMUS DENGAN cache_data + TTL
+# Berbeda dengan cache_resource, cache_data akan expire setelah TTL detik
+# sehingga otomatis reload dari Google Sheet tanpa perlu restart server.
 # ─────────────────────────────────────────────────────────────────────────────
 
-@st.fragment(run_every=_KAMUS_TTL)
-def _render_header_with_live_kamus():
+@st.cache_data(ttl=_KAMUS_TTL, show_spinner=False)
+def _load_kamus_from_sheet():
     """
-    Fragment ini di-rerun setiap _KAMUS_TTL detik secara otomatis.
-    Fetch langsung ke Google Sheet tanpa cache sehingga perubahan
-    di spreadsheet terlihat dalam <= 1 detik.
+    Load kamus dari Google Sheet.
+    Otomatis di-refresh setiap _KAMUS_TTL detik (default 1 detik = 1 detik).
     """
-    # Fetch langsung dari Google Sheet — tanpa cache
-    _d = CustomDictionary()
-    _n = _d.load_defaults()
-    _i = ItalicDictionary()
-    _ni = _i.load_defaults()
+    d = CustomDictionary()
+    count_kamus = d.load_defaults()
+    i = ItalicDictionary()
+    count_italic = i.load_defaults()
+    return d, count_kamus, i, count_italic
 
-    # Simpan ke session_state agar engine lain bisa pakai
-    st.session_state['custom_dict']      = _d
-    st.session_state['kamus_count']      = _n
-    st.session_state['italic_dict']      = _i
-    st.session_state['italic_count']     = _ni
+# Reload kamus ke session_state jika:
+#   (a) belum pernah load, ATAU
+#   (b) sudah lebih dari _KAMUS_TTL detik sejak load terakhir
+_needs_reload = (
+    'custom_dict' not in st.session_state or
+    time.time() - st.session_state.get('_kamus_loaded_at', 0) > _KAMUS_TTL
+)
+
+if _needs_reload:
+    _d, _n, _i, _ni = _load_kamus_from_sheet()
+    st.session_state['custom_dict']    = _d
+    st.session_state['kamus_count']    = _n
+    st.session_state['italic_dict']    = _i
+    st.session_state['italic_count']   = _ni
     st.session_state['_kamus_loaded_at'] = time.time()
 
-    _status_html = (
-        f"""<div class="status-pill status-ready">
-            <span class="status-dot"></span>
-            Sistem Siap &nbsp;
-        </div>"""
-        if _n > 0 else
-        """<div class="status-pill status-warn">
-            <span class="status-dot"></span>
-            Kamus Tidak Aktif
-        </div>"""
-    )
-
-    st.markdown(f"""
-        <div class="app-header">
-            <div class="badge">Generator RSNI</div>
-            <h1>📑 ISO to RSNI Converter</h1>
-            <p>Memformat & Menerjemahan Dokumen Standar ISO Menjadi Draft RSNI Secara Otomatis</p>
-            <div class="stats-row">
-                <div class="stat-item">
-                    <div class="stat-num">8</div>
-                    <div class="stat-lbl">Engine</div>
-                </div>
-                <div class="stat-divider"></div>
-                <div class="stat-item">
-                    <div class="stat-num">{_n if _n > 0 else '—'}</div>
-                    <div class="stat-lbl">Kamus SNI</div>
-                </div>
-                <div class="stat-divider"></div>
-                <div class="stat-item">
-                    <div class="stat-num">{_ni if _ni > 0 else '—'}</div>
-                    <div class="stat-lbl">Kamus Istilah Asing</div>
-                </div>
-                <div class="stat-divider"></div>
-                <div class="stat-item">
-                    <div class="stat-num">13</div>
-                    <div class="stat-lbl">Bahasa</div>
-                </div>
-            </div>
-            {_status_html}
-        </div>
-    """, unsafe_allow_html=True)
-
-# --- HALAMAN UTAMA ---
-
-# Render header + muat kamus secara live (auto-refresh setiap 1 detik)
-_render_header_with_live_kamus()
-
-# Ambil nilai kamus dari session_state untuk dipakai di bawah
+# Ambil nilai untuk ditampilkan di header
 _kamus = st.session_state.get('custom_dict')
 _count = st.session_state.get('kamus_count', 0)
 _italic_count = st.session_state.get('italic_count', 0)
+
+# ─────────────────────────────────────────────────────────────────────────────
+
+# --- HALAMAN UTAMA ---
+
+# --- HEADER ---
+_status_html = (
+    f"""<div class="status-pill status-ready">
+        <span class="status-dot"></span>
+        Sistem Siap &nbsp;
+    </div>"""
+    if _count > 0 else
+    """<div class="status-pill status-warn">
+        <span class="status-dot"></span>
+        Kamus Tidak Aktif
+    </div>"""
+)
+
+st.markdown(f"""
+    <div class="app-header">
+        <div class="badge">Generator RSNI</div>
+        <h1>📑 ISO to RSNI Converter</h1>
+        <p>Memformat & Menerjemahan Dokumen Standar ISO Menjadi Draft RSNI Secara Otomatis</p>
+        <div class="stats-row">
+            <div class="stat-item">
+                <div class="stat-num">8</div>
+                <div class="stat-lbl">Engine</div>
+            </div>
+            <div class="stat-divider"></div>
+            <div class="stat-item">
+                <div class="stat-num">{_count if _count > 0 else '—'}</div>
+                <div class="stat-lbl">Kamus SNI</div>
+            </div>
+            <div class="stat-divider"></div>
+            <div class="stat-item">
+                <div class="stat-num">{_italic_count if _italic_count > 0 else '—'}</div>
+                <div class="stat-lbl">Kamus Istilah Asing</div>
+            </div>
+            <div class="stat-divider"></div>
+            <div class="stat-item">
+                <div class="stat-num">13</div>
+                <div class="stat-lbl">Bahasa</div>
+            </div>
+        </div>
+        {_status_html}
+    </div>
+""", unsafe_allow_html=True)
 
 import datetime
 _tahun = str(datetime.date.today().year)
@@ -811,80 +794,22 @@ if st.session_state.get('_run_process') and st.session_state.get('_target_file')
     # UI Progress — 3 elemen terpisah agar tidak saling tumpuk
     status_placeholder = st.empty()
     progress_bar = st.progress(0)
-    start_time = time.time()
-
-    # ── Live Timer: iframe via components.html agar <script> benar-benar jalan
-    _TIMER_HTML = """
-    <style>
-      #sni-timer-wrap {
-        font-family: 'JetBrains Mono', monospace;
-        font-size: 0.82rem;
-        color: rgba(110,231,183,0.85);
-        text-align: center;
-        letter-spacing: 1px;
-        margin: 0;
-        padding: 0;
-        background: transparent;
-      }
-    </style>
-    <div id="sni-timer-wrap">
-      &#x23F1; <span id="sni-timer">0 detik</span>
-    </div>
-    <script>
-      var start = Date.now();
-      setInterval(function(){
-        var sec = Math.floor((Date.now() - start) / 1000);
-        var el = document.getElementById('sni-timer');
-        if (!el) return;
-        if (sec < 60) {
-          el.textContent = sec + ' detik';
-        } else {
-          var m = Math.floor(sec / 60);
-          var s = sec % 60;
-          el.textContent = m + ' menit ' + s + ' detik';
-        }
-      }, 1000);
-    </script>
-    """
-    # components.html() render ke iframe — script PASTI jalan, tidak disanitasi
-    _components.html(_TIMER_HTML, height=36)
-    # time_placeholder dipakai hanya untuk waktu final statis setelah selesai
     time_placeholder = st.empty()
-    # ────────────────────────────────────────────────────────────────────────
-
-    # Helper Update UI — TIDAK menyentuh timer iframe, hanya status & progress
-    def update_ui(pct, msg, skip_progress=False):
-        parts = msg.split("\n", 1)
-        line1 = parts[0].strip()
-        line2 = parts[1].strip() if len(parts) > 1 else ""
-        if pct >= 100:
-            dot_color, dot_glow, anim = "#10b981", "rgba(16,185,129,0.9)", ""
-        elif pct >= 75:
-            dot_color, dot_glow, anim = "#6366f1", "rgba(99,102,241,0.9)", "animation:_pd 0.9s infinite;"
-        elif pct >= 50:
-            dot_color, dot_glow, anim = "#818cf8", "rgba(129,140,248,0.8)", "animation:_pd 1s infinite;"
-        else:
-            dot_color, dot_glow, anim = "#a5b4fc", "rgba(165,180,252,0.7)", "animation:_pd 1.1s infinite;"
-        detail_html = (
-            f'<div style="font-size:0.78rem;color:rgba(199,210,254,0.72);margin-top:0.22rem;'
-            f'white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-style:italic;">{line2}</div>'
-        ) if line2 else ""
+    start_time = time.time()
+    
+    # Helper Update UI
+    def update_ui(pct, msg):
         status_placeholder.markdown(
-            f'<div style="background:rgba(15,23,42,0.6);border:1px solid rgba(99,102,241,0.22);'
-            f'border-radius:10px;padding:0.5rem 0.9rem;font-family:\'Outfit\',sans-serif;margin-bottom:0.3rem;">'
-            f'<div style="display:flex;align-items:center;gap:0.5rem;">'
-            f'<span style="display:inline-block;width:8px;height:8px;border-radius:50%;flex-shrink:0;'
-            f'background:{dot_color};box-shadow:0 0 7px {dot_glow};{anim}"></span>'
-            f'<span style="font-size:0.85rem;font-weight:600;color:rgba(165,180,252,0.92);'
-            f'flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">{line1}</span>'
-            f'<span style="font-family:\'JetBrains Mono\',monospace;font-size:0.75rem;'
-            f'color:rgba(110,231,183,0.65);flex-shrink:0;">{pct}%</span>'
-            f'</div>{detail_html}</div>'
-            f'<style>@keyframes _pd{{0%,100%{{opacity:1;transform:scale(1);}}50%{{opacity:.3;transform:scale(1.6);}}}}</style>',
+            f'<div style="font-size:0.85rem; color:rgba(165,180,252,0.85); '
+            f'font-family:\'Outfit\',sans-serif; font-weight:500; margin-bottom:0.3rem;">'
+            f'⚡ {msg}</div>',
             unsafe_allow_html=True
         )
-        if not skip_progress:
-            progress_bar.progress(pct)
+        progress_bar.progress(pct)
+        time_placeholder.markdown(
+            f'<div class="timer-text">⏱ {get_elapsed_str(start_time)}</div>',
+            unsafe_allow_html=True
+        )
 
     # Pipeline Optimasi
     def run_optimization(input_file, doc_title):
@@ -894,183 +819,62 @@ if st.session_state.get('_run_process') and st.session_state.get('_target_file')
             "bsn_year": _tahun, "ics_number": "XX.XXX.XX", "ref_standard": "",
         }
 
-        # Hitung total paragraf dokumen untuk info realtime
-        try:
-            from docx import Document as _DocCount
-            _dc = _DocCount(input_file)
-            _total_para = len(_dc.paragraphs)
-            _total_tbl  = len(_dc.tables)
-            del _dc
-        except Exception:
-            _total_para, _total_tbl = 0, 0
-        _doc_info = f"{_total_para} paragraf, {_total_tbl} tabel"
-
-        # Engine 1–5 berbagi 0–10% total progress
-        # E2=1-2, E4=3-4, E5=5-6, E6=7-8, E7=9-10
-
-        # 1. Engine 2 — Format Dasar
-        update_ui(1, f"[1/5] Memuat & format dokumen... ({_doc_info})")
+        # 1. Engine 2
+        update_ui(5, "[1/6] Format Dasar...")
         output_file = f"opt_{os.path.basename(input_file)}"
         success, msg = engine2.process(input_file, output_file, ISO_FONT_NAME, ISO_FONT_SIZE, enable_headers=True, doc_title=doc_title, copyright_text=copyright_text)
         if not success: raise Exception(f"Engine 2: {msg}")
-        update_ui(2, f"[1/5] Format dasar selesai ✓ ({_doc_info})")
         final_file = output_file
         auto_title_id, auto_title_en = extract_titles_from_docx(output_file)
-        _title_info = auto_title_id[:30] + "..." if auto_title_id and len(auto_title_id) > 30 else (auto_title_id or "-")
 
-        # 2. Engine 4 — Cover
-        update_ui(3, f"[2/5] Membuat cover: {cover_settings['sni_number']}")
+        # 2. Engine 4
+        update_ui(20, "[2/6] Cover...")
         cover_out = f"cover_{os.path.basename(final_file)}"
-        ok4 = engine4.prepend_cover(input_docx=final_file, output_docx=cover_out, sni_number=cover_settings["sni_number"], bsn_year=cover_settings["bsn_year"], title_id=auto_title_id, title_en=auto_title_en, ref_standard=cover_settings["ref_standard"], ics_number=cover_settings["ics_number"])[0]
-        if ok4:
+        if engine4.prepend_cover(input_docx=final_file, output_docx=cover_out, sni_number=cover_settings["sni_number"], bsn_year=cover_settings["bsn_year"], title_id=auto_title_id, title_en=auto_title_en, ref_standard=cover_settings["ref_standard"], ics_number=cover_settings["ics_number"])[0]:
             final_file = cover_out
-            update_ui(4, f"[2/5] Cover selesai ✓ — {_title_info}")
 
-        # 3. Engine 5 — Daftar Isi
-        update_ui(5, f"[3/5] Membuat daftar isi dari {_total_para} paragraf...")
+        # 3. Engine 5
+        update_ui(35, "[3/6] Daftar Isi...")
         di_out = f"di_{os.path.basename(final_file)}"
-        ok5 = engine5.insert(input_docx=final_file, output_docx=di_out, doc_title=cover_settings["sni_number"], copyright_text=f"©BSN {cover_settings['bsn_year']}")[0]
-        if ok5:
+        if engine5.insert(input_docx=final_file, output_docx=di_out, doc_title=cover_settings["sni_number"], copyright_text=f"©BSN {cover_settings['bsn_year']}")[0]:
             final_file = di_out
-            update_ui(6, f"[3/5] Daftar isi selesai ✓")
 
-        # 4. Engine 6 — Prakata
-        ref_std = re.sub(r'^SNI\s+', '', cover_settings["sni_number"]).strip()
-        update_ui(7, f"[4/5] Menyisipkan prakata: {ref_std}")
+        # 4. Engine 6
+        update_ui(50, "[4/6] Prakata...")
         pp_out = f"pp_{os.path.basename(final_file)}"
-        ok6 = engine6.insert(input_docx=final_file, output_docx=pp_out, sni_number=cover_settings["sni_number"], title_id=auto_title_id or 'Judul ID', title_en=auto_title_en or 'Title EN', ref_standard=ref_std, bsn_year=cover_settings["bsn_year"])[0]
-        if ok6:
+        ref_std = re.sub(r'^SNI\s+', '', cover_settings["sni_number"]).strip()
+        if engine6.insert(input_docx=final_file, output_docx=pp_out, sni_number=cover_settings["sni_number"], title_id=auto_title_id or 'Judul ID', title_en=auto_title_en or 'Title EN', ref_standard=ref_std, bsn_year=cover_settings["bsn_year"])[0]:
             final_file = pp_out
-            update_ui(8, f"[4/5] Prakata selesai ✓")
 
-        # 5. Engine 7 — Info Pendukung
-        update_ui(9, f"[5/5] Menambahkan info pendukung BSN {_tahun}...")
+        # 5. Engine 7
+        update_ui(65, "[5/6] Info Pendukung...")
         ip_out = f"ip_{os.path.basename(final_file)}"
-        ok7 = engine7.append(input_docx=final_file, output_docx=ip_out)[0]
-        if ok7:
+        if engine7.append(input_docx=final_file, output_docx=ip_out)[0]:
             final_file = ip_out
-            update_ui(10, f"[5/5] Formatting selesai ✓")
-
+        
         return final_file
 
     try:
-        # --- LANGKAH 1: OPTIMASI (0–10%) ---
-        update_ui(1, "Membaca file dokumen...")
+        # --- LANGKAH 1: OPTIMASI ---
         final_opt_file = run_optimization(target_file, doc_title_val)
         st.session_state['_final_opt_file'] = final_opt_file
-
-        # --- LANGKAH 2: TERJEMAHAN (10–100%) ---
-        update_ui(10, "[6/6] Menginisialisasi mesin terjemahan...")
+        
+        # --- LANGKAH 2: TERJEMAHAN ---
+        update_ui(75, "[6/6] Terjemahan...")
         tr_out = f"ID_{os.path.basename(final_opt_file)}"
-
+        
         _engine9 = DocxFinalTranslatorEngine(source_lang=src_lang_val, target_lang='id', custom_dict=st.session_state.get('custom_dict'))
-
-        # ── Callback: parse format baru engine9, throttle ≤1x/detik ─────────
-        # Format pesan dari engine9:
-        #   "[tag] aksi\tdone/total\tn_trans\tn_skip\tn_tbl\tpreview"
-        _cb_t0      = [time.time()]   # waktu update terakhir
-        _cb_total   = [0]             # total item (diisi dari pesan pertama)
-
-        _ICON = {
-            'translate': '✏️', 'done': '✏️',
-            'skip': '⏭', 'kosong': '⏭', 'cover-italic': '⏭',
-            'heading': '⏭', 'toc': '⏭', 'header': '⏭', 'footer': '⏭',
-            'tabel': '📊', 'annex': '📎', 'bibliografi': '📚',
-        }
-
+        
         def _cb_tr(pct, msg):
-            # ── Fallback pct (dipakai saat fase init/post-proc, bukan fase elemen) ──
-            # Fase elemen akan override ini dengan kalkulasi done/total di bawah
-            final_pct = min(10 + int(pct * 0.90), 100)
-
-            # ── Parse format tab-separated dari engine9 ──────────────────────
-            # Format: "[tag] aksi\tdone/total\tn_trans\tn_skip\tn_tbl\tpreview"
-            parts = msg.split('\t')
-            if len(parts) >= 6:
-                tag_aksi  = parts[0].strip()   # "[cover-italic] skip"
-                frac      = parts[1].strip()   # "42/567"
-                n_trans   = parts[2].strip()   # "12"
-                n_skip    = parts[3].strip()   # "28"
-                n_tbl     = parts[4].strip()   # "3"
-                preview   = parts[5].strip()   # cuplikan teks
-
-                # Ambil tag dalam kurung siku
-                m_tag = re.match(r'\[([^\]]+)\]', tag_aksi)
-                tag   = m_tag.group(1) if m_tag else "?"
-                aksi  = tag_aksi[m_tag.end():].strip() if m_tag else tag_aksi
-
-                # Parse done & total dari fraksi "42/567"
-                done_int, total_int = 0, 0
-                if '/' in frac:
-                    try:
-                        done_int  = int(frac.split('/')[0])
-                        total_int = int(frac.split('/')[1])
-                    except Exception:
-                        pass
-
-                # Simpan total sekali
-                if _cb_total[0] == 0 and total_int > 0:
-                    _cb_total[0] = total_int
-                total_ref = _cb_total[0] if _cb_total[0] > 0 else total_int
-
-                # ── Progress dihitung dari done/total elemen (fase loop) ──────
-                # Progress RIIL: elemen done/total → 10%–100%
-                # elemen 0/total = 10%,  elemen total/total = 100%
-                # Tidak ada cap di 65% — progress benar-benar mencerminkan pekerjaan
-                if total_ref > 0 and done_int >= 0:
-                    elem_ratio = min(done_int / total_ref, 1.0)
-                    final_pct  = min(10 + int(elem_ratio * 90), 100)
-
-                icon = _ICON.get(tag, _ICON.get(aksi, '🔄'))
-
-                # Baris atas: statistik + batch info
-                stat_parts = []
-                if n_trans and n_trans != '0': stat_parts.append(f"✏️ {n_trans} diterjemah")
-                if n_skip  and n_skip  != '0': stat_parts.append(f"⏭ {n_skip} dilewati")
-                if n_tbl   and n_tbl   != '0': stat_parts.append(f"📊 {n_tbl} tabel")
-                stat_str = "  ·  ".join(stat_parts) if stat_parts else "memulai..."
-
-                total_str = f"/{total_ref}" if total_ref else ""
-                line1 = f"[6/6] Translate  ·  elemen {done_int}{total_str}  ·  {stat_str}"
-
-                # Baris bawah: aksi + preview teks saat ini
-                if preview and preview != '-':
-                    line2 = f"{icon} [{tag}] {aksi}  —  \"{preview}\""
-                else:
-                    line2 = f"{icon} [{tag}] {aksi}"
-
-            else:
-                # Pesan non-tab: init (pct 2–5) dan post-processing (pct 66–100)
-                # Progress langsung dari pct engine9 → 10–100%
-                line1 = f"[6/6] Translate"
-                line2 = f"🔄 {msg.strip()[:100]}"
-
-            # ── Selalu update progress bar (tidak ikut throttle) ─────────────
-            progress_bar.progress(final_pct)
-
-            # Throttle status teks: max 1x/detik, kecuali pct ≤5 atau ≥96
-            now = time.time()
-            penting = (pct <= 5 or pct >= 96)
-            if not penting and (now - _cb_t0[0]) < 1.0:
-                return
-            _cb_t0[0] = now
-
-            # Update status teks saja (progress bar sudah diupdate di atas)
-            update_ui(final_pct, f"{line1}\n{line2}", skip_progress=True)
-        # ─────────────────────────────────────────────────────────────────────
+            final_pct = 75 + int(pct * 0.25)
+            update_ui(final_pct, f"[Translate] {msg}")
 
         ok_tr, _ = _engine9.translate(input_docx=final_opt_file, output_docx=tr_out, progress_callback=_cb_tr, translate_headers=False)
         
         if ok_tr:
             update_ui(100, "✅ Selesai!")
-            final_elapsed = get_elapsed_str(start_time)
-            # Ganti JS timer dengan waktu final statis (berhenti otomatis)
-            time_placeholder.markdown(
-                f'<div class="timer-text">⏱ {final_elapsed}</div>',
-                unsafe_allow_html=True
-            )
             st.session_state['_final_tr_file'] = tr_out
-            st.session_state['_final_time'] = final_elapsed
+            st.session_state['_final_time'] = get_elapsed_str(start_time)
             st.session_state['_show_results'] = True
             # Parse dokumen langsung agar chat langsung siap setelah rerun
             st.session_state['_doc_sections'] = _parse_doc_structure(tr_out)
@@ -1293,6 +1097,572 @@ def _local_answer(query: str, sections: list, history: list) -> str:
         "\n\n_Coba gunakan kata kunci yang lebih spesifik atau tanyakan tentang bagian di atas._"
     )
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CLAUDE API CHAT — diskusi isi dokumen
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _build_doc_context(sections: list, max_chars: int = 14000) -> str:
+    """Bangun teks konteks dari sections, potong jika terlalu panjang."""
+    lines, total = [], 0
+    for s in sections:
+        chunk = f"\n## {s['heading']}\n" + "\n".join(s['paragraphs']) + "\n"
+        if total + len(chunk) > max_chars:
+            sisa = max_chars - total
+            if sisa > 100:
+                lines.append(chunk[:sisa] + "\n[...dokumen dipotong...]")
+            break
+        lines.append(chunk)
+        total += len(chunk)
+    return "\n".join(lines)
+
+def _claude_chat(system: str, messages: list) -> str:
+    """Kirim chat ke Z.ai API (GLM), return teks jawaban."""
+    import urllib.request, json
+
+    ZAI_API_KEY = "bd7f64d4e11642599ca8d1772e89521c.imnp62IRucfcV4bA"
+
+    all_messages = [{"role": "system", "content": system}] + messages
+
+    payload = json.dumps({
+        "model": "glm-4-flash",
+        "messages": all_messages,
+        "max_tokens": 1024,
+        "temperature": 0.7,
+    }).encode()
+
+    req = urllib.request.Request(
+        "https://api.z.ai/api/paas/v4/chat/completions",
+        data=payload,
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {ZAI_API_KEY}",
+        },
+        method="POST"
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=60) as r:
+            result = json.loads(r.read())
+            return result['choices'][0]['message']['content']
+    except Exception as e:
+        return f"❌ Z.ai Error: {e}"
+
+# # ── TAMPILAN CHAT — selalu tampil di dashboard ────────────────────────────────
+
+# _src = st.session_state.get('_final_tr_file') or st.session_state.get('_final_opt_file')
+# _cached_sections = st.session_state.get('_doc_sections', [])
+
+# if _src and os.path.exists(_src) and len(_cached_sections) == 0:
+#     st.session_state['_doc_sections'] = _parse_doc_structure(_src)
+# elif '_doc_sections' not in st.session_state:
+#     st.session_state['_doc_sections'] = []
+
+# sections = st.session_state.get('_doc_sections', [])
+# n_sec    = len(sections)
+# n_para   = sum(len(s['paragraphs']) for s in sections)
+# has_doc  = n_sec > 0
+
+# st.divider()
+
+# import streamlit.components.v1 as _components
+
+# _exp_label = (
+#     f"🤖 Asisten AI  ·  {n_sec} bagian  ·  {n_para} paragraf"
+#     if has_doc else
+#     "🤖 Asisten AI  ·  Tanya seputar Draft RSNI"
+# )
+
+# st.markdown("""
+# <style>
+# div[data-testid="stExpander"] {
+#     border: 1.5px solid rgba(99,102,241,0.6) !important;
+#     border-radius: 14px !important;
+#     overflow: hidden !important;
+#     box-shadow: 0 4px 24px rgba(99,102,241,0.3) !important;
+#     background: rgba(20,18,50,0.55) !important;
+# }
+# div[data-testid="stExpander"] summary {
+#     background: linear-gradient(135deg, #6366f1 0%, #4f46e5 50%, #4338ca 100%) !important;
+#     padding: 0.82rem 1.2rem !important;
+#     border-radius: 12px !important;
+#     box-shadow: 0 3px 14px rgba(99,102,241,0.45) !important;
+# }
+# div[data-testid="stExpander"] summary:hover {
+#     background: linear-gradient(135deg, #818cf8 0%, #6366f1 50%, #4f46e5 100%) !important;
+#     box-shadow: 0 6px 22px rgba(99,102,241,0.6) !important;
+# }
+# div[data-testid="stExpander"] summary span,
+# div[data-testid="stExpander"] summary p,
+# div[data-testid="stExpander"] summary div {
+#     color: #fff !important;
+#     font-weight: 700 !important;
+# }
+# div[data-testid="stExpander"] summary svg {
+#     stroke: #fff !important;
+#     color: #fff !important;
+# }
+# </style>
+# """, unsafe_allow_html=True)
+
+# with st.expander(_exp_label, expanded=True):
+
+#     doc_badge = (
+#         f"<span style='background:rgba(16,185,129,0.12);border:1px solid rgba(16,185,129,0.3);"
+#         f"color:#6ee7b7;font-size:0.75rem;padding:0.2rem 0.7rem;border-radius:99px;'>"
+#         f"📑 {n_sec} bagian · {n_para} paragraf</span>"
+#         if has_doc else
+#         f"<span style='background:rgba(255,255,255,0.05);border:1px solid rgba(255,255,255,0.1);"
+#         f"color:rgba(255,255,255,0.3);font-size:0.75rem;padding:0.2rem 0.7rem;border-radius:99px;'>"
+#         f"📄 Belum ada dokumen — jawab hal umum RSNI</span>"
+#     )
+#     st.markdown(
+#         f"<div style='display:flex;gap:0.7rem;margin-bottom:0.8rem;flex-wrap:wrap;'>"
+#         f"{doc_badge}"
+#         f"<span style='background:rgba(99,102,241,0.1);border:1px solid rgba(99,102,241,0.25);"
+#         f"color:#a5b4fc;font-size:0.75rem;padding:0.2rem 0.7rem;border-radius:99px;'>"
+#         f"✨ Z.ai GLM</span></div>",
+#         unsafe_allow_html=True
+#     )
+
+#     # ── Pemilih Suara TTS ────────────────────────────────────────────────────
+#     _components.html("""
+# <div id="tts-voice-bar" style="margin-bottom:8px;display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
+#   <span style="color:rgba(165,180,252,0.7);font-size:0.73rem;font-family:sans-serif;">🎙️ Suara:</span>
+#   <select id="tts-voice-select"
+#     style="background:rgba(15,23,42,0.85);border:1.5px solid rgba(99,102,241,0.35);
+#            color:#c7d2fe;font-size:0.73rem;padding:3px 8px;border-radius:8px;
+#            font-family:sans-serif;cursor:pointer;outline:none;max-width:260px;">
+#     <option value="">⏳ Memuat daftar suara...</option>
+#   </select>
+#   <select id="tts-rate-select"
+#     style="background:rgba(15,23,42,0.85);border:1.5px solid rgba(99,102,241,0.35);
+#            color:#c7d2fe;font-size:0.73rem;padding:3px 8px;border-radius:8px;
+#            font-family:sans-serif;cursor:pointer;outline:none;">
+#     <option value="0.7">🐢 Lambat</option>
+#     <option value="0.92" selected>▶️ Normal</option>
+#     <option value="1.2">⚡ Cepat</option>
+#     <option value="1.5">🚀 Sangat Cepat</option>
+#   </select>
+# </div>
+# <script>
+# (function(){
+#   var sel = document.getElementById('tts-voice-select');
+
+#   function populateVoices(){
+#     var voices = window.speechSynthesis.getVoices();
+#     if(!voices.length) return;
+#     sel.innerHTML = '';
+
+#     var id_voices = voices.filter(function(v){
+#       return v.lang.startsWith('id') || v.lang.startsWith('ms');
+#     });
+#     var en_voices = voices.filter(function(v){
+#       return v.lang.startsWith('en');
+#     }).slice(0, 10);
+
+#     if(id_voices.length){
+#       var og = document.createElement('optgroup');
+#       og.label = '🇮🇩 Indonesia / Melayu';
+#       id_voices.forEach(function(v){
+#         var o = document.createElement('option');
+#         o.value = v.name;
+#         o.textContent = v.name + ' (' + v.lang + ')';
+#         og.appendChild(o);
+#       });
+#       sel.appendChild(og);
+#     }
+
+#     if(en_voices.length){
+#       var og2 = document.createElement('optgroup');
+#       og2.label = '🌐 English (fallback)';
+#       en_voices.forEach(function(v){
+#         var o = document.createElement('option');
+#         o.value = v.name;
+#         o.textContent = v.name + ' (' + v.lang + ')';
+#         og2.appendChild(o);
+#       });
+#       sel.appendChild(og2);
+#     }
+
+#     sel.onchange = function(){
+#       try{ localStorage.setItem('tts_voice', sel.value); }catch(e){}
+#     };
+#     try{
+#       var saved = localStorage.getItem('tts_voice');
+#       if(saved && sel.querySelector('option[value="'+saved+'"]')) sel.value = saved;
+#     }catch(e){}
+#   }
+
+#   if(window.speechSynthesis.getVoices().length > 0){
+#     populateVoices();
+#   } else {
+#     window.speechSynthesis.onvoiceschanged = populateVoices;
+#     setTimeout(function(){ populateVoices(); }, 500);
+#   }
+# })();
+# </script>
+# """, height=52)
+
+#     # TTS helper
+#     def _tts_html(text: str, btn_id: str) -> str:
+#         import base64
+#         b64 = base64.b64encode(text[:3000].encode('utf-8')).decode('ascii')
+#         return f"""
+# <div style="margin-top:5px;display:flex;gap:6px;flex-wrap:wrap;">
+#   <span id="tts_data_{btn_id}" style="display:none">{b64}</span>
+#   <button id="btn_speak_{btn_id}"
+#     onclick="(function(){{
+#       if(!('speechSynthesis' in window)){{alert('Browser tidak mendukung TTS');return;}}
+#       window.speechSynthesis.cancel();
+
+#       var raw = document.getElementById('tts_data_{btn_id}').textContent;
+#       var txt = decodeURIComponent(escape(atob(raw)));
+#       var btn = document.getElementById('btn_speak_{btn_id}');
+
+#       var voiceName = '';
+#       var rate = 0.92;
+#       try {{
+#         var topDoc = window.top.document;
+#         var vSel = topDoc.getElementById('tts-voice-select');
+#         var rSel = topDoc.getElementById('tts-rate-select');
+#         if(vSel) voiceName = vSel.value;
+#         if(rSel) rate = parseFloat(rSel.value) || 0.92;
+#       }} catch(e) {{
+#         try{{ voiceName = localStorage.getItem('tts_voice') || ''; }}catch(e2){{}}
+#       }}
+
+#       var voices = window.speechSynthesis.getVoices();
+#       var chosenVoice = null;
+#       if(voiceName) chosenVoice = voices.find(function(v){{return v.name===voiceName;}});
+#       if(!chosenVoice) chosenVoice = voices.find(function(v){{return v.lang.startsWith('id');}});
+#       if(!chosenVoice) chosenVoice = voices.find(function(v){{return v.lang.startsWith('ms');}});
+#       if(!chosenVoice) chosenVoice = voices.find(function(v){{return v.lang.startsWith('en');}});
+
+#       var sentences = txt.match(/[^.!?\\n]{{1,220}}[.!?\\n]?/g) || [txt];
+#       btn.textContent = '⏳ Membaca...';
+#       btn.style.borderColor = 'rgba(16,185,129,0.6)';
+#       btn.style.color = '#6ee7b7';
+
+#       function speakChunk(i){{
+#         if(i >= sentences.length){{
+#           btn.textContent='🔊 Bacakan';
+#           btn.style.borderColor='rgba(99,102,241,0.4)';
+#           btn.style.color='#a5b4fc';
+#           return;
+#         }}
+#         var u = new SpeechSynthesisUtterance(sentences[i]);
+#         u.lang = 'id-ID';
+#         u.rate = rate;
+#         u.pitch = 1.0;
+#         if(chosenVoice) u.voice = chosenVoice;
+#         u.onend  = function(){{ speakChunk(i+1); }};
+#         u.onerror = function(){{
+#           btn.textContent='🔊 Bacakan';
+#           btn.style.borderColor='rgba(99,102,241,0.4)';
+#           btn.style.color='#a5b4fc';
+#         }};
+#         window.speechSynthesis.speak(u);
+#       }}
+
+#       function startSpeak(){{
+#         if(window.speechSynthesis.getVoices().length===0){{
+#           window.speechSynthesis.onvoiceschanged=function(){{ speakChunk(0); }};
+#         }} else {{
+#           speakChunk(0);
+#         }}
+#       }}
+#       startSpeak();
+#     }})()"
+#     style="background:rgba(99,102,241,0.15);border:1px solid rgba(99,102,241,0.4);
+#            color:#a5b4fc;font-size:0.72rem;padding:4px 12px;border-radius:99px;
+#            cursor:pointer;font-family:sans-serif;transition:all 0.2s;">
+#     🔊 Bacakan
+#   </button>
+#   <button onclick="(function(){{
+#       window.speechSynthesis.cancel();
+#       var b=document.getElementById('btn_speak_{btn_id}');
+#       if(b){{b.textContent='🔊 Bacakan';b.style.borderColor='rgba(99,102,241,0.4)';b.style.color='#a5b4fc';}}
+#     }})()"
+#     style="background:rgba(239,68,68,0.1);border:1px solid rgba(239,68,68,0.3);
+#            color:#fca5a5;font-size:0.72rem;padding:4px 12px;border-radius:99px;
+#            cursor:pointer;font-family:sans-serif;transition:all 0.2s;">
+#     ⏹ Stop
+#   </button>
+# </div>
+# """
+
+#     # Inisialisasi riwayat
+#     if '_chat_history' not in st.session_state:
+#         st.session_state['_chat_history'] = []
+
+#     # Tampilkan riwayat
+#     for idx, msg in enumerate(st.session_state['_chat_history']):
+#         with st.chat_message(msg['role'], avatar='🧑' if msg['role'] == 'user' else '🤖'):
+#             st.markdown(msg['content'])
+#             if msg['role'] == 'assistant':
+#                 _clean = re.sub(r'[*_`#>\-]+', '', msg['content'])
+#                 _clean = re.sub(r'\s+', ' ', _clean).strip()
+#                 _components.html(_tts_html(_clean, f"hist_{idx}"), height=44)
+
+#     # ── Voice Input ─────────────────────────────────────────────────────────
+#     _components.html("""
+# <style>
+# #mic-fixed-btn {
+#   display: none;
+#   position: fixed;
+#   bottom: 14px;
+#   right: calc(50% - 375px);
+#   z-index: 99999;
+#   background: linear-gradient(135deg, #6366f1, #4f46e5);
+#   border: none; color: #fff;
+#   font-size: 0.78rem; font-weight: 700;
+#   padding: 8px 15px; border-radius: 99px; cursor: pointer;
+#   font-family: 'Outfit', sans-serif;
+#   box-shadow: 0 4px 16px rgba(99,102,241,0.5);
+#   transition: all 0.2s; white-space: nowrap;
+#   align-items: center; gap: 5px;
+# }
+# #mic-fixed-btn.listening {
+#   background: linear-gradient(135deg,#ef4444,#dc2626) !important;
+#   animation: mic-pulse 1s infinite;
+# }
+# @keyframes mic-pulse {
+#   0%   { box-shadow: 0 0 0 0 rgba(239,68,68,0.6); }
+#   70%  { box-shadow: 0 0 0 10px rgba(239,68,68,0); }
+#   100% { box-shadow: 0 0 0 0 rgba(239,68,68,0); }
+# }
+# #mic-toast-local {
+#   display: none;
+#   position: fixed; bottom: 60px; left: 50%;
+#   transform: translateX(-50%);
+#   background: rgba(15,23,42,0.96);
+#   border: 1px solid rgba(99,102,241,0.4);
+#   border-radius: 12px; padding: 7px 16px;
+#   font-size: 0.78rem; color: #c7d2fe;
+#   font-family: sans-serif; z-index: 99999;
+#   box-shadow: 0 4px 20px rgba(0,0,0,0.4);
+#   white-space: nowrap; pointer-events: none;
+#   max-width: 90vw; overflow: hidden; text-overflow: ellipsis;
+# }
+# </style>
+
+# <button id="mic-fixed-btn" onclick="toggleMic()">🎤 Bicara</button>
+# <div   id="mic-toast-local"></div>
+
+# <script>
+# (function(){
+#   if (!window._mic) window._mic = { rec: null, listening: false, timer: null };
+#   var M = window._mic;
+
+#   var fbBtn   = document.getElementById('mic-fixed-btn');
+#   var fbToast = document.getElementById('mic-toast-local');
+#   var activeBtn   = fbBtn;
+#   var activeToast = fbToast;
+
+#   function showToast(msg, ms) {
+#     activeToast.textContent = msg;
+#     activeToast.style.display = 'block';
+#     clearTimeout(M.timer);
+#     if (ms) M.timer = setTimeout(function(){ activeToast.style.display='none'; }, ms);
+#   }
+
+#   function resetBtn() {
+#     activeBtn.innerHTML = '🎤 Bicara';
+#     activeBtn.classList.remove('listening');
+#   }
+#   function forceStop() {
+#     if (M.rec) { try { M.rec.abort(); } catch(e){} M.rec = null; }
+#     M.listening = false; resetBtn();
+#   }
+
+#   function sendToChat(txt) {
+#     var sent = false;
+#     var targets = [];
+#     try { targets.push(window); } catch(e){}
+#     try { if (window.parent !== window) targets.push(window.parent); } catch(e){}
+#     try { if (window.top !== window && window.top !== window.parent) targets.push(window.top); } catch(e){}
+#     for (var i = 0; i < targets.length && !sent; i++) {
+#       try {
+#         var w = targets[i];
+#         var ta = w.document.querySelector('div[data-testid="stChatInput"] textarea');
+#         if (!ta) continue;
+#         var setter = Object.getOwnPropertyDescriptor(w.HTMLTextAreaElement.prototype, 'value').set;
+#         setter.call(ta, txt);
+#         ta.dispatchEvent(new Event('input',  {bubbles:true}));
+#         ta.dispatchEvent(new Event('change', {bubbles:true}));
+#         setTimeout(function(){
+#           ['keydown','keypress','keyup'].forEach(function(ev){
+#             ta.dispatchEvent(new w.KeyboardEvent(ev, {key:'Enter',code:'Enter',keyCode:13,which:13,bubbles:true,cancelable:true}));
+#           });
+#           activeToast.style.display = 'none';
+#         }, 150);
+#         sent = true;
+#       } catch(e) {}
+#     }
+#     if (!sent) {
+#       try { navigator.clipboard.writeText(txt).then(function(){ showToast('📋 Tersalin — paste Ctrl+V ke chat', 4000); }); }
+#       catch(e) { showToast('💬 ' + txt.substring(0,60), 5000); }
+#     }
+#   }
+
+#   window.toggleMic = function() {
+#     if (M.listening) { forceStop(); showToast('⏹ Dihentikan', 1500); return; }
+#     var SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+#     if (!SR) { showToast('❌ Gunakan Chrome/Edge untuk voice input', 3000); return; }
+#     forceStop();
+#     var rec = new SR();
+#     rec.lang = 'id-ID'; rec.continuous = false; rec.interimResults = true; rec.maxAlternatives = 1;
+#     M.rec = rec;
+#     var lastTxt = '';
+#     rec.onstart = function() {
+#       M.listening = true;
+#       activeBtn.innerHTML = '🔴 Stop'; activeBtn.classList.add('listening');
+#       showToast('🎤 Sedang mendengarkan...');
+#     };
+#     rec.onresult = function(e) {
+#       var interim='', final_t='';
+#       for (var i=e.resultIndex; i<e.results.length; i++) {
+#         if (e.results[i].isFinal) final_t += e.results[i][0].transcript;
+#         else interim += e.results[i][0].transcript;
+#       }
+#       lastTxt = final_t || interim;
+#       showToast('💬 ' + lastTxt);
+#     };
+#     rec.onend = function() {
+#       M.rec = null; M.listening = false; resetBtn();
+#       var txt = lastTxt.trim(); lastTxt = '';
+#       if (!txt) { showToast('⚠️ Tidak terdeteksi — coba lagi', 2500); return; }
+#       sendToChat(txt);
+#     };
+#     rec.onerror = function(e) {
+#       M.rec = null; M.listening = false; resetBtn();
+#       if (e.error === 'aborted') return;
+#       var msgs = {'no-speech':'⚠️ Tidak ada suara','not-allowed':'❌ Izin mikrofon ditolak','audio-capture':'❌ Mikrofon tidak ada','network':'❌ Gangguan jaringan'};
+#       showToast(msgs[e.error] || ('❌ Error: ' + e.error), 3000);
+#     };
+#     rec.start();
+#   };
+
+#   function setupParentBtn() {
+#     try {
+#       var pw = window.parent;
+#       if (pw === window) throw new Error('no parent');
+
+#       if (!pw.document.getElementById('_mic_style')) {
+#         var s = pw.document.createElement('style');
+#         s.id = '_mic_style';
+#         s.textContent =
+#           'div[data-testid="stChatInput"]{position:relative !important;}' +
+#           'div[data-testid="stChatInput"] textarea{padding-right:128px !important;}' +
+#           '#_mic_btn{' +
+#             'position:absolute;right:52px;top:50%;transform:translateY(-50%);' +
+#             'background:linear-gradient(135deg,#6366f1,#4f46e5);' +
+#             'border:none;color:#fff;font-size:0.78rem;font-weight:700;' +
+#             'padding:7px 14px;border-radius:99px;cursor:pointer;' +
+#             'font-family:Outfit,sans-serif;' +
+#             'box-shadow:0 3px 12px rgba(99,102,241,0.5);' +
+#             'transition:all 0.2s;white-space:nowrap;' +
+#             'display:inline-flex;align-items:center;gap:5px;z-index:200;' +
+#           '}' +
+#           '#_mic_btn:hover{background:linear-gradient(135deg,#818cf8,#6366f1);box-shadow:0 5px 18px rgba(99,102,241,0.65);}' +
+#           '#_mic_btn.listening{background:linear-gradient(135deg,#ef4444,#dc2626)!important;animation:_mpulse 1s infinite;}' +
+#           '@keyframes _mpulse{0%{box-shadow:0 0 0 0 rgba(239,68,68,0.6)}70%{box-shadow:0 0 0 8px rgba(239,68,68,0)}100%{box-shadow:0 0 0 0 rgba(239,68,68,0)}}' +
+#           '#_mic_toast{display:none;position:fixed;bottom:72px;left:50%;transform:translateX(-50%);' +
+#             'background:rgba(15,23,42,0.96);border:1px solid rgba(99,102,241,0.4);' +
+#             'border-radius:12px;padding:7px 16px;font-size:0.78rem;color:#c7d2fe;' +
+#             'font-family:sans-serif;z-index:99999;box-shadow:0 4px 20px rgba(0,0,0,0.4);' +
+#             'white-space:nowrap;pointer-events:none;max-width:90vw;overflow:hidden;text-overflow:ellipsis;}';
+#         pw.document.head.appendChild(s);
+#       }
+
+#       if (!pw.document.getElementById('_mic_toast')) {
+#         var t = pw.document.createElement('div');
+#         t.id = '_mic_toast';
+#         pw.document.body.appendChild(t);
+#       }
+#       activeToast = pw.document.getElementById('_mic_toast');
+
+#       function doInject() {
+#         var chatInput = pw.document.querySelector('div[data-testid="stChatInput"]');
+#         if (!chatInput) return false;
+#         var existing = pw.document.getElementById('_mic_btn');
+#         if (existing && chatInput.contains(existing)) {
+#           activeBtn = existing;
+#           existing.onclick = function(e){ e.preventDefault(); window.toggleMic(); };
+#           fbBtn.style.display = 'none';
+#           return true;
+#         }
+#         if (existing) existing.remove();
+#         var btn = pw.document.createElement('button');
+#         btn.id   = '_mic_btn';
+#         btn.type = 'button';
+#         btn.innerHTML = '🎤 Bicara';
+#         btn.onclick = function(e){ e.preventDefault(); window.toggleMic(); };
+#         chatInput.appendChild(btn);
+#         activeBtn   = btn;
+#         fbBtn.style.display = 'none';
+#         return true;
+#       }
+
+#       if (!doInject()) {
+#         var obs = new pw.MutationObserver(function(){ doInject(); });
+#         obs.observe(pw.document.body, { childList:true, subtree:true });
+#       } else {
+#         var obs2 = new pw.MutationObserver(function(){ doInject(); });
+#         obs2.observe(pw.document.body, { childList:true, subtree:true });
+#       }
+
+#     } catch(e) {
+#       fbBtn.style.display = 'flex';
+#     }
+#   }
+
+#   setupParentBtn();
+# })();
+# </script>
+# """, height=56)
+
+#     # Input teks
+#     user_input = st.chat_input("Tanya seputar isi dokumen RSNI...")
+
+#     if user_input:
+#         st.session_state['_chat_history'].append({'role': 'user', 'content': user_input})
+#         with st.chat_message('user', avatar='🧑'):
+#             st.markdown(user_input)
+
+#         with st.chat_message('assistant', avatar='🤖'):
+#             with st.spinner("asistant sedang menganalisis..."):
+#                 if has_doc:
+#                     doc_ctx = _build_doc_context(sections, max_chars=14000)
+#                     system_prompt = (
+#                         "Kamu adalah asisten ahli RSNI yang membantu pengguna memahami dokumen. "
+#                         "Jawab HANYA berdasarkan isi dokumen berikut. "
+#                         "Gunakan Bahasa Indonesia yang jelas, terstruktur, dan akurat. "
+#                         "Jika informasi tidak ada dalam dokumen, katakan dengan jujur.\n\n"
+#                         f"=== ISI DOKUMEN ===\n{doc_ctx}\n==================="
+#                     )
+#                 else:
+#                     system_prompt = (
+#                         "Kamu adalah asisten ahli RSNI dan dokumen teknis BSN. "
+#                         "Jawab dalam Bahasa Indonesia dengan jelas dan akurat. "
+#                         "Belum ada dokumen — jawab berdasarkan pengetahuan umum SNI, ISO, IEC, dan standar lainnya."
+#                     )
+#                 api_messages = [
+#                     {"role": m['role'], "content": m['content']}
+#                     for m in st.session_state['_chat_history']
+#                 ]
+#                 reply = _claude_chat(system_prompt, api_messages)
+
+#             st.markdown(reply)
+#             _clean = re.sub(r'[*_`#>\-]+', '', reply)
+#             _clean = re.sub(r'\s+', ' ', _clean).strip()
+#             _components.html(_tts_html(_clean, f"new_{int(time.time())}"), height=44)
+#             st.session_state['_chat_history'].append({'role': 'assistant', 'content': reply})
+
+#     if st.session_state.get('_chat_history'):
+#         if st.button("🗑️ Hapus Riwayat", key="clear_chat"):
+#             st.session_state['_chat_history'] = []
+#             st.rerun()
 
 # --- FOOTER ---
 _now = time.strftime("%H:%M")
