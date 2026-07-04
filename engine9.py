@@ -65,13 +65,29 @@ def _get_next_link_placeholder() -> str:
     _LINK_COUNTER += 1
     return f"{_LINK_PLACEHOLDER_BASE}link-{_LINK_COUNTER}"
 
+# FIX: token pelindung kamus/istilah sekarang berbentuk URL palsu (bukan "@@TK_..@@").
+# Google Translate sering "membetulkan"/mengubah token aneh semacam "@@TK_AB12CD34@@"
+# (menghapus '@', mengubah huruf besar-kecil, menambah spasi), sehingga substitusi
+# balik via regex GAGAL dan istilah dari kamus tidak pernah muncul di hasil akhir --
+# inilah sebab utama kata seperti "Prakata"/istilah asing "hilang" dari output.
+# Pola URL ini sama dengan trik yang sudah dipakai & terbukti aman untuk hyperlink
+# (lihat _get_next_link_placeholder): Google Translate mengenali pola URL dan
+# membiarkannya apa adanya.
+_DICT_TOKEN_BASE = "https://kamus-lock.local/k-"
+_ITALIC_TOKEN_BASE = "https://istilah-lock.local/i-"
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 2 URL SPREADSHEET TERPISAH
 # ─────────────────────────────────────────────────────────────────────────────
+# PENTING: URL berikut HARUS SAMA dengan link "Kamus SNI" / "Kamus Istilah Asing"
+# yang ditampilkan & bisa diedit pengguna di footer app.py. Sebelumnya URL kamus
+# istilah asing di sini BERBEDA dengan spreadsheet yang ditautkan di app.py,
+# sehingga perubahan yang diketik pengguna di Google Sheet tidak pernah terbaca
+# oleh engine ini.
 
 KAMUS_SPREADSHEET_URL = "https://docs.google.com/spreadsheets/d/1BBPCMPwvbBk5LPdoDQwnjQzcPHv7_RDKENqeMsklF-8/edit?usp=sharing"
-ITALIC_SPREADSHEET_URL = "https://docs.google.com/spreadsheets/d/1SQnWSA8c1OBVq3XYE8CDMumkt0hpFtxKUjdinfWrqak/edit?usp=sharing"
+ITALIC_SPREADSHEET_URL = "https://docs.google.com/spreadsheets/d/1NZm1HjsjxmflxnZlzV_O2XF75ZlMUOu8VVofsKfp_FA/edit?usp=sharing"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -83,6 +99,7 @@ class CustomDictionary:
     
     def __init__(self):
         self._entries: dict[str, tuple[str, str]] = {}
+        self.last_error: str | None = None
 
     def add_term(self, source: str, target: str) -> None:
         s = source.strip()
@@ -94,10 +111,17 @@ class CustomDictionary:
         self._entries.clear()
 
     def load_defaults(self) -> int:
+        # FIX: error sebelumnya ditelan diam-diam (except Exception: return 0),
+        # membuat kegagalan load kamus (mis. sheet tidak bisa diakses/publik,
+        # header kolom tidak dikenali) tidak pernah terlihat oleh pengguna.
         try:
             return self.load_from_google_sheet(KAMUS_SPREADSHEET_URL)
-        except Exception:
+        except Exception as e:
+            self.last_error = str(e)
             return 0
+
+    def get_last_error(self) -> str | None:
+        return self.last_error
 
     def load_from_csv(self, filepath: str, src_col: str = 'source', 
                       tgt_col: str = 'target', delimiter: str = ',', 
@@ -129,11 +153,14 @@ class CustomDictionary:
         try: import pandas as pd
         except ImportError: raise ImportError("Jalankan: pip install pandas openpyxl")
         df = pd.read_excel(filepath, sheet_name=sheet_name, dtype=str).fillna('')
-        col_src = _find_col(df.columns.tolist(), [src_col, 'source', 'Inggris'])
-        col_tgt = _find_col(df.columns.tolist(), [tgt_col, 'target', 'Indonesia'])
-        if col_src is None: col_src = df.columns[0]
-        if col_tgt is None and len(df.columns) >= 2: col_tgt = df.columns[1]
-        if col_tgt is None: raise ValueError("Kolom target tidak ditemukan.")
+        cols = df.columns.tolist()
+        col_src = _find_col(cols, [src_col, 'source', 'inggris', 'english', 'istilah asing',
+                                    'istilah', 'bahasa inggris', 'asing', 'kata asing'])
+        col_tgt = _find_col(cols, [tgt_col, 'target', 'indonesia', 'terjemahan',
+                                    'bahasa indonesia', 'padanan', 'arti'])
+        if col_src is None: col_src = _pick_fallback_col(cols, [c for c in [col_tgt] if c])
+        if col_tgt is None: col_tgt = _pick_fallback_col(cols, [c for c in [col_src] if c])
+        if col_tgt is None: raise ValueError(f"Kolom target tidak ditemukan. Header: {cols}")
         count = 0
         for _, row in df.iterrows():
             src = str(row[col_src]).strip()
@@ -144,6 +171,7 @@ class CustomDictionary:
 
     def load_from_google_sheet(self, url: str, src_col: str = 'source', 
                                tgt_col: str = 'target', timeout: int = 15) -> int:
+        self.last_error = None
         try: import urllib.request, io
         except ImportError: raise ImportError("urllib tidak tersedia.")
         csv_url = _google_sheet_to_csv_url(url)
@@ -151,19 +179,30 @@ class CustomDictionary:
             req = urllib.request.Request(csv_url, headers={'User-Agent': 'Mozilla/5.0'})
             with urllib.request.urlopen(req, timeout=timeout) as resp: 
                 raw = resp.read().decode('utf-8-sig')
-        except Exception as e: raise ConnectionError(f"Gagal mengambil data: {e}")
+        except Exception as e:
+            self.last_error = f"Gagal mengambil data dari Spreadsheet Kamus: {e}"
+            raise ConnectionError(self.last_error)
         f = io.StringIO(raw); reader = csv.DictReader(f); fieldnames = reader.fieldnames or []
-        col_src = _find_col(fieldnames, [src_col, 'source', 'Inggris'])
-        col_tgt = _find_col(fieldnames, [tgt_col, 'target', 'Indonesia'])
-        if col_src is None and len(fieldnames) >= 1: col_src = fieldnames[0]
-        if col_tgt is None and len(fieldnames) >= 2: col_tgt = fieldnames[1]
-        if col_tgt is None: raise ValueError(f"Kolom target tidak ditemukan. Header: {fieldnames}")
+        # FIX: pencarian kolom sekarang case-insensitive & mengenali banyak sinonim
+        # header berbahasa Indonesia, plus fallback yang menghindari kolom nomor urut.
+        col_src = _find_col(fieldnames, [src_col, 'source', 'inggris', 'english', 'istilah asing',
+                                          'istilah', 'bahasa inggris', 'asing', 'kata asing'])
+        col_tgt = _find_col(fieldnames, [tgt_col, 'target', 'indonesia', 'terjemahan',
+                                          'bahasa indonesia', 'padanan', 'arti'])
+        if col_src is None: col_src = _pick_fallback_col(fieldnames, [c for c in [col_tgt] if c])
+        if col_tgt is None: col_tgt = _pick_fallback_col(fieldnames, [c for c in [col_src] if c])
+        if col_tgt is None or col_src is None:
+            self.last_error = f"Kolom source/target tidak ditemukan. Header sheet: {fieldnames}"
+            raise ValueError(self.last_error)
         count = 0
         for row in reader:
-            src = str(row.get(col_src, '')).strip()
-            tgt = str(row.get(col_tgt, '')).strip()
+            src = str(row.get(col_src, '') or '').strip()
+            tgt = str(row.get(col_tgt, '') or '').strip()
             if src and tgt and src.lower() not in ('', 'nan') and tgt.lower() not in ('', 'nan'):
                 self._entries[src.lower()] = (src, tgt); count += 1
+        if count == 0:
+            self.last_error = (f"Sheet terbaca tapi 0 baris valid. Kolom terpakai: "
+                                f"source='{col_src}', target='{col_tgt}'. Header: {fieldnames}")
         return count
 
     def __len__(self) -> int: return len(self._entries)
@@ -177,7 +216,9 @@ class CustomDictionary:
         for src_lower, (src_orig, tgt) in sorted_entries:
             pattern = re.compile(r'(?<![A-Za-z0-9])' + re.escape(src_lower) + r'(?![A-Za-z0-9])', re.IGNORECASE)
             if pattern.search(result):
-                token = f'@@TK_{uuid.uuid4().hex[:8].upper()}@@'
+                # FIX: token berbentuk URL palsu, bukan "@@TK_..@@" (lihat catatan
+                # _DICT_TOKEN_BASE) supaya selamat melewati Google Translate.
+                token = f'{_DICT_TOKEN_BASE}{uuid.uuid4().hex[:10]}'
                 token_map[token] = tgt
                 result = pattern.sub(token, result)
         return result, token_map
@@ -201,6 +242,7 @@ class ItalicDictionary:
 
     def __init__(self):
         self._entries: dict[str, str] = {}
+        self.last_error: str | None = None
 
     def add_term(self, term: str) -> None:
         t = term.strip()
@@ -213,8 +255,12 @@ class ItalicDictionary:
     def load_defaults(self) -> int:
         try:
             return self.load_from_google_sheet(ITALIC_SPREADSHEET_URL)
-        except Exception:
+        except Exception as e:
+            self.last_error = str(e)
             return 0
+
+    def get_last_error(self) -> str | None:
+        return self.last_error
 
     def load_from_csv(self, filepath: str, term_col: str = 'term', 
                       delimiter: str = ',', encoding: str = 'utf-8-sig') -> int:
@@ -250,11 +296,10 @@ class ItalicDictionary:
         try: import pandas as pd
         except ImportError: raise ImportError("Jalankan: pip install pandas openpyxl")
         df = pd.read_excel(filepath, sheet_name=sheet_name, dtype=str).fillna('')
-        col_term = None
-        for col_name in [term_col, 'term', 'kata', 'italic', 'word', 'text']:
-            if col_name in df.columns:
-                col_term = col_name; break
-        if col_term is None: col_term = df.columns[0]
+        cols = df.columns.tolist()
+        col_term = _find_col(cols, [term_col, 'term', 'kata', 'italic', 'word', 'text',
+                                     'istilah', 'istilah asing', 'kata asing', 'asing'])
+        if col_term is None: col_term = _pick_fallback_col(cols, [])
         count = 0
         skip_vals = {'nan', '', 'term', 'kata', 'italic'}
         for _, row in df.iterrows():
@@ -265,6 +310,7 @@ class ItalicDictionary:
 
     def load_from_google_sheet(self, url: str, term_col: str = 'term', 
                                timeout: int = 15) -> int:
+        self.last_error = None
         try: import urllib.request, io
         except ImportError: raise ImportError("urllib tidak tersedia.")
         csv_url = _google_sheet_to_csv_url(url)
@@ -272,21 +318,26 @@ class ItalicDictionary:
             req = urllib.request.Request(csv_url, headers={'User-Agent': 'Mozilla/5.0'})
             with urllib.request.urlopen(req, timeout=timeout) as resp: 
                 raw = resp.read().decode('utf-8-sig')
-        except Exception as e: raise ConnectionError(f"Gagal mengambil data dari Spreadsheet Italic: {e}")
+        except Exception as e:
+            self.last_error = f"Gagal mengambil data dari Spreadsheet Istilah Asing: {e}"
+            raise ConnectionError(self.last_error)
         f = io.StringIO(raw); reader = csv.DictReader(f); fieldnames = reader.fieldnames or []
-        col_term = None
-        for col_name in [term_col, 'term', 'kata', 'italic', 'word', 'text']:
-            if col_name in fieldnames:
-                col_term = col_name; break
-        if col_term is None and len(fieldnames) >= 1:
-            col_term = fieldnames[0]
-        if col_term is None: raise ValueError(f"Tidak ada kolom. Header: {fieldnames}")
+        # FIX: case-insensitive + sinonim header Indonesia, fallback hindari kolom nomor urut.
+        col_term = _find_col(fieldnames, [term_col, 'term', 'kata', 'italic', 'word', 'text',
+                                           'istilah', 'istilah asing', 'kata asing', 'asing'])
+        if col_term is None: col_term = _pick_fallback_col(fieldnames, [])
+        if col_term is None:
+            self.last_error = f"Tidak ada kolom yang cocok. Header sheet: {fieldnames}"
+            raise ValueError(self.last_error)
         count = 0
         skip_vals = {'nan', '', 'term', 'kata', 'italic', 'word', 'text'}
         for row in reader:
-            term = str(row.get(col_term, '')).strip()
+            term = str(row.get(col_term, '') or '').strip()
             if term and term.lower() not in skip_vals:
                 self._entries[term.lower()] = term; count += 1
+        if count == 0:
+            self.last_error = (f"Sheet terbaca tapi 0 istilah valid. Kolom terpakai: "
+                                f"'{col_term}'. Header: {fieldnames}")
         return count
 
     def __len__(self) -> int: return len(self._entries)
@@ -302,7 +353,9 @@ class ItalicDictionary:
         for term_lower, term_orig in sorted_entries:
             pattern = re.compile(r'(?<![A-Za-z0-9])' + re.escape(term_lower) + r'(?![A-Za-z0-9])', re.IGNORECASE)
             if pattern.search(result):
-                token = f'@@IT_{uuid.uuid4().hex[:8].upper()}@@'
+                # FIX: token berbentuk URL palsu (lihat _ITALIC_TOKEN_BASE) supaya
+                # tidak dirusak Google Translate seperti token "@@IT_..@@" sebelumnya.
+                token = f'{_ITALIC_TOKEN_BASE}{uuid.uuid4().hex[:10]}'
                 token_map[token] = term_orig
                 result = pattern.sub(token, result)
         return result, token_map
@@ -322,9 +375,39 @@ class ItalicDictionary:
 # SHARED HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
 
+_COL_SKIP_TOKENS = {'no', 'no.', 'nomor', '#', 'number', 'id'}
+
 def _find_col(columns: list, candidates: list) -> str | None:
-    for c in candidates:
-        if c in columns: return c
+    """
+    Cari nama kolom yang cocok, TANPA peduli huruf besar/kecil maupun spasi
+    di awal/akhir header. FIX: sebelumnya perbandingan case-sensitive persis
+    ('Source' != 'source'), sehingga header sheet buatan pengguna (mis. "Istilah
+    Asing", "Bahasa Indonesia", "Source ") nyaris tidak pernah cocok dan kolom
+    salah/kolom pertama dipakai secara asal (bisa jadi kolom nomor urut),
+    membuat seluruh isi kamus gagal terbaca dengan benar.
+    """
+    norm_map = {str(c).strip().lower(): c for c in columns}
+    for cand in candidates:
+        key = cand.strip().lower()
+        if key in norm_map:
+            return norm_map[key]
+    # fallback: cocokkan sebagian (mis. header "Istilah Asing (Inggris)")
+    for cand in candidates:
+        key = cand.strip().lower()
+        for norm_key, orig in norm_map.items():
+            if key and key in norm_key:
+                return orig
+    return None
+
+def _is_index_like_col(colname: str) -> bool:
+    return colname.strip().lower() in _COL_SKIP_TOKENS
+
+def _pick_fallback_col(columns: list, exclude: list) -> str | None:
+    """Ambil kolom pertama yang BUKAN kolom nomor urut/id dan belum terpakai."""
+    for c in columns:
+        if c in exclude: continue
+        if _is_index_like_col(c): continue
+        return c
     return None
 
 def _google_sheet_to_csv_url(url: str) -> str:
