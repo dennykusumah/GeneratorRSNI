@@ -53,19 +53,20 @@ def _run(text: str, bold=False, italic=False, size_pt=11, color=None) -> str:
     return f'<w:r>{_rpr(bold, italic, size_pt, color)}<w:t xml:space="preserve">{_esc(text)}</w:t></w:r>'
 
 
-def _para(runs_xml: str, align='both', space_after=0, indent_left=0) -> str:
+def _para(runs_xml: str, align='both', space_after=0, indent_left=0, pstyle: str | None = None) -> str:
+    ps  = f'<w:pStyle w:val="{pstyle}"/>' if pstyle else ''
     jc  = f'<w:jc w:val="{align}"/>'
     sa  = f'<w:spacing w:before="0" w:after="{space_after}"/>'
     ind = f'<w:ind w:left="{indent_left}"/>' if indent_left else ''
     return (
-        f'<w:p><w:pPr>{sa}{jc}{ind}'
+        f'<w:p><w:pPr>{ps}{sa}{jc}{ind}'
         f'<w:rPr><w:rFonts w:ascii="Arial" w:eastAsia="Arial" w:hAnsi="Arial" w:cs="Arial"/><w:noproof/></w:rPr>'
         f'</w:pPr>{runs_xml}</w:p>'
     )
 
 
-def _empty(align='both') -> str:
-    return _para('', align=align)
+def _empty(align='both', pstyle: str | None = None) -> str:
+    return _para('', align=align, pstyle=pstyle)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -209,13 +210,15 @@ def _patch_numbering(numbering_bytes: bytes | None) -> tuple[bytes, int]:
     )
 
 
-def _bullet_para(runs_xml: str, num_id: int) -> str:
+def _bullet_para(runs_xml: str, num_id: int, pstyle: str | None = None) -> str:
     """
     Paragraf bullet resmi Word dengan simbol em-dash.
     """
+    ps = f'<w:pStyle w:val="{pstyle}"/>' if pstyle else ''
     return (
         f'<w:p>'
         f'<w:pPr>'
+        f'{ps}'
         f'<w:spacing w:before="0" w:after="0"/>'
         f'<w:jc w:val="both"/>'
         f'<w:numPr>'
@@ -233,9 +236,10 @@ def _bullet_para(runs_xml: str, num_id: int) -> str:
     )
 
 
-def _page_break_para() -> str:
+def _page_break_para(pstyle: str | None = None) -> str:
+    ps = f'<w:pStyle w:val="{pstyle}"/>' if pstyle else ''
     return (
-        '<w:p><w:pPr>'
+        f'<w:p><w:pPr>{ps}'
         '<w:spacing w:before="0" w:after="0"/>'
         '<w:rPr><w:rFonts w:ascii="Arial" w:hAnsi="Arial" w:cs="Arial"/><w:noproof/></w:rPr>'
         '</w:pPr>'
@@ -248,13 +252,23 @@ def _page_break_para() -> str:
 # CONTENT BUILDERS
 # ─────────────────────────────────────────────────────────────────────────────
 
+# Marker pStyle: menandai paragraf hasil generate engine ini (Prakata & Pendahuluan)
+# sebagai konten FINAL berbahasa Indonesia yang TIDAK BOLEH ikut diterjemahkan
+# ulang oleh engine9 (DocxFinalTranslatorEngine). Style ini sengaja tidak perlu
+# terdaftar di styles.xml — python-docx & Word tetap aman membacanya (fallback
+# ke style Normal untuk tampilan), sementara engine9 mendeteksinya lewat ID
+# mentah pada atribut w:pStyle.
+_NO_TRANSLATE_STYLE = 'BSNNoTranslate'
+
+
 def _build_prakata(sni_number, title_id, title_en, ref_standard, bsn_year, num_id: int = 1):
+    NT = _NO_TRANSLATE_STYLE
     xmls = []
-    xmls.append(_page_break_para())
-    xmls.append(_para(_run('Prakata', bold=True, size_pt=12), align='center'))
-    xmls.append(_empty(align='center'))
-    xmls.append(_empty(align='center'))
-    xmls.append(_empty())
+    xmls.append(_page_break_para(pstyle=NT))
+    xmls.append(_para(_run('Prakata', bold=True, size_pt=12), align='center', pstyle=NT))
+    xmls.append(_empty(align='center', pstyle=NT))
+    xmls.append(_empty(align='center', pstyle=NT))
+    xmls.append(_empty(pstyle=NT))
 
     p1_runs = (
         _run(f'{sni_number}, ')
@@ -265,33 +279,33 @@ def _build_prakata(sni_number, title_id, title_en, ref_standard, bsn_year, num_i
         + _run(title_en, italic=True)
         + _run(f', dengan metode adopsi terjemahan dua bahasa dan ditetapkan oleh BSN Tahun {bsn_year}.')
     )
-    xmls.append(_para(p1_runs, align='both'))
-    xmls.append(_empty())
+    xmls.append(_para(p1_runs, align='both', pstyle=NT))
+    xmls.append(_empty(pstyle=NT))
 
     p2 = (
         f'Dalam Standar ini istilah \u201cthis International Standard\u201d pada standar '
         f'{ref_standard} yang diadopsi diganti dengan \u201cthis Standard\u201d dan '
         f'diterjemahkan menjadi \u201cStandar ini\u201d.'
     )
-    xmls.append(_para(_run(p2), align='both'))
-    xmls.append(_empty())
+    xmls.append(_para(_run(p2), align='both', pstyle=NT))
+    xmls.append(_empty(pstyle=NT))
 
     xmls.append(_para(_run(
         'Terdapat standar yang dijadikan sebagai acuan normatif dalam Standar ini '
         'telah diadopsi menjadi SNI, yaitu:'
-    ), align='both'))
-    xmls.append(_empty())
+    ), align='both', pstyle=NT))
+    xmls.append(_empty(pstyle=NT))
     for li in [
         'ISO/IEC XXXX-X:YYYY, ZZZZ, telah diadopsi dengan tingkat keselarasan identik menjadi SNI ISO/IEC XXXX-X:YYYY, ZZZZ'
     ]:
-        xmls.append(_bullet_para(_run(li), num_id))
-    xmls.append(_empty())
+        xmls.append(_bullet_para(_run(li), num_id, pstyle=NT))
+    xmls.append(_empty(pstyle=NT))
 
     for li in [
         'ISO/IEC XXXX-X:YYYY, ZZZZ, telah diadopsi dengan tingkat keselarasan identik menjadi SNI ISO/IEC XXXX-X:YYYY, ZZZZ'
     ]:
-        xmls.append(_bullet_para(_run(li), num_id))
-    xmls.append(_empty())
+        xmls.append(_bullet_para(_run(li), num_id, pstyle=NT))
+    xmls.append(_empty(pstyle=NT))
 
     p_runs = (
         _run('Standar ini disusun oleh Komite Teknis XX-YY, ZZZZ. ')
@@ -303,21 +317,21 @@ def _build_prakata(sni_number, title_id, title_en, ref_standard, bsn_year, num_i
         + _run('dengan hasil akhir disetujui menjadi SNI.')
         )
 
-    xmls.append(_para(p_runs, align='both'))
+    xmls.append(_para(p_runs, align='both', pstyle=NT))
 
     xmls.append(_para(_run(
         'Untuk menghindari kesalahan dalam penggunaan Standar ini, disarankan bagi pengguna '
         'standar menggunakan dokumen SNI yang dicetak dengan tinta berwarna (dapat mencantumkan '
         'kode tingkat warna Red Green Blue (RGB) jika diperlukan untuk cetak gambar dengan '
         'warna yang lebih akurat).'
-    ), align='both'))
-    xmls.append(_empty())
+    ), align='both', pstyle=NT))
+    xmls.append(_empty(pstyle=NT))
 
     xmls.append(_para(_run(
         f'Apabila pengguna menemukan keraguan dalam Standar ini, maka disarankan untuk melihat '
         f'standar aslinya, yaitu {ref_standard}, dan/atau dokumen terkait lain yang menyertainya.'
-    ), align='both'))
-    xmls.append(_empty())
+    ), align='both', pstyle=NT))
+    xmls.append(_empty(pstyle=NT))
 
     xmls.append(_para(_run(
         'Perlu diperhatikan bahwa kemungkinan beberapa unsur dari Standar ini dapat berupa '
@@ -327,21 +341,22 @@ def _build_prakata(sni_number, title_id, title_en, ref_standard, bsn_year, num_i
         'intelektual, Badan Standardisasi Nasional tidak bertanggung jawab mengenai bukti, validitas, '
         'dan ruang lingkup dari kekayaan intelektual tersebut. Badan Standardisasi Nasional tidak '
         'bertanggung jawab mengenai bukti, validitas, dan ruang lingkup dari kekayaan intelektual tersebut.'
-    ), align='both'))
+    ), align='both', pstyle=NT))
 
     for _ in range(6):
-        xmls.append(_empty(align='center'))
+        xmls.append(_empty(align='center', pstyle=NT))
 
     return xmls
 
 
 def _build_pendahuluan():
+    NT = _NO_TRANSLATE_STYLE
     xmls = []
-    xmls.append(_page_break_para())
-    xmls.append(_para(_run('Pendahuluan', bold=True, size_pt=12), align='center'))
-    xmls.append(_empty(align='center'))
-    xmls.append(_empty(align='center'))
-    xmls.append(_empty(align='center'))
+    xmls.append(_page_break_para(pstyle=NT))
+    xmls.append(_para(_run('Pendahuluan', bold=True, size_pt=12), align='center', pstyle=NT))
+    xmls.append(_empty(align='center', pstyle=NT))
+    xmls.append(_empty(align='center', pstyle=NT))
+    xmls.append(_empty(align='center', pstyle=NT))
 
     lorem = (
         'Lorem ipsum dolor sit amet, consectetur adipiscing elit. '
@@ -351,8 +366,8 @@ def _build_pendahuluan():
         'esse cillum dolore eu fugiat nulla pariatur. Excepteur sint occaecat cupidatat non '
         'proident, sunt in culpa qui officia deserunt mollit anim id est laborum.'
     )
-    xmls.append(_para(_run(lorem, bold=False, size_pt=11, color='FF0000'), align='both'))
-    xmls.append(_empty(align='both'))
+    xmls.append(_para(_run(lorem, bold=False, size_pt=11, color='FF0000'), align='both', pstyle=NT))
+    xmls.append(_empty(align='both', pstyle=NT))
     lorem = (
         'Lorem ipsum dolor sit amet, consectetur adipiscing elit. '
         'Sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. '
@@ -361,7 +376,7 @@ def _build_pendahuluan():
         'esse cillum dolore eu fugiat nulla pariatur. Excepteur sint occaecat cupidatat non '
         'proident, sunt in culpa qui officia deserunt mollit anim id est laborum.'
     )
-    xmls.append(_para(_run(lorem, bold=False, size_pt=11, color='FF0000'), align='both'))
+    xmls.append(_para(_run(lorem, bold=False, size_pt=11, color='FF0000'), align='both', pstyle=NT))
     return xmls
 
 
