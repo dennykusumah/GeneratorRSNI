@@ -416,6 +416,66 @@ def _all_runs_italic(para) -> bool:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# PROTEKSI ISTILAH/JUDUL ASING YANG SUDAH MIRING DI SUMBER
+# ─────────────────────────────────────────────────────────────────────────────
+# Di dokumen ISO, judul dokumen acuan (mis. pada klausul "Acuan normatif")
+# dan istilah asing lain biasanya SUDAH dicetak miring di file sumber.
+# Sesuai konvensi SNI, bagian ini TIDAK diterjemahkan dan tetap dicetak
+# miring pada dokumen hasil. Sebelumnya bagian ini "hilang" karena
+# _translate_para menggabungkan semua run menjadi satu string polos
+# sebelum diterjemahkan, sehingga info format miring per-run dibuang dan
+# teksnya ikut diterjemahkan seperti teks biasa. Fungsi di bawah ini
+# mendeteksi run miring tersebut dan melindunginya dengan mekanisme
+# token yang sama seperti "Kamus Istilah Asing" (spreadsheet).
+
+def _get_para_style_italic(para) -> bool:
+    try:
+        if para.style and para.style.font and para.style.font.italic: return True
+    except Exception: pass
+    return False
+
+def _run_effective_italic(run, para_style_italic: bool) -> bool:
+    if run.font.italic is True: return True
+    if run.font.italic is False: return False
+    rPr = run._element.find(f'{_W}rPr')
+    if rPr is not None:
+        i_el = rPr.find(f'{_W}i')
+        if i_el is not None:
+            val = i_el.get(f'{_W}val', 'true')
+            return val.lower() not in ('false', '0')
+        return para_style_italic
+    return para_style_italic
+
+def _extract_source_italic_map(text_runs, para_style_italic: bool) -> tuple[str, dict]:
+    """
+    Gabungkan run menjadi satu teks (seperti semula), TAPI bagian yang
+    sudah diformat miring di sumber diganti token dulu agar tidak ikut
+    diterjemahkan. token_map: token -> teks asli (verbatim, akan
+    dikembalikan + dicetak miring setelah proses terjemahan selesai).
+    """
+    segments = []
+    for _, r in text_runs:
+        is_ital = _run_effective_italic(r, para_style_italic)
+        t = r.text or ''
+        if segments and segments[-1][1] == is_ital:
+            segments[-1] = [segments[-1][0] + t, is_ital]
+        else:
+            segments.append([t, is_ital])
+
+    token_map = {}
+    out_parts = []
+    for seg_text, is_ital in segments:
+        stripped = seg_text.strip()
+        if is_ital and len(stripped) >= 3 and not _RE_PURE_NUMBER.fullmatch(stripped):
+            token = f'@@SRC_{uuid.uuid4().hex[:8].upper()}@@'
+            token_map[token] = seg_text
+            out_parts.append(token)
+        else:
+            out_parts.append(seg_text)
+    return ''.join(out_parts), token_map
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # LINK HANDLING (FIXED - AMAN, TIDAK MERUSAK XML)
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -843,8 +903,9 @@ class _Translator:
             except Exception: result = t
         if token_map: result = self.custom_dict._apply_post(result, token_map)
         italic_terms_found = []
-        if final_italic_map and self.italic_dict:
-            result, italic_terms_found = self.italic_dict._apply_post(result, final_italic_map)
+        if final_italic_map:
+            _idict = self.italic_dict if self.italic_dict is not None else ItalicDictionary()
+            result, italic_terms_found = _idict._apply_post(result, final_italic_map)
         return result, italic_terms_found
 
 def _match_capitalization(original: str, translated: str) -> str:
@@ -879,7 +940,8 @@ def _translate_para(para, tr, past_bibliography: bool = False) -> list[str]:
             _translate_hyperlinks_in_para(para, tr)
         return []
     
-    combined = ''.join(r.text for _, r in text_runs).strip()
+    combined_raw = ''.join(r.text for _, r in text_runs)
+    combined = combined_raw.strip()
     if _skip_text(combined): 
         if has_hl:
             _translate_hyperlinks_in_para(para, tr)
@@ -893,10 +955,22 @@ def _translate_para(para, tr, past_bibliography: bool = False) -> list[str]:
             if run.font.size: font_size = run.font.size.pt if run.font.size else None
             break
     
-    # Proteksi italic
-    italic_map = {}
+    # Teks asli (SEBELUM proteksi token apa pun) — dipakai untuk mencocokkan
+    # kapitalisasi hasil terjemahan, agar token proteksi (huruf besar semua)
+    # tidak ikut dihitung dan salah membuat seluruh paragraf jadi HURUF BESAR.
+    original_for_case = combined
+
+    # Proteksi 1: istilah/judul asing yang SUDAH miring di dokumen sumber
+    # (mis. judul standar acuan pada klausul "Acuan normatif"). Bagian ini
+    # tidak diterjemahkan dan akan dicetak miring kembali di hasil.
+    para_style_italic = _get_para_style_italic(para)
+    combined_with_src_tokens, italic_map = _extract_source_italic_map(text_runs, para_style_italic)
+    combined = combined_with_src_tokens.strip()
+
+    # Proteksi 2: kamus istilah asing dari spreadsheet ("Kamus Istilah Asing")
     if tr.italic_dict and len(tr.italic_dict) > 0:
-        combined, italic_map = tr.italic_dict._apply_pre(combined)
+        combined, dict_italic_map = tr.italic_dict._apply_pre(combined)
+        italic_map.update(dict_italic_map)
     
     # Terjemahkan
     translated, italic_terms_found = tr.translate_one(combined, italic_map)
@@ -905,7 +979,7 @@ def _translate_para(para, tr, past_bibliography: bool = False) -> list[str]:
         if has_hl:
             _translate_hyperlinks_in_para(para, tr)
         return []
-    translated = _match_capitalization(combined, translated)
+    translated = _match_capitalization(original_for_case, translated)
     
     # Apply formatting ke teks normal
     if italic_terms_found:
