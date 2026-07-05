@@ -318,7 +318,8 @@ def _build_prakata(sni_number, title_id, title_en, ref_standard, bsn_year, num_i
         )
 
     xmls.append(_para(p_runs, align='both', pstyle=NT))
-
+    xmls.append(_empty(pstyle=NT))
+    
     xmls.append(_para(_run(
         'Untuk menghindari kesalahan dalam penggunaan Standar ini, disarankan bagi pengguna '
         'standar menggunakan dokumen SNI yang dicetak dengan tinta berwarna (dapat mencantumkan '
