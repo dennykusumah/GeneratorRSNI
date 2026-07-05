@@ -963,7 +963,7 @@ if st.session_state.get('_run_process') and st.session_state.get('_target_file')
         update_ui(10, "[6/6] Menginisialisasi mesin terjemahan...")
         tr_out = f"ID_{os.path.basename(final_opt_file)}"
 
-        _engine9 = DocxFinalTranslatorEngine(source_lang=src_lang_val, target_lang='id', custom_dict=st.session_state.get('custom_dict'))
+        _engine9 = DocxFinalTranslatorEngine(source_lang=src_lang_val, target_lang='id', custom_dict=st.session_state.get('custom_dict'), italic_dict=st.session_state.get('italic_dict'))
 
         # ── Callback: parse format baru engine9, throttle ≤1x/detik ─────────
         # Format pesan dari engine9:
