@@ -37,11 +37,6 @@ _R    = f'{{{_NS_R}}}'
 
 _RE_PURE_NUMBER = re.compile(r'^[\d\s\.\,\:\;\-\(\)\[\]\/\\\+\=\*\%\&\^\$\#\@\!\"\'`~<>{}|_]+$')
 _RE_COPYRIGHT = re.compile(r'©|BSN\s*\d{4}', re.IGNORECASE)
-# Teks hyperlink yang berupa URL mentah (contoh: "ISO Online browsing platform:
-# available at https://www.iso.org/obp") TIDAK BOLEH dikirim ke Google Translate.
-# Google Translate kadang mengubah/menambah spasi pada string URL sehingga link
-# tampilan menjadi rusak/tidak sesuai alamat aslinya.
-_RE_URL_LIKE = re.compile(r'^(?:https?://|www\.)\S+$', re.IGNORECASE)
 
 _SKIP_STYLES = {
     'caption', 'header', 'footer',
@@ -54,6 +49,9 @@ _BIBLIO_KEYWORDS_EXACT = {
     'daftar acuan', 'daftar pustaka', 'daftar referensi',
 }
 _ANNEX_STYLE_IDS = {'ANNEX', 'Annex', 'annex'}
+# Paragraf yang ditandai engine6 (Prakata/Pendahuluan) — sudah final berbahasa
+# Indonesia, JANGAN diterjemahkan ulang di sini.
+_NO_TRANSLATE_STYLE_IDS = {'BSNNoTranslate'}
 _HEADING_STYLES_WITH_NUM = {
     'Heading1', 'Heading2', 'Heading3',
     'ANNEX', 'a2', 'a3',
@@ -69,52 +67,6 @@ def _get_next_link_placeholder() -> str:
     global _LINK_COUNTER
     _LINK_COUNTER += 1
     return f"{_LINK_PLACEHOLDER_BASE}link-{_LINK_COUNTER}"
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# TOKEN PLACEHOLDER YANG AMAN UNTUK GOOGLE TRANSLATE
-# ─────────────────────────────────────────────────────────────────────────────
-# FIX KRITIS: token lama berbentuk "@@TK_ABC12345@@" / "@@IT_ABC12345@@" (mengandung
-# simbol "@" dan "_" serta ANGKA). Google Translate cukup sering:
-#   - membuang / merapikan simbol "@@" dan "_"
-#   - mengeja ulang digit angka ke dalam bahasa target
-#   - menyisipkan spasi di tengah token
-# Akibatnya token tidak ditemukan lagi saat proses "_apply_post", sehingga
-# substitusi kamus (SNI maupun Istilah Asing) GAGAL SENYAP dan token mentah bisa
-# ikut muncul di dokumen hasil.
-#
-# SOLUSI: token dibuat HANYA dari huruf (tanpa simbol/angka) sehingga jauh lebih
-# kecil kemungkinan diubah oleh mesin terjemahan, ditambah sebuah fallback regex
-# "longgar" (mengizinkan spasi sisipan di antara setiap huruf token) saat
-# pencocokan persis gagal.
-
-_TOKEN_HEXMAP = {
-    '0': 'q', '1': 'x', '2': 'z', '3': 'v', '4': 'k', '5': 'j', '6': 'w', '7': 'y',
-    '8': 'h', '9': 'b', 'a': 'g', 'b': 'f', 'c': 'p', 'd': 'd', 'e': 'c', 'f': 't',
-}
-
-def _make_safe_token(prefix: str) -> str:
-    """Buat token placeholder unik yang HANYA berisi huruf (tanpa simbol/angka)."""
-    raw_hex = uuid.uuid4().hex[:12]
-    body = ''.join(_TOKEN_HEXMAP[c] for c in raw_hex)
-    # Prefix di awal & akhir (huruf besar) sebagai penanda batas token
-    return f"{prefix}{body.capitalize()}{prefix}"
-
-def _substitute_token(text: str, token: str, replacement: str) -> tuple[str, bool]:
-    """
-    Ganti `token` di dalam `text` dengan `replacement`.
-    1) Coba pencocokan persis (case-insensitive).
-    2) Jika gagal, coba pencocokan LONGGAR: mengizinkan spasi/line-break yang
-       tersisip di antara tiap huruf token (akibat proses terjemahan).
-    Mengembalikan (text_baru, ditemukan_atau_tidak).
-    """
-    exact_pattern = re.compile(re.escape(token), re.IGNORECASE)
-    if exact_pattern.search(text):
-        return exact_pattern.sub(replacement, text), True
-    loose_pattern = re.compile(r'\s*'.join(re.escape(c) for c in token), re.IGNORECASE)
-    if loose_pattern.search(text):
-        return loose_pattern.sub(replacement, text), True
-    return text, False
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -228,15 +180,15 @@ class CustomDictionary:
         for src_lower, (src_orig, tgt) in sorted_entries:
             pattern = re.compile(r'(?<![A-Za-z0-9])' + re.escape(src_lower) + r'(?![A-Za-z0-9])', re.IGNORECASE)
             if pattern.search(result):
-                token = _make_safe_token('Kms')
+                token = f'@@TK_{uuid.uuid4().hex[:8].upper()}@@'
                 token_map[token] = tgt
                 result = pattern.sub(token, result)
         return result, token_map
 
     def _apply_post(self, translated: str, token_map: dict) -> str:
         result = translated
-        for token, tgt in token_map.items():
-            result, _found = _substitute_token(result, token, tgt)
+        for token, tgt in token_map.items(): 
+            result = re.sub(re.escape(token), tgt, result, flags=re.IGNORECASE)
         return result
 
 
@@ -353,7 +305,7 @@ class ItalicDictionary:
         for term_lower, term_orig in sorted_entries:
             pattern = re.compile(r'(?<![A-Za-z0-9])' + re.escape(term_lower) + r'(?![A-Za-z0-9])', re.IGNORECASE)
             if pattern.search(result):
-                token = _make_safe_token('Itl')
+                token = f'@@IT_{uuid.uuid4().hex[:8].upper()}@@'
                 token_map[token] = term_orig
                 result = pattern.sub(token, result)
         return result, token_map
@@ -362,9 +314,10 @@ class ItalicDictionary:
         result = translated
         italic_terms_found = []
         for token, original in italic_map.items():
-            result, found = _substitute_token(result, token, original)
-            if found and original not in italic_terms_found:
-                italic_terms_found.append(original)
+            if re.search(re.escape(token), result, re.IGNORECASE):
+                result = re.sub(re.escape(token), original, result, flags=re.IGNORECASE)
+                if original not in italic_terms_found:
+                    italic_terms_found.append(original)
         return result, italic_terms_found
 
 
@@ -403,6 +356,7 @@ def _skip_text(text: str) -> bool:
 def _skip_paragraph(para, past_bibliography: bool = False) -> bool:
     if past_bibliography: return True
     if not para.text.strip(): return True
+    if _get_para_style_id(para) in _NO_TRANSLATE_STYLE_IDS: return True
     for tag in [f'{_W}drawing', f'{_W}pict']:
         if para._element.find('.//' + tag) is not None: return True
     style_name = (para.style.name or '').lower()
@@ -490,22 +444,16 @@ def _translate_hyperlinks_in_para(para, tr) -> None:
             continue
         
         # 2. Terjemahkan teks (dengan perlindungan italic)
-        #    FIX: jika teks tampilan hyperlink adalah URL mentah (mis. "https://www.iso.org/obp"),
-        #    JANGAN diterjemahkan — biarkan apa adanya. Mengirim URL ke Google Translate
-        #    berisiko merusak alamatnya (spasi/karakter tersisip), menyebabkan link tampak salah.
-        if _RE_URL_LIKE.match(hl_text):
-            translated = hl_text
-        else:
-            text_to_translate = hl_text
-            italic_map = {}
-
-            if tr.italic_dict and len(tr.italic_dict) > 0:
-                text_to_translate, italic_map = tr.italic_dict._apply_pre(text_to_translate)
-
-            translated, _ = tr.translate_one(text_to_translate, italic_map)
-
-            if italic_map and tr.italic_dict:
-                translated, _ = tr.italic_dict._apply_post(translated, italic_map)
+        text_to_translate = hl_text
+        italic_map = {}
+        
+        if tr.italic_dict and len(tr.italic_dict) > 0:
+            text_to_translate, italic_map = tr.italic_dict._apply_pre(text_to_translate)
+        
+        translated, _ = tr.translate_one(text_to_translate, italic_map)
+        
+        if italic_map and tr.italic_dict:
+            translated, _ = tr.italic_dict._apply_post(translated, italic_map)
         
         # 3. Ganti teks di dalam hyperlink (AMAN: hanya mengubah .text)
         if t_els:
@@ -931,17 +879,11 @@ def _translate_para(para, tr, past_bibliography: bool = False) -> list[str]:
             _translate_hyperlinks_in_para(para, tr)
         return []
     
-    raw_combined = ''.join(r.text for _, r in text_runs)
-    combined = raw_combined.strip()
+    combined = ''.join(r.text for _, r in text_runs).strip()
     if _skip_text(combined): 
         if has_hl:
             _translate_hyperlinks_in_para(para, tr)
         return []
-    # FIX: jika ada hyperlink SETELAH teks normal ini (mis. "...available at " + link),
-    # dan teks normal aslinya diakhiri spasi, pastikan spasi itu tetap ada setelah
-    # diterjemahkan — kalau tidak, teks akan menempel langsung ke URL
-    # (contoh bug: "available athttps://www.iso.org/obp").
-    needs_trailing_space = has_hl and raw_combined != combined and raw_combined.endswith((' ', '\u00a0', '\t'))
     
     # Get font
     font_name = 'Arial'; font_size = None
@@ -964,8 +906,6 @@ def _translate_para(para, tr, past_bibliography: bool = False) -> list[str]:
             _translate_hyperlinks_in_para(para, tr)
         return []
     translated = _match_capitalization(combined, translated)
-    if needs_trailing_space and not translated.endswith((' ', '\u00a0')):
-        translated += ' '
     
     # Apply formatting ke teks normal
     if italic_terms_found:
@@ -1118,24 +1058,14 @@ class DocxFinalTranslatorEngine:
             para_map = {p._element: p for p in doc.paragraphs}
             tbl_map = {t._element: t for t in doc.tables}
 
-            # ── Deteksi section front-matter (hasil sisipan Engine 4/5/6) ──────────
-            # Section 0 = Cover (Engine 4)                       -> proteksi parsial (hanya baris italic)
-            # Section 1 = Hak Cipta (Engine 4)                   -> proteksi penuh (statis, Bahasa Indonesia)
-            # Section 2 = Daftar Isi + Prakata + Pendahuluan     -> proteksi penuh (statis, Bahasa Indonesia)
-            #             (Engine 5 & Engine 6 berbagi 1 section yang sama)
-            # Section 3+ = badan dokumen ASLI yang WAJIB diterjemahkan.
-            # FIX: sebelumnya hanya section 0 yang diproteksi (dan hanya baris italic-nya),
-            # sehingga label "Prakata"/"Pendahuluan" dan seluruh isi Daftar Isi ikut
-            # dikirim ke Google Translate dan berisiko rusak/salah terjemah.
-            _FRONTMATTER_FULL_SKIP_SECTIONS = {1, 2}
-            items = []; sec_brks = 0
+            items = []; sec_brks = 0; COVER_END = 1
             for child in body:
                 if child in para_map:
-                    cur_sec = sec_brks
-                    items.append(('para', para_map[child], cur_sec))
+                    in_cover = (sec_brks < COVER_END)
+                    items.append(('para', para_map[child], in_cover))
                     if _has_inline_sectpr(para_map[child]): sec_brks += 1
                 elif child in tbl_map:
-                    items.append(('table', tbl_map[child], sec_brks))
+                    items.append(('table', tbl_map[child], sec_brks < COVER_END))
 
             total = len(items); done = 0; past_bibliography = False
             annex_counter = 0; italic_count = 0; link_count = 0
@@ -1143,7 +1073,7 @@ class DocxFinalTranslatorEngine:
             _stat_trans = 0; _stat_skip = 0; _stat_tbl = 0
             _stat_cover = 0; _stat_annex = 0
 
-            for kind, obj, sec_idx in items:
+            for kind, obj, in_cover in items:
                 done += 1; pct = 5 + int(done / max(total, 1) * 60)
                 if kind == 'para':
                     para = obj; is_bib = _is_biblio_title_para(para)
@@ -1152,17 +1082,10 @@ class DocxFinalTranslatorEngine:
                     para_text = para.text.strip()
                     preview = (para_text[:55] + "…") if len(para_text) > 55 else para_text
 
-                    if sec_idx == 0 and _all_runs_italic(para):
+                    if in_cover and _all_runs_italic(para):
                         _stat_cover += 1
                         _notify(progress_callback, pct,
                             f"[cover-italic] skip\t{done}/{total}\t{_stat_trans}\t{_stat_skip}\t{_stat_tbl}\t{preview}")
-                    elif sec_idx in _FRONTMATTER_FULL_SKIP_SECTIONS:
-                        # Hak Cipta / Daftar Isi / Prakata / Pendahuluan: konten statis
-                        # hasil generate pipeline sendiri (sudah Bahasa Indonesia) —
-                        # JANGAN dikirim ke Google Translate sama sekali.
-                        _stat_skip += 1
-                        _notify(progress_callback, pct,
-                            f"[frontmatter] skip\t{done}/{total}\t{_stat_trans}\t{_stat_skip}\t{_stat_tbl}\t{preview}")
                     elif is_bib:
                         italic_count += len(_translate_para(para, tr))
                         past_bibliography = True
@@ -1197,11 +1120,7 @@ class DocxFinalTranslatorEngine:
                         _notify(progress_callback, pct,
                             f"[translate{italic_tag}{link_tag}] done\t{done}/{total}\t{_stat_trans}\t{_stat_skip}\t{_stat_tbl}\t{preview}")
                 elif kind == 'table':
-                    if sec_idx in _FRONTMATTER_FULL_SKIP_SECTIONS:
-                        _stat_skip += 1
-                        _notify(progress_callback, pct,
-                            f"[frontmatter] skip\t{done}/{total}\t{_stat_trans}\t{_stat_skip}\t{_stat_tbl}\t-")
-                    elif not past_bibliography:
+                    if not past_bibliography:
                         _translate_table(obj, tr)
                         _stat_tbl += 1
                         _notify(progress_callback, pct,
