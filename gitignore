@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+temp_main_*
+opt_*
+cover_*
+di_*
+pp_*
+ip_*
+ID_*
+.venv/
+venv/
