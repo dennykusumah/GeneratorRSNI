@@ -16,6 +16,6 @@ jobs:
     steps:
       - name: Ping app URL
         run: |
-          curl -sS -o /dev/null -w "HTTP status: %{http_code}\n" \
+          curl -sS -L -o /dev/null -w "HTTP status: %{http_code}\n" \
             --retry 3 --retry-delay 10 \
             "${{ secrets.STREAMLIT_APP_URL }}"
