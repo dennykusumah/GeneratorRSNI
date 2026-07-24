@@ -6,6 +6,7 @@ import time
 import glob
 import atexit
 import threading
+import uuid
 from io import BytesIO
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -790,7 +791,11 @@ btn_process = st.button("🚀 Proses", key="btn_main", use_container_width=True)
 
 if btn_process:
     if uploaded_file:
-        target_file = f"temp_main_{uploaded_file.name}"
+        # ID unik per sesi browser — mencegah tabrakan nama file saat beberapa
+        # pengguna mengakses aplikasi secara bersamaan (satu proses melayani
+        # banyak sesi di Streamlit Community Cloud).
+        _sid = st.session_state.setdefault('_sid', uuid.uuid4().hex[:8])
+        target_file = f"temp_main_{_sid}_{uploaded_file.name}"
         with open(target_file, "wb") as f:
             f.write(uploaded_file.getbuffer())
         
