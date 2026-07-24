@@ -17,5 +17,7 @@ jobs:
       - name: Ping app URL
         run: |
           curl -sS -L -o /dev/null -w "HTTP status: %{http_code}\n" \
+            --cookie-jar /tmp/cookies.txt --cookie /tmp/cookies.txt \
+            --max-redirs 10 \
             --retry 3 --retry-delay 10 \
             "${{ secrets.STREAMLIT_APP_URL }}"
