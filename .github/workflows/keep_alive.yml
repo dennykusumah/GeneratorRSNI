@@ -1,4 +1,3 @@
-#
 name: Keep Streamlit Awake
 
 on:
@@ -7,7 +6,7 @@ on:
   workflow_dispatch:
 
 jobs:
-  keep-awake:
+  wake:
     runs-on: ubuntu-latest
 
     steps:
@@ -21,11 +20,11 @@ jobs:
         run: |
           npm init -y
           npm install playwright
-          npx playwright install chromium
+          npx playwright install --with-deps chromium
 
-      - name: Create script
+      - name: Create Playwright script
         run: |
-          cat <<'EOF' > wake.js
+          cat > wake.js <<'EOF'
           const { chromium } = require('playwright');
 
           (async () => {
@@ -33,32 +32,86 @@ jobs:
               headless: true
             });
 
-            const page = await browser.newPage();
-
-            console.log("Opening app...");
-
-            await page.goto("https://generator-rsni.streamlit.app", {
-              waitUntil: "networkidle",
-              timeout: 120000
+            const page = await browser.newPage({
+              viewport: {
+                width: 1400,
+                height: 900
+              }
             });
 
-            // Tunggu sebentar
-            await page.waitForTimeout(5000);
+            page.setDefaultTimeout(120000);
 
-            // Cari tombol wake up
-            const button = page.getByText("Yes, get this app back up!");
+            console.log("Opening Streamlit...");
 
-            if (await button.count() > 0) {
-              console.log("App sleeping. Clicking wake up...");
-              await button.click();
-              await page.waitForTimeout(30000);
-            } else {
-              console.log("App already awake.");
+            try {
+
+              await page.goto(
+                "https://generator-rsni.streamlit.app",
+                {
+                  waitUntil: "domcontentloaded",
+                  timeout: 120000
+                }
+              );
+
+              await page.waitForTimeout(5000);
+
+              const wakeButton = page.locator(
+                'button:has-text("Yes, get this app back up!")'
+              );
+
+              if (await wakeButton.count() > 0) {
+
+                console.log("App sleeping.");
+
+                await wakeButton.first().click();
+
+                console.log("Waiting for app to start...");
+
+                await page.waitForLoadState("networkidle");
+
+                await page.waitForTimeout(60000);
+
+              } else {
+
+                console.log("App already awake.");
+
+              }
+
+              await page.screenshot({
+                path: "success.png",
+                fullPage: true
+              });
+
+              console.log("Finished.");
+
+            } catch (err) {
+
+              console.log(err);
+
+              await page.screenshot({
+                path: "error.png",
+                fullPage: true
+              });
+
+              throw err;
+
+            } finally {
+
+              await browser.close();
+
             }
 
-            await browser.close();
           })();
           EOF
 
-      - name: Run Playwright
+      - name: Run script
         run: node wake.js
+
+      - name: Upload screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: screenshots
+          path: |
+            success.png
+            error.png
