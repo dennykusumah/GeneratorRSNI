@@ -1,23 +1,64 @@
-name: Keep Streamlit App Awake
-
-# Streamlit Community Cloud membuat aplikasi "tidur" jika tidak ada
-# traffic selama 12 jam. Workflow ini mengunjungi URL aplikasi setiap
-# 6 jam supaya jam tidak pernah mencapai 12 jam, sehingga aplikasi
-# tetap terjaga tanpa perlu diklik "wake up" secara manual.
+#
+name: Keep Streamlit Awake
 
 on:
   schedule:
-    - cron: "0 */6 * * *"   # setiap 6 jam
-  workflow_dispatch: {}       # bisa dijalankan manual dari tab Actions
+    - cron: "0 */6 * * *"
+  workflow_dispatch:
 
 jobs:
-  ping:
+  keep-awake:
     runs-on: ubuntu-latest
+
     steps:
-      - name: Ping app URL
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install Playwright
         run: |
-          curl -sS -L -o /dev/null -w "HTTP status: %{http_code}\n" \
-            --cookie-jar /tmp/cookies.txt --cookie /tmp/cookies.txt \
-            --max-redirs 10 \
-            --retry 3 --retry-delay 10 \
-            "${{ secrets.STREAMLIT_APP_URL }}"
+          npm init -y
+          npm install playwright
+          npx playwright install chromium
+
+      - name: Create script
+        run: |
+          cat <<'EOF' > wake.js
+          const { chromium } = require('playwright');
+
+          (async () => {
+            const browser = await chromium.launch({
+              headless: true
+            });
+
+            const page = await browser.newPage();
+
+            console.log("Opening app...");
+
+            await page.goto("https://generator-rsni.streamlit.app", {
+              waitUntil: "networkidle",
+              timeout: 120000
+            });
+
+            // Tunggu sebentar
+            await page.waitForTimeout(5000);
+
+            // Cari tombol wake up
+            const button = page.getByText("Yes, get this app back up!");
+
+            if (await button.count() > 0) {
+              console.log("App sleeping. Clicking wake up...");
+              await button.click();
+              await page.waitForTimeout(30000);
+            } else {
+              console.log("App already awake.");
+            }
+
+            await browser.close();
+          })();
+          EOF
+
+      - name: Run Playwright
+        run: node wake.js
