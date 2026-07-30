@@ -73,8 +73,8 @@ def _get_next_link_placeholder() -> str:
 # 2 URL SPREADSHEET TERPISAH
 # ─────────────────────────────────────────────────────────────────────────────
 
-KAMUS_SPREADSHEET_URL = "https://docs.google.com/spreadsheets/d/1BBPCMPwvbBk5LPdoDQwnjQzcPHv7_RDKENqeMsklF-8/edit?usp=sharing"
-ITALIC_SPREADSHEET_URL = "https://docs.google.com/spreadsheets/d/1NZm1HjsjxmflxnZlzV_O2XF75ZlMUOu8VVofsKfp_FA/edit#gid=0"
+KAMUS_SPREADSHEET_URL = "https://docs.google.com/spreadsheets/d/1Q6SNuAxTCL1fffi0O4Rxl-m0UpdZO2bL/edit?usp=sharing"
+ITALIC_SPREADSHEET_URL = "https://docs.google.com/spreadsheets/d/1jjn_KDxUK3AbXfOzdVqYGU1cM4UXCxYm/edit?usp=sharing"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
