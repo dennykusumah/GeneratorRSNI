@@ -290,6 +290,39 @@ def _enforce_italic_terms(doc, terms: list[str]) -> None:
                 run.font.italic = True
 
 
+def _enforce_empty_daftar_isi_page(doc) -> None:
+    """Jaring pengaman terakhir: pastikan halaman "Daftar Isi" SELALU kosong
+    (tanpa entri/teks apa pun di bawah judulnya), apa pun yang terjadi di
+    tahap-tahap sebelumnya (mis. field TOC yang ter-update otomatis, atau
+    proses lain yang tanpa sengaja menambahkan teks). Dijalankan paling
+    akhir (sebelum doc.save) di StyleFinalizerEngine.
+
+    Cakupan: dari paragraf TEPAT SETELAH judul "Daftar Isi" (kemunculan
+    pertama di seluruh dokumen) sampai SEBELUM paragraf pembatas halaman
+    berikutnya (paragraf yang mengandung <w:sectPr>, termasuk paragraf
+    sectPr itu sendiri dibiarkan apa adanya). Hanya TEKS run yang dihapus
+    (run/paragraf itu sendiri tidak dihapus), supaya format/struktur
+    dokumen (spacing, style, dst.) tidak berubah — halaman tetap kosong
+    persis seperti sebelum judul ditambahkan.
+    """
+    paras = doc.paragraphs
+    di_idx = None
+    for i, p in enumerate(paras):
+        if _norm(p.text) == 'daftar isi':
+            di_idx = i
+            break
+    if di_idx is None:
+        return
+
+    for p in paras[di_idx + 1:]:
+        pPr = p._p.find(qn('w:pPr'))
+        has_sectpr = pPr is not None and pPr.find(qn('w:sectPr')) is not None
+        for run in p.runs:
+            run.text = ''
+        if has_sectpr:
+            break
+
+
 class StyleFinalizerEngine:
     """
     Menambahkan style "Judul" & "Pasal" ke dokumen lalu menerapkannya secara
@@ -397,9 +430,10 @@ class StyleFinalizerEngine:
                 _apply_pasal(doc, paras[idx], ilvl, num_id)
 
             # 6) Jaring pengaman terakhir: pastikan "Red Green Blue" pada
-            #    Prakata SELALU tercetak italic, sebagai jaminan final
-            #    sebelum dokumen disimpan.
+            #    Prakata SELALU tercetak italic, & halaman "Daftar Isi"
+            #    SELALU kosong — jaminan final sebelum dokumen disimpan.
             _enforce_italic_terms(doc, ['Red Green Blue'])
+            _enforce_empty_daftar_isi_page(doc)
 
             doc.save(output_docx)
 
