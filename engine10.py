@@ -641,10 +641,17 @@ class StyleFinalizerEngine:
                 _apply_pasal(doc, paras[idx], ilvl, num_id, number_text)
 
             # 6) Jaring pengaman terakhir: pastikan "Red Green Blue" pada
-            #    Prakata SELALU tercetak italic, & halaman "Daftar Isi"
-            #    SELALU kosong — jaminan final sebelum dokumen disimpan.
+            #    Prakata SELALU tercetak italic — jaminan final sebelum
+            #    dokumen disimpan.
+            #    CATATAN: _enforce_empty_daftar_isi_page() SENGAJA TIDAK
+            #    dipanggil lagi di sini. Engine5 (DaftarIsiEngine) kini
+            #    menyisipkan field TOC asli Word di halaman Daftar Isi
+            #    (lihat engine5.py) supaya daftar isi terisi otomatis —
+            #    memanggil fungsi ini akan menghapus kembali isi field
+            #    tersebut sehingga halaman Daftar Isi kosong lagi.
+            #    Fungsi itu sendiri dibiarkan ada (tidak dihapus) di bawah
+            #    supaya tidak mengubah bagian lain dari engine ini.
             _enforce_italic_terms(doc, ['Red Green Blue'])
-            _enforce_empty_daftar_isi_page(doc)
 
             doc.save(output_docx)
 
