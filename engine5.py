@@ -1,32 +1,22 @@
 """
-Engine5: DaftarIsiEngine (v4 - Native Word TOC Field)
+Engine5: DaftarIsiEngine (v5 - Halaman Daftar Isi kosong)
 =========================================================
-Engine untuk membuat halaman Daftar Isi sesuai standar BSN/SNI.
+Engine untuk menyisipkan halaman "Daftar Isi" sesuai standar BSN/SNI.
 
-v4 (Native TOC field):
-  - Isi Daftar Isi TIDAK LAGI diketik manual / diekstrak sebagai teks statis.
-  - Sebagai gantinya, disisipkan field TOC asli Word:
-        { TOC \\t "Judul,1,Pasal,1" \\h \\z }
-    persis seperti hasil "References > Table of Contents > Custom Table of
-    Contents" di Word dengan opsi "Styles" dicentang HANYA untuk style
-    "Judul" (TOC level 1) dan "Pasal" (TOC level 1) — opsi "Outline levels"
-    DI-UNCHECK (sengaja TANPA switch \\u), supaya Daftar Isi HANYA berisi
-    paragraf ber-style "Judul"/"Pasal" — bukan seluruh paragraf yang punya
-    outline level (mis. heading asli "Heading 1"/"Heading 2" sebelum
-    dikonversi, atau heading pada bagian berbahasa Inggris), yang sebelumnya
-    ikut nyasar masuk Daftar Isi tanpa titik-titik/nomor halaman karena
-    switch \\u membuat Word menyertakan SEMUA paragraf ber-outline-level
-    (union dengan hasil \\t), bukan hanya yang ber-style Judul/Pasal.
-  - Word yang menghitung isi + nomor halaman secara otomatis saat dokumen
-    dibuka (bukan dihitung oleh Python), sehingga Daftar Isi selalu akurat
-    mengikuti pagination final. Ditambahkan <w:updateFields w:val="true"/>
-    pada settings.xml supaya field ini otomatis ter-update saat file dibuka
-    di Word (tidak perlu klik kanan > Update Field secara manual).
-  - Style paragraf "TOC 1" ditambahkan ke styles.xml (Arial 11 Bold, rata
-    kiri, spacing after 6pt, single line spacing, outline level Body Text,
-    indent left 0 / hanging 1,27 cm / right 0,88 cm — sesuai spesifikasi
-    Modify Style yang dibuat manual di Word oleh pengguna) supaya tampilan
-    entri Daftar Isi konsisten walau dibuka di komputer lain.
+v5 (halaman kosong, tanpa field/teks apapun di bawah judul):
+  - Halaman Daftar Isi HANYA berisi judul "Daftar Isi" (rata tengah, bold).
+    TIDAK ADA lagi field TOC Word maupun teks statis apapun di bawahnya —
+    persis seperti halaman Pendahuluan yang juga hanya berisi judulnya saja.
+  - Sebelumnya (v4) halaman ini berisi field TOC asli Word
+    ({ TOC \\t "Judul,1,Pasal,1" \\h \\z }) yang otomatis ter-update saat
+    dokumen dibuka (karena <w:updateFields w:val="true"/> di settings.xml),
+    sehingga field itu langsung terisi teks hasil hitung Word begitu file
+    dibuka/disimpan — halaman jadi TIDAK pernah benar-benar kosong. Field
+    itu SUDAH DIHAPUS SEPENUHNYA dari elemen yang disisipkan; halaman kini
+    dijamin kosong walau dokumen dibuka & field lain di-update.
+  - Style paragraf "TOC 1" tetap ditambahkan ke styles.xml (tidak dipakai
+    paragraf manapun lagi, tapi dibiarkan ada / tidak dihapus dari
+    styles.xml supaya bagian lain tidak berubah).
   - Bagian lain (header/footer, page size/margin, romawi nomor halaman,
     posisi penyisipan setelah halaman Hak Cipta) TIDAK diubah.
 """
@@ -123,7 +113,10 @@ def _build_footer(copyright_text, pw, lm, rm):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# DAFTAR ISI BUILDER (native Word TOC field)
+# DAFTAR ISI BUILDER
+# Konstanta & fungsi toc_field_p() di bawah ini TIDAK LAGI dipanggil (lihat
+# xmls di _build_di_elements) — sengaja dibiarkan ada (tidak dihapus) sebagai
+# referensi, TIDAK berpengaruh apapun ke dokumen hasil karena tidak dipakai.
 # ─────────────────────────────────────────────────────────────────────────────
 _TOC_FIELD_INSTR = 'TOC \\t "Judul,1,Pasal,1" \\h \\z'
 _TOC_PLACEHOLDER = (
@@ -136,11 +129,10 @@ def _build_di_elements(hdr_odd, hdr_even, ftr_odd, ftr_even):
     """
     Return list of raw XML strings untuk paragraf DI + inline sectPr.
 
-    Isi Daftar Isi kini berupa field TOC asli Word (bukan teks statis),
-    dibangun dari style "Judul" (TOC level 1) & "Pasal" (TOC level 1) saja —
-    identik dengan Table of Contents Options: Styles dicentang hanya
-    untuk Judul & Pasal (keduanya level 1), style lain di-uncheck,
-    Show levels: 1.
+    Halaman Daftar Isi HANYA berisi judul "Daftar Isi" (rata tengah, bold)
+    diikuti 3 paragraf kosong — TIDAK ADA field TOC atau teks apapun lagi
+    di bawahnya, supaya halaman ini dijamin kosong (sama seperti halaman
+    Pendahuluan) walaupun dokumen dibuka & field lain di-update di Word.
     """
     TAB  = 9061
     top  = cm_to_twips(3);   bottom = cm_to_twips(2)
@@ -199,7 +191,6 @@ def _build_di_elements(hdr_odd, hdr_even, ftr_odd, ftr_even):
 
     xmls = (
         [title_p(), empty_p(), empty_p(), empty_p()]
-        + [toc_field_p()]
         + [sect_p()]
     )
     return xmls
@@ -301,7 +292,8 @@ def _find_nth_section_paragraph_index(body, n=2):
 class DaftarIsiEngine:
     """
     Engine untuk menyisipkan halaman Daftar Isi setelah halaman Hak Cipta (page 2).
-    Isi Daftar Isi diambil OTOMATIS dari heading dokumen (sama dengan logika engine2).
+    Halaman hanya berisi judul "Daftar Isi" — TIDAK ADA isi/entri apapun,
+    persis seperti halaman Pendahuluan.
     Penomoran: Romawi (i, ii, iii, ...).
     """
 
