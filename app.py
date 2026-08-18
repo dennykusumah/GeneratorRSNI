@@ -961,12 +961,12 @@ if st.session_state.get('_run_process') and st.session_state.get('_target_file')
             final_file = ip_out
             update_ui(10, f"[5/5] Formatting selesai ✓")
 
-        return final_file
+        return final_file, cover_settings
 
     try:
         # --- LANGKAH 1: OPTIMASI (0–10%) ---
         update_ui(1, "Membaca file dokumen...")
-        final_opt_file = run_optimization(target_file, doc_title_val)
+        final_opt_file, cover_settings = run_optimization(target_file, doc_title_val)
         st.session_state['_final_opt_file'] = final_opt_file
 
         # --- LANGKAH 2: TERJEMAHAN (10–100%) ---
