@@ -7,7 +7,7 @@ v7 (field TOC & style "TOC1" dipelajari & disamakan PERSIS dengan F.docx,
 menggantikan pendekatan v6 yang formatnya masih berbeda dari F.docx):
   - Halaman Daftar Isi berisi judul "Daftar Isi" (rata tengah, bold, style
     "Judul"), diikuti field TOC ASLI Word:
-        { TOC \\h \\z \\t "Judul;1;Pasal;1;ANNEX;1" }
+        { TOC \\h \\z \\t "Judul;1;Pasal;1" }
     Field ini disisipkan dalam bentuk "belum di-update" (persis seperti saat
     pengguna melakukan Insert > Table of Contents secara manual di Word) —
     satu paragraf berisi begin/instrText/separate/teks-placeholder/end.
@@ -30,7 +30,7 @@ menggantikan pendekatan v6 yang formatnya masih berbeda dari F.docx):
     tab kanan dot-leader di batas kanan area konten — persis F.docx.
     Sebelumnya (v6) style ini masih bold & pakai hanging-indent ala
     "Modify Style manual", sehingga tampilannya BEDA dari F.docx.
-  - Field mengacu ke style "Judul", "Pasal", dan "ANNEX" — SEMUA level 1
+  - Field mengacu ke style "Judul" dan "Pasal" — SEMUA level 1
     (flat, tanpa indentasi bertingkat), sesuai style yang diterapkan
     Engine10 (StyleFinalizerEngine) pada judul halaman (Daftar Isi/Prakata/
     Pendahuluan/Bibliografi), Pasal/Subpasal berbahasa Indonesia, dan
@@ -156,7 +156,7 @@ def _build_footer(copyright_text, pw, lm, rm):
 # found.") pada mesin Word dengan Regional Settings Indonesia. Memakai
 # titik koma (sama seperti F.docx) menghindari masalah ini.
 # ─────────────────────────────────────────────────────────────────────────────
-_TOC_FIELD_INSTR = 'TOC \\h \\z \\t "Judul;1;Pasal;1;ANNEX;1"'
+_TOC_FIELD_INSTR = 'TOC \\h \\z \\t "Judul;1;Pasal;1"'
 _TOC_PLACEHOLDER = (
     'Klik kanan pada teks ini lalu pilih "Update Field" '
     '(atau tekan Ctrl+A kemudian F9) untuk menampilkan Daftar Isi.'
