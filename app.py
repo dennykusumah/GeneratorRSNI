@@ -16,7 +16,7 @@ from io import BytesIO
 # Database kamus ada di https://bit.ly/kamusSNI
 
 # Pola file temporer yang dibuat oleh aplikasi
-_TEMP_PATTERNS = ["temp_main_*", "opt_*", "cover_*", "di_*", "pp_*", "ip_*", "ID_*", "style_*"]
+_TEMP_PATTERNS = ["temp_main_*", "opt_*", "cover_*", "di_*", "pp_*", "ip_*", "ID_*"]
 # Hapus file lebih lama dari N menit
 _MAX_AGE_MINUTES = 30
 
@@ -75,7 +75,6 @@ from engine5 import DaftarIsiEngine
 from engine6 import PrakataPendahuluanEngine
 from engine7 import InfoPendukungEngine
 from engine9 import CustomDictionary, ItalicDictionary, DocxFinalTranslatorEngine
-from engine10 import StyleFinalizerEngine
 
 # --- KONFIGURASI HALAMAN ---
 st.set_page_config(
@@ -895,14 +894,9 @@ if st.session_state.get('_run_process') and st.session_state.get('_target_file')
     # Pipeline Optimasi
     def run_optimization(input_file, doc_title):
         copyright_text = f"© BSN {_tahun}"
-        _sni_number_val = doc_title if doc_title else "SNI ISO XXXXX:20XX"
-        # Ambil 4 digit tahun ISO dari input user setelah tanda ":" (mis. "SNI ISO 9828-1:2025" -> "2025")
-        _iso_year_match = re.search(r':\s*(\d{4})', _sni_number_val)
-        _iso_year_val = _iso_year_match.group(1) if _iso_year_match else _tahun
         cover_settings = {
-            "sni_number": _sni_number_val,
-            "bsn_year": _tahun, "iso_year": _iso_year_val,
-            "ics_number": "XX.XXX.XX", "ref_standard": "",
+            "sni_number": doc_title if doc_title else "SNI ISO XXXXX:20XX",
+            "bsn_year": _tahun, "ics_number": "XX.XXX.XX", "ref_standard": "",
         }
 
         # Hitung total paragraf dokumen untuk info realtime
@@ -932,7 +926,7 @@ if st.session_state.get('_run_process') and st.session_state.get('_target_file')
         # 2. Engine 4 — Cover
         update_ui(3, f"[2/5] Membuat cover: {cover_settings['sni_number']}")
         cover_out = f"cover_{os.path.basename(final_file)}"
-        ok4 = engine4.prepend_cover(input_docx=final_file, output_docx=cover_out, sni_number=cover_settings["sni_number"], bsn_year=cover_settings["bsn_year"], iso_year=cover_settings["iso_year"], title_id=auto_title_id, title_en=auto_title_en, ref_standard=cover_settings["ref_standard"], ics_number=cover_settings["ics_number"])[0]
+        ok4 = engine4.prepend_cover(input_docx=final_file, output_docx=cover_out, sni_number=cover_settings["sni_number"], bsn_year=cover_settings["bsn_year"], title_id=auto_title_id, title_en=auto_title_en, ref_standard=cover_settings["ref_standard"], ics_number=cover_settings["ics_number"])[0]
         if ok4:
             final_file = cover_out
             update_ui(4, f"[2/5] Cover selesai ✓ — {_title_info}")
@@ -1071,19 +1065,8 @@ if st.session_state.get('_run_process') and st.session_state.get('_target_file')
         # ─────────────────────────────────────────────────────────────────────
 
         ok_tr, _ = _engine9.translate(input_docx=final_opt_file, output_docx=tr_out, progress_callback=_cb_tr, translate_headers=False)
-
+        
         if ok_tr:
-            # 6. Engine 10 — Style "Judul" & "Pasal" (final finishing, tidak mengubah isi)
-            update_ui(99, "[6/6] Menerapkan style Judul & Pasal...")
-            style_out = f"style_{os.path.basename(tr_out)}"
-            ok10, msg10 = StyleFinalizerEngine().apply(input_docx=tr_out, output_docx=style_out)
-            if ok10:
-                tr_out = style_out
-            else:
-                # Jika gagal, tetap lanjut memakai hasil terjemahan tanpa style custom
-                # supaya proses tidak gagal total hanya karena finishing style.
-                print(f"[Engine10] Gagal menerapkan style Judul/Pasal: {msg10}")
-
             update_ui(100, "✅ Selesai!")
             final_elapsed = get_elapsed_str(start_time)
             # Ganti JS timer dengan waktu final statis (berhenti otomatis)
@@ -1896,7 +1879,7 @@ st.markdown(
     f"<br>"
     f"<span style='font-size:0.8rem;color:#ffffff;'>© 2026 Generator RSNI · ISO to RSNI Converter · All rights reserved.</span>"
     f"<br>"
-    f"<span style='font-size:0.72rem;opacity:0.8;color:#ffffff;'>Developed by Denny Kusuma H.</span>"
+    f"<span style='font-size:0.72rem;opacity:0.8;color:#ffffff;'>Developed by Denny Kusuma H. & Ahmad Habibi</span>"
     f"</div>",
     unsafe_allow_html=True
 )
