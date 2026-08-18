@@ -549,7 +549,13 @@ class StyleFinalizerEngine:
             # 4) Kumpulkan target paragraf untuk style "Judul"
             judul_targets = {}  # idx -> force_page_break_before
 
-            # "Daftar Isi" -> kemunculan PERTAMA di seluruh dokumen (judul halaman TOC)
+            # "Daftar Isi" -> kemunculan PERTAMA di seluruh dokumen (judul halaman TOC).
+            # Paragraf ini TETAP diberi style "Judul" (sama seperti Prakata/
+            # Pendahuluan/Bibliografi) supaya formatnya konsisten. Field TOC
+            # tidak akan salah memasukkan paragraf ini sebagai entrinya
+            # sendiri karena engine5 membatasi cakupan field lewat bookmark
+            # "GenRSNI_ToCScope" (switch \b) yang mulai TEPAT SETELAH
+            # paragraf judul "Daftar Isi" ini — lihat engine5._build_di_elements().
             for i in range(n):
                 if _norm(paras[i].text) == 'daftar isi':
                     judul_targets[i] = False
