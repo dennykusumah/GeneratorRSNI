@@ -6,17 +6,19 @@ Engine untuk membuat halaman Daftar Isi sesuai standar BSN/SNI.
 v4 (Native TOC field):
   - Isi Daftar Isi TIDAK LAGI diketik manual / diekstrak sebagai teks statis.
   - Sebagai gantinya, disisipkan field TOC asli Word:
-        { TOC \\t "Judul,1,Pasal,2" \\h \\z \\u }
+        { TOC \\t "Judul,1,Pasal,1" \\h \\z \\u }
     persis seperti hasil "References > Table of Contents > Custom Table of
     Contents" di Word dengan opsi "Styles" dicentang HANYA untuk style
-    "Judul" (TOC level 1) dan "Pasal" (TOC level 2) — style lain di-uncheck.
+    "Judul" (TOC level 1) dan "Pasal" (TOC level 1) — style lain di-uncheck,
+    Show levels: 1.
   - Word yang menghitung isi + nomor halaman secara otomatis saat dokumen
     dibuka (bukan dihitung oleh Python), sehingga Daftar Isi selalu akurat
     mengikuti pagination final. Ditambahkan <w:updateFields w:val="true"/>
     pada settings.xml supaya field ini otomatis ter-update saat file dibuka
     di Word (tidak perlu klik kanan > Update Field secara manual).
-  - Style paragraf "TOC 1" & "TOC 2" ditambahkan ke styles.xml (Arial 11,
-    justify, spacing after 6pt, single line spacing, sesuai spesifikasi
+  - Style paragraf "TOC 1" ditambahkan ke styles.xml (Arial 11 Bold, rata
+    kiri, spacing after 6pt, single line spacing, outline level Body Text,
+    indent left 0 / hanging 1,27 cm / right 0,88 cm — sesuai spesifikasi
     Modify Style yang dibuat manual di Word oleh pengguna) supaya tampilan
     entri Daftar Isi konsisten walau dibuka di komputer lain.
   - Bagian lain (header/footer, page size/margin, romawi nomor halaman,
@@ -117,7 +119,7 @@ def _build_footer(copyright_text, pw, lm, rm):
 # ─────────────────────────────────────────────────────────────────────────────
 # DAFTAR ISI BUILDER (native Word TOC field)
 # ─────────────────────────────────────────────────────────────────────────────
-_TOC_FIELD_INSTR = 'TOC \\t "Judul,1,Pasal,2" \\h \\z \\u'
+_TOC_FIELD_INSTR = 'TOC \\t "Judul,1,Pasal,1" \\h \\z \\u'
 _TOC_PLACEHOLDER = (
     'Klik kanan pada teks ini lalu pilih "Update Field" '
     '(atau tekan Ctrl+A kemudian F9) untuk menampilkan Daftar Isi.'
@@ -129,9 +131,10 @@ def _build_di_elements(hdr_odd, hdr_even, ftr_odd, ftr_even):
     Return list of raw XML strings untuk paragraf DI + inline sectPr.
 
     Isi Daftar Isi kini berupa field TOC asli Word (bukan teks statis),
-    dibangun dari style "Judul" (level 1) & "Pasal" (level 2) saja —
+    dibangun dari style "Judul" (TOC level 1) & "Pasal" (TOC level 1) saja —
     identik dengan Table of Contents Options: Styles dicentang hanya
-    untuk Judul & Pasal, style lain di-uncheck.
+    untuk Judul & Pasal (keduanya level 1), style lain di-uncheck,
+    Show levels: 1.
     """
     TAB  = 9061
     top  = cm_to_twips(3);   bottom = cm_to_twips(2)
@@ -197,10 +200,12 @@ def _build_di_elements(hdr_odd, hdr_even, ftr_odd, ftr_even):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# STYLE "TOC 1" / "TOC 2" — sesuai Modify Style yang dibuat manual di Word
-# (Arial 11, justify, spacing after 6pt, single, indent left 0 / hanging
-#  1,27 cm / right 0,88 cm). TOC 2 diturunkan dari TOC 1 dengan tambahan
-# indent kiri untuk membedakan level Pasal (sub-butir) dari Judul.
+# STYLE "TOC 1" — sesuai Modify Style yang dibuat manual di Word:
+#   Based on: Normal, Next: Normal, Font Arial 11 Bold, rata kiri (Left),
+#   Outline level: Body Text, Spacing before 0pt / after 6pt / Single,
+#   Indentation: Left 0 cm, Hanging 1,27 cm, Right 0,88 cm.
+# Hanya SATU level dipakai (Judul & Pasal sama-sama TOC level 1), jadi
+# hanya style "TOC 1" yang diperlukan.
 # ─────────────────────────────────────────────────────────────────────────────
 def _ensure_toc_styles(files: dict) -> None:
     key = 'word/styles.xml'
@@ -208,42 +213,33 @@ def _ensure_toc_styles(files: dict) -> None:
         return
     styles_xml = files[key].decode('utf-8')
 
-    TAB    = 9061
-    hang   = cm_to_twips(1.27)   # 720
-    rindent = cm_to_twips(0.88)  # 498
+    TAB     = 9061
+    hang    = cm_to_twips(1.27)   # 720
+    rindent = cm_to_twips(0.88)   # 498
 
     toc1_xml = (
         f'<w:style w:type="paragraph" w:customStyle="1" w:styleId="TOC1">'
         f'<w:name w:val="TOC 1"/><w:basedOn w:val="Normal"/><w:next w:val="Normal"/>'
         f'<w:autoRedefine/><w:uiPriority w:val="39"/><w:unhideWhenUsed/><w:qFormat/>'
         f'<w:pPr>'
-        f'<w:jc w:val="both"/>'
+        f'<w:jc w:val="left"/>'
         f'<w:tabs><w:tab w:val="right" w:leader="dot" w:pos="{TAB}"/></w:tabs>'
         f'<w:spacing w:before="0" w:after="120" w:line="240" w:lineRule="auto"/>'
         f'<w:ind w:left="0" w:right="{rindent}" w:hanging="{hang}"/>'
         f'</w:pPr>'
         f'<w:rPr><w:rFonts w:ascii="Arial" w:hAnsi="Arial" w:cs="Arial"/>'
-        f'<w:sz w:val="22"/><w:szCs w:val="22"/></w:rPr>'
-        f'</w:style>'
-    )
-    toc2_xml = (
-        f'<w:style w:type="paragraph" w:customStyle="1" w:styleId="TOC2">'
-        f'<w:name w:val="TOC 2"/><w:basedOn w:val="TOC1"/><w:next w:val="Normal"/>'
-        f'<w:autoRedefine/><w:uiPriority w:val="39"/><w:unhideWhenUsed/><w:qFormat/>'
-        f'<w:pPr>'
-        f'<w:ind w:left="360" w:right="{rindent}" w:hanging="{hang}"/>'
-        f'</w:pPr>'
+        f'<w:b/><w:sz w:val="22"/><w:szCs w:val="22"/></w:rPr>'
         f'</w:style>'
     )
 
-    add = ''
-    if 'w:styleId="TOC1"' not in styles_xml:
-        add += toc1_xml
-    if 'w:styleId="TOC2"' not in styles_xml:
-        add += toc2_xml
-    if add:
-        styles_xml = styles_xml.replace('</w:styles>', add + '</w:styles>')
-        files[key] = styles_xml.encode('utf-8')
+    # Buang definisi TOC1/TOC2 lama (jika ada dari hasil generate sebelumnya)
+    # supaya selalu memakai spesifikasi terbaru, lalu sisipkan TOC1 yang baru.
+    styles_xml = re.sub(
+        r'<w:style\b[^>]*w:styleId="TOC[12]"[^>]*>.*?</w:style>',
+        '', styles_xml, flags=re.DOTALL
+    )
+    styles_xml = styles_xml.replace('</w:styles>', toc1_xml + '</w:styles>')
+    files[key] = styles_xml.encode('utf-8')
 
 
 def _ensure_update_fields(files: dict) -> None:
