@@ -573,6 +573,19 @@ class StyleFinalizerEngine:
                     was_biblio_title = style_name(paras[i]) == 'Biblio Title'
                     judul_targets[i] = was_biblio_title  # pertahankan page-break-before
 
+            # "Lampiran/Annex" -> WAJIB style "Judul".
+            # Dokumen sumber ISO memakai style custom "ANNEX" untuk judul
+            # lampiran. Engine5 membangun TOC dengan field:
+            #   TOC \h \z \t "Judul;1;Pasal;1;ANNEX;1"
+            # Namun agar hasil akhir sama seperti F.docx, style ANNEX harus
+            # dikonversi menjadi "Judul". Dengan begitu entri Lampiran
+            # tetap muncul di TOC sebagai level 1, sekaligus tampil dengan
+            # format Judul (Arial 12 pt, bold, center) seperti F.docx.
+            # Teks Lampiran TIDAK diubah.
+            for i in range(n):
+                if style_name(paras[i]) == 'ANNEX':
+                    judul_targets[i] = False
+
             for idx, force_pb in judul_targets.items():
                 _apply_judul(doc, paras[idx], force_page_break_before=force_pb)
 
@@ -656,7 +669,7 @@ class StyleFinalizerEngine:
             doc.save(output_docx)
 
             msg = (
-                f'OK: {len(judul_targets)} heading -> "Judul", '
+                f'OK: {len(judul_targets)} heading/Lampiran -> "Judul", '
                 f'{len(pasal_targets)} pasal/subpasal -> "Pasal".'
             )
             return True, msg
