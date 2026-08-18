@@ -1,0 +1,326 @@
+"""
+Engine10: StyleFinalizerEngine
+=================================
+Engine untuk menambahkan style custom "Judul" dan "Pasal" (sesuai spesifikasi
+Modify Style yang dibuat manual di Word oleh pengguna) ke dalam dokumen, lalu
+MENERAPKANNYA secara otomatis pada bagian-bagian dokumen yang sesuai.
+
+Spesifikasi style (hasil dari Word "Modify Style"):
+
+  "Judul"  — based on Heading 1, style untuk paragraf berikutnya: Body Text
+             Font Arial 12pt Bold, rata tengah (center), outline level 1,
+             indentasi kiri/kanan 0, spasi sebelum/sesudah 0pt,
+             spasi baris 1,5 lines, TANPA auto-numbering.
+
+  "Pasal"  — based on Heading 1, style untuk paragraf berikutnya: Body Text
+             Font Arial 11pt Bold, rata kiri-kanan (justified),
+             spasi sebelum/sesudah 0pt, spasi baris 1,5 lines,
+             auto-numbering TETAP mengikuti Heading 1 / Heading 2 asal
+             (levelnya dipertahankan lewat override w:numPr per-paragraf).
+
+Penerapan otomatis:
+
+  Style "Judul" -> heading halaman "Daftar Isi" (judul halaman itu sendiri,
+      BUKAN entri di dalam daftar isi), "Prakata", "Pendahuluan" (heading-nya,
+      BUKAN entri di dalam daftar isi), dan "Bibliografi".
+
+  Style "Pasal" -> semua Pasal (paragraf ber-style "Heading 1") dan Subpasal
+      (paragraf ber-style "Heading 2") yang BERBAHASA INDONESIA saja, KECUALI:
+        - Sub-subpasal ke bawah (Heading 3, Heading 4, dst.) — tidak disentuh.
+        - Pasal "Istilah dan Definisi" beserta subpasal di bawahnya — dilewati.
+        - Seluruh bagian berbahasa Inggris — dilewati sepenuhnya.
+
+Bagian lain dokumen (tabel, isi paragraf biasa, cover, entri daftar isi,
+header/footer, dst.) TIDAK diubah sama sekali.
+
+Deteksi batas bahasa Indonesia vs Inggris:
+  Dokumen hasil pipeline GeneratorRSNI selalu memiliki DUA paragraf ber-style
+  "Main Title 1" (judul utama halaman pertama isi dokumen): yang pertama
+  adalah judul berbahasa Indonesia (pembuka bagian ID), yang kedua adalah
+  judul berbahasa Inggris (pembuka bagian EN, hasil adopsi dua-bahasa).
+  Semua heading DI ANTARA kedua "Main Title 1" tsb. dianggap berbahasa
+  Indonesia; semua heading SETELAH "Main Title 1" kedua dianggap berbahasa
+  Inggris dan dilewati. Jika dokumen hanya punya satu bagian bahasa (tidak
+  ditemukan dua "Main Title 1"), seluruh heading diperlakukan sebagai
+  berbahasa Indonesia.
+"""
+
+import re
+from docx import Document
+from docx.oxml.ns import qn
+from docx.oxml import parse_xml
+from docx.oxml.ns import nsdecls
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Konstanta
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Teks heading yang harus DILEWATI saat menerapkan style "Pasal"
+# (pasal "istilah dan definisi" & turunannya tidak diberi style Pasal).
+_SKIP_SECTION_TITLES = {
+    'istilah dan definisi',
+    'istilah dan definisi umum',
+}
+
+# Teks heading halaman yang harus diberi style "Judul".
+_JUDUL_TARGET_TEXTS = {'daftar isi', 'prakata', 'pendahuluan', 'bibliografi'}
+
+
+def _norm(text: str) -> str:
+    """Normalisasi teks untuk dibandingkan: lower-case, trim whitespace/tab."""
+    return re.sub(r'\s+', ' ', (text or '').strip()).strip().lower()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Style XML — "Judul" & "Pasal"
+# ─────────────────────────────────────────────────────────────────────────────
+
+_JUDUL_STYLE_XML = f'''<w:style {nsdecls("w")} w:type="paragraph" w:customStyle="1" w:styleId="Judul">
+  <w:name w:val="Judul"/>
+  <w:basedOn w:val="Heading1"/>
+  <w:next w:val="BodyText"/>
+  <w:qFormat/>
+  <w:pPr>
+    <w:numPr><w:ilvl w:val="0"/><w:numId w:val="0"/></w:numPr>
+    <w:outlineLvl w:val="0"/>
+    <w:spacing w:before="0" w:after="0" w:line="360" w:lineRule="auto"/>
+    <w:ind w:left="0" w:right="0" w:firstLine="0"/>
+    <w:jc w:val="center"/>
+  </w:pPr>
+  <w:rPr>
+    <w:rFonts w:ascii="Arial" w:hAnsi="Arial" w:cs="Arial"/>
+    <w:b/>
+    <w:sz w:val="24"/>
+    <w:szCs w:val="24"/>
+  </w:rPr>
+</w:style>'''
+
+_PASAL_STYLE_XML = f'''<w:style {nsdecls("w")} w:type="paragraph" w:customStyle="1" w:styleId="Pasal">
+  <w:name w:val="Pasal"/>
+  <w:basedOn w:val="Heading1"/>
+  <w:next w:val="BodyText"/>
+  <w:qFormat/>
+  <w:pPr>
+    <w:spacing w:before="0" w:after="0" w:line="360" w:lineRule="auto"/>
+    <w:jc w:val="both"/>
+  </w:pPr>
+  <w:rPr>
+    <w:rFonts w:ascii="Arial" w:hAnsi="Arial" w:cs="Arial"/>
+    <w:b/>
+    <w:sz w:val="22"/>
+    <w:szCs w:val="22"/>
+  </w:rPr>
+</w:style>'''
+
+
+def _find_style_el(doc, style_id):
+    for st in doc.styles.element.findall(qn('w:style')):
+        if st.get(qn('w:styleId')) == style_id:
+            return st
+    return None
+
+
+def _ensure_style(doc, style_id, style_xml):
+    """Tambahkan style ke styles.xml jika belum ada. Idempotent."""
+    if _find_style_el(doc, style_id) is not None:
+        return
+    new_style = parse_xml(style_xml)
+    doc.styles.element.append(new_style)
+
+
+def _resolve_num_id(doc, style_id, _depth=0):
+    """Telusuri rantai basedOn untuk menemukan w:numId yang berlaku pada style ini."""
+    if _depth > 8:
+        return None
+    st = _find_style_el(doc, style_id)
+    if st is None:
+        return None
+    pPr = st.find(qn('w:pPr'))
+    if pPr is not None:
+        numPr = pPr.find(qn('w:numPr'))
+        if numPr is not None:
+            numId_el = numPr.find(qn('w:numId'))
+            if numId_el is not None:
+                val = numId_el.get(qn('w:val'))
+                if val and val != '0':
+                    return val
+    based = st.find(qn('w:basedOn'))
+    if based is not None:
+        parent_id = based.get(qn('w:val'))
+        if parent_id and parent_id != style_id:
+            return _resolve_num_id(doc, parent_id, _depth + 1)
+    return None
+
+
+def _clear_paragraph_direct_formatting(paragraph, drop_tags):
+    """Hapus elemen langsung tertentu dari pPr agar formatting style baru berlaku penuh."""
+    p_el = paragraph._p
+    pPr = p_el.find(qn('w:pPr'))
+    if pPr is None:
+        pPr = parse_xml(f'<w:pPr {nsdecls("w")}/>')
+        p_el.insert(0, pPr)
+    for tag in drop_tags:
+        el = pPr.find(qn(tag))
+        if el is not None:
+            pPr.remove(el)
+    return pPr
+
+
+def _strip_run_direct_formatting(paragraph):
+    """Hapus rPr langsung pada tiap run agar teks mengikuti rPr dari style paragraf."""
+    for r in paragraph._p.findall(qn('w:r')):
+        rPr = r.find(qn('w:rPr'))
+        if rPr is not None:
+            r.remove(rPr)
+
+
+def _set_pstyle(paragraph, style_id):
+    p_el = paragraph._p
+    pPr = p_el.find(qn('w:pPr'))
+    if pPr is None:
+        pPr = parse_xml(f'<w:pPr {nsdecls("w")}/>')
+        p_el.insert(0, pPr)
+    pStyle = pPr.find(qn('w:pStyle'))
+    if pStyle is None:
+        pStyle = parse_xml(f'<w:pStyle {nsdecls("w")} w:val="{style_id}"/>')
+        pPr.insert(0, pStyle)
+    else:
+        pStyle.set(qn('w:val'), style_id)
+
+
+def _apply_judul(doc, paragraph, force_page_break_before=False):
+    _set_pstyle(paragraph, 'Judul')
+    pPr = _clear_paragraph_direct_formatting(
+        paragraph, ['w:jc', 'w:spacing', 'w:ind', 'w:outlineLvl', 'w:numPr']
+    )
+    if force_page_break_before and pPr.find(qn('w:pageBreakBefore')) is None:
+        pPr.append(parse_xml(f'<w:pageBreakBefore {nsdecls("w")}/>'))
+    _strip_run_direct_formatting(paragraph)
+
+
+def _apply_pasal(doc, paragraph, ilvl, num_id):
+    _set_pstyle(paragraph, 'Pasal')
+    pPr = _clear_paragraph_direct_formatting(
+        paragraph, ['w:jc', 'w:spacing', 'w:ind', 'w:numPr']
+    )
+    # Pertahankan level numbering asal (Pasal = level 0, Subpasal = level 1)
+    # supaya penomoran otomatis "1", "4.1", dst. tidak berubah/rusak.
+    if num_id:
+        numPr_xml = (
+            f'<w:numPr {nsdecls("w")}>'
+            f'<w:ilvl w:val="{ilvl}"/><w:numId w:val="{num_id}"/>'
+            f'</w:numPr>'
+        )
+        pPr.insert(0, parse_xml(numPr_xml))
+    _strip_run_direct_formatting(paragraph)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Engine utama
+# ─────────────────────────────────────────────────────────────────────────────
+
+class StyleFinalizerEngine:
+    """
+    Menambahkan style "Judul" & "Pasal" ke dokumen lalu menerapkannya secara
+    otomatis pada heading halaman (Judul) dan Pasal/Subpasal berbahasa
+    Indonesia (Pasal), tanpa mengubah bagian dokumen lainnya.
+    """
+
+    def apply(self, input_docx: str, output_docx: str) -> tuple[bool, str]:
+        try:
+            doc = Document(input_docx)
+
+            # 1) Pastikan style "Judul" & "Pasal" tersedia di styles.xml
+            _ensure_style(doc, 'Judul', _JUDUL_STYLE_XML)
+            _ensure_style(doc, 'Pasal', _PASAL_STYLE_XML)
+
+            paras = doc.paragraphs
+            n = len(paras)
+
+            def style_name(p):
+                return p.style.name if p.style is not None else ''
+
+            # 2) Cari batas bagian Indonesia vs Inggris via "Main Title 1"
+            main_title_idx = [i for i in range(n) if style_name(paras[i]) == 'Main Title 1']
+            if len(main_title_idx) >= 2:
+                id_lo, id_hi = main_title_idx[0], main_title_idx[1]
+            else:
+                id_lo, id_hi = 0, n
+
+            # 3) Cari batas akhir "front matter" (sebelum heading/pasal pertama)
+            first_heading_idx = n
+            for i in range(n):
+                if style_name(paras[i]) in ('Heading 1', 'Heading 2', 'Heading 3', 'Heading 4'):
+                    first_heading_idx = i
+                    break
+
+            # 4) Kumpulkan target paragraf untuk style "Judul"
+            judul_targets = {}  # idx -> force_page_break_before
+
+            # "Daftar Isi" -> kemunculan PERTAMA di seluruh dokumen (judul halaman TOC)
+            for i in range(n):
+                if _norm(paras[i].text) == 'daftar isi':
+                    judul_targets[i] = False
+                    break
+
+            # "Pendahuluan" -> kemunculan TERAKHIR sebelum heading/pasal pertama
+            # (yaitu heading halaman Pendahuluan, bukan entri di daftar isi)
+            cand = [i for i in range(first_heading_idx) if _norm(paras[i].text) == 'pendahuluan']
+            if cand:
+                judul_targets[cand[-1]] = False
+
+            # "Prakata" -> semua kemunculan sebelum heading/pasal pertama
+            for i in range(first_heading_idx):
+                if _norm(paras[i].text) == 'prakata':
+                    judul_targets[i] = False
+
+            # "Bibliografi" -> semua kemunculan SETELAH heading/pasal pertama
+            # (di badan dokumen, bukan entri di daftar isi front-matter)
+            for i in range(first_heading_idx, n):
+                if _norm(paras[i].text) == 'bibliografi':
+                    was_biblio_title = style_name(paras[i]) == 'Biblio Title'
+                    judul_targets[i] = was_biblio_title  # pertahankan page-break-before
+
+            for idx, force_pb in judul_targets.items():
+                _apply_judul(doc, paras[idx], force_page_break_before=force_pb)
+
+            # 5) Kumpulkan target paragraf untuk style "Pasal"
+            #    (hanya Heading 1 & Heading 2, hanya di rentang bahasa Indonesia,
+            #     lewati pasal "Istilah dan Definisi" & turunannya)
+            heading1_num_id = _resolve_num_id(doc, 'Heading1')
+            heading2_num_id = _resolve_num_id(doc, 'Heading2') or heading1_num_id
+
+            pasal_targets = []  # (idx, ilvl, num_id)
+            skip_active = False
+            for i in range(id_lo, id_hi):
+                sname = style_name(paras[i])
+                if sname == 'Heading 1':
+                    skip_active = _norm(paras[i].text) in _SKIP_SECTION_TITLES
+                    if skip_active:
+                        continue
+                    pasal_targets.append((i, 0, heading1_num_id))
+                elif sname == 'Heading 2':
+                    if skip_active:
+                        continue
+                    pasal_targets.append((i, 1, heading2_num_id))
+                # Heading 3+ (sub-subpasal) sengaja tidak disentuh
+
+            for idx, ilvl, num_id in pasal_targets:
+                _apply_pasal(doc, paras[idx], ilvl, num_id)
+
+            doc.save(output_docx)
+
+            msg = (
+                f'OK: {len(judul_targets)} heading -> "Judul", '
+                f'{len(pasal_targets)} pasal/subpasal -> "Pasal".'
+            )
+            return True, msg
+
+        except Exception as e:
+            import traceback
+            return False, f'StyleFinalizerEngine Error: {str(e)}\n{traceback.format_exc()}'
+
+
+def apply_custom_styles(input_docx: str, output_docx: str) -> tuple[bool, str]:
+    """Shortcut fungsi-level untuk StyleFinalizerEngine().apply(...)."""
+    return StyleFinalizerEngine().apply(input_docx, output_docx)
