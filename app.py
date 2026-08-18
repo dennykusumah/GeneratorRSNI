@@ -937,13 +937,12 @@ if st.session_state.get('_run_process') and st.session_state.get('_target_file')
             final_file = cover_out
             update_ui(4, f"[2/5] Cover selesai ✓ — {_title_info}")
 
-        # 3. Engine 5 — Daftar Isi
-        update_ui(5, f"[3/5] Membuat daftar isi dari {_total_para} paragraf...")
-        di_out = f"di_{os.path.basename(final_file)}"
-        ok5 = engine5.insert(input_docx=final_file, output_docx=di_out, doc_title=cover_settings["sni_number"], copyright_text=f"©BSN {cover_settings['bsn_year']}")[0]
-        if ok5:
-            final_file = di_out
-            update_ui(6, f"[3/5] Daftar isi selesai ✓")
+        # 3. Engine 5 — DAFTAR ISI DITUNDA
+        # TOC sengaja TIDAK dibuat di tahap optimasi awal. Engine10 harus
+        # selesai terlebih dahulu agar style final "Judul" dan "Pasal" sudah
+        # terbentuk. Engine5 akan dipanggil kembali sebagai langkah terakhir
+        # setelah Engine10 selesai.
+        update_ui(5, "[3/5] Daftar isi ditunda sampai style final selesai...")
 
         # 4. Engine 6 — Prakata
         ref_std = re.sub(r'^SNI\s+', '', cover_settings["sni_number"]).strip()
@@ -1080,9 +1079,25 @@ if st.session_state.get('_run_process') and st.session_state.get('_target_file')
             if ok10:
                 tr_out = style_out
             else:
-                # Jika gagal, tetap lanjut memakai hasil terjemahan tanpa style custom
-                # supaya proses tidak gagal total hanya karena finishing style.
-                print(f"[Engine10] Gagal menerapkan style Judul/Pasal: {msg10}")
+                # Jika Engine10 gagal, Engine5 TIDAK dijalankan karena TOC
+                # membutuhkan style "Judul" dan "Pasal" dari Engine10.
+                raise Exception(f"Engine10 gagal: {msg10}")
+
+            # 7. Engine 5 — TOC FINAL
+            # PENTING: Engine5 sekarang dijalankan SETELAH Engine10.
+            # Artinya semua style Judul/Pasal, termasuk Lampiran -> Judul,
+            # sudah final sebelum field TOC dibuat.
+            update_ui(99, "[7/7] Membuat Daftar Isi dari style final...")
+            toc_out = f"toc_{os.path.basename(tr_out)}"
+            ok5, msg5 = engine5.insert(
+                input_docx=tr_out,
+                output_docx=toc_out,
+                doc_title=cover_settings["sni_number"],
+                copyright_text=f"©BSN {cover_settings['bsn_year']}"
+            )
+            if not ok5:
+                raise Exception(f"Engine5 (TOC) gagal: {msg5}")
+            tr_out = toc_out
 
             update_ui(100, "✅ Selesai!")
             final_elapsed = get_elapsed_str(start_time)
