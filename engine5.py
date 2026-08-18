@@ -461,7 +461,6 @@ class DaftarIsiEngine:
             files['word/document.xml'] = etree.tostring(
                 tree, xml_declaration=True, encoding='UTF-8', standalone=True
             )
-
             # 11. Tulis output
             with zipfile.ZipFile(output_docx, 'w', zipfile.ZIP_DEFLATED) as zout:
                 for prio in ['[Content_Types].xml', '_rels/.rels']:
