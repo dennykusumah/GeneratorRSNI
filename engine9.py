@@ -13,7 +13,6 @@ FIX v2:
 import re
 import copy
 import time
-import random
 import uuid
 import traceback
 import csv
@@ -58,14 +57,7 @@ _HEADING_STYLES_WITH_NUM = {
     'ANNEX', 'a2', 'a3',
     'Heading4', 'Heading5', 'Heading6',
 }
-# Jeda antar-request ke server translate. Dinaikkan dari 0.15 dan diberi
-# sedikit jitter acak agar pola request tidak terlalu beraturan — mengurangi
-# risiko server translate melakukan rate-limit/menolak (500) yang sebelumnya
-# menyebabkan teks error server ikut tersisip ke dokumen hasil.
-_TRANSLATE_DELAY = 0.35
-
-def _translate_delay() -> float:
-    return _TRANSLATE_DELAY + random.uniform(0, 0.15)
+_TRANSLATE_DELAY = 0.15
 _EM_DASH = '—'
 
 _LINK_PLACEHOLDER_BASE = "https://placeholder-link.local/"
@@ -81,8 +73,8 @@ def _get_next_link_placeholder() -> str:
 # 2 URL SPREADSHEET TERPISAH
 # ─────────────────────────────────────────────────────────────────────────────
 
-KAMUS_SPREADSHEET_URL = "https://docs.google.com/spreadsheets/d/1Q6SNuAxTCL1fffi0O4Rxl-m0UpdZO2bL/edit?usp=sharing"
-ITALIC_SPREADSHEET_URL = "https://docs.google.com/spreadsheets/d/1jjn_KDxUK3AbXfOzdVqYGU1cM4UXCxYm/edit?usp=sharing"
+KAMUS_SPREADSHEET_URL = "https://docs.google.com/spreadsheets/d/1BBPCMPwvbBk5LPdoDQwnjQzcPHv7_RDKENqeMsklF-8/edit?usp=sharing"
+ITALIC_SPREADSHEET_URL = "https://docs.google.com/spreadsheets/d/1NZm1HjsjxmflxnZlzV_O2XF75ZlMUOu8VVofsKfp_FA/edit#gid=0"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -484,98 +476,6 @@ def _extract_source_italic_map(text_runs, para_style_italic: bool) -> tuple[str,
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# PROTEKSI SUPERSCRIPT / SUBSCRIPT DI SUMBER
-# ─────────────────────────────────────────────────────────────────────────────
-# Dokumen ISO sering memakai superscript/subscript untuk notasi satuan atau
-# pangkat (mis. "kWm-2" -> "kWm superscript -2"). Sebelumnya _translate_para
-# menggabungkan semua run menjadi satu string polos sebelum diterjemahkan,
-# sehingga info superscript/subscript per-run ikut hilang (teks hasil
-# terjemahan hanya mewarisi format run pertama). Fungsi di bawah ini
-# mendeteksi run superscript/subscript tsb dan melindunginya dengan
-# mekanisme token yang sama seperti proteksi istilah miring, supaya
-# formatnya bisa dikembalikan persis setelah proses terjemahan selesai.
-
-def _run_vertalign_kind(run):
-    """Return 'sup' jika run superscript, 'sub' jika subscript, selain itu None."""
-    try:
-        if run.font.superscript:
-            return 'sup'
-        if run.font.subscript:
-            return 'sub'
-    except Exception:
-        pass
-    return None
-
-
-def _extract_source_special_map(text_runs, para_style_italic: bool) -> tuple[str, dict, dict]:
-    """
-    Gabungkan run menjadi satu teks dengan proteksi format khusus dari sumber.
-
-    Proteksi:
-      1) Superscript/subscript -> token yang tidak diterjemahkan.
-      2) Italic -> token yang tidak diterjemahkan.
-
-    Untuk superscript/subscript, selain teks dan jenis format, rPr XML ASLI
-    juga disimpan. Dengan demikian saat dipulihkan bukan hanya w:vertAlign
-    yang dipertahankan, tetapi juga font, ukuran, bahasa, bold, italic,
-    karakter spacing, dan properti run lain yang memang ada pada file input.
-    """
-    segments = []  # [text, kind, source_rPr]
-    for _, r in text_runs:
-        va = _run_vertalign_kind(r)
-        if va:
-            kind = va
-        else:
-            kind = 'ital' if _run_effective_italic(r, para_style_italic) else 'normal'
-
-        t = r.text or ''
-        rpr = None
-        if va:
-            rpr_el = r._element.find(f'{_W}rPr')
-            if rpr_el is not None:
-                rpr = copy.deepcopy(rpr_el)
-
-        # Hanya gabungkan run jika jenis formatnya sama.
-        # Untuk vertAlign, jangan menggabungkan dua run dengan rPr berbeda,
-        # karena masing-masing dapat memiliki font/language/size yang berbeda.
-        can_merge = bool(segments and segments[-1][1] == kind)
-        if can_merge and kind in ('sup', 'sub'):
-            prev_rpr = segments[-1][2]
-            if (prev_rpr is None) != (rpr is None):
-                can_merge = False
-            elif prev_rpr is not None and rpr is not None:
-                can_merge = etree.tostring(prev_rpr) == etree.tostring(rpr)
-
-        if can_merge:
-            segments[-1][0] += t
-        else:
-            segments.append([t, kind, rpr])
-
-    italic_map = {}
-    vertalign_map = {}
-    out_parts = []
-
-    for seg_text, kind, rpr in segments:
-        stripped = seg_text.strip()
-
-        if kind in ('sup', 'sub') and stripped:
-            token = f'@@V{"SUP" if kind == "sup" else "SUB"}_{uuid.uuid4().hex[:8].upper()}@@'
-            # (teks asli, rPr asli)
-            vertalign_map[token] = (seg_text, copy.deepcopy(rpr))
-            out_parts.append(token)
-
-        elif kind == 'ital' and len(stripped) >= 3 and not _RE_PURE_NUMBER.fullmatch(stripped):
-            token = f'@@SRC_{uuid.uuid4().hex[:8].upper()}@@'
-            italic_map[token] = seg_text
-            out_parts.append(token)
-
-        else:
-            out_parts.append(seg_text)
-
-    return ''.join(out_parts), italic_map, vertalign_map
-
-
-# ─────────────────────────────────────────────────────────────────────────────
 # LINK HANDLING (FIXED - AMAN, TIDAK MERUSAK XML)
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -636,124 +536,70 @@ def _translate_hyperlinks_in_para(para, tr) -> None:
 # ITALIC FORMATTING
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _apply_mixed_formatting_to_para(para, text: str, italic_terms: list[str],
-                                     font_name: str = None, font_size: int = None,
-                                     vertalign_map: dict | None = None) -> None:
-    """
-    Terapkan formatting: kata di italic_terms jadi MIRING, dan token
-    @@VSUP_xxx@@ / @@VSUB_xxx@@ (proteksi superscript/subscript sumber, jika
-    ada) dikembalikan menjadi teks asli dengan format superscript/subscript
-    -- BUKAN diperlakukan sebagai teks biasa atau ikut diterjemahkan.
-    """
-    # 1) Pecah dulu berdasarkan token superscript/subscript (kalau ada),
-    #    supaya potongan tsb tidak ikut diproses sebagai teks biasa/italic.
-    pieces = []  # list of (segment_text, vertalign_kind or None, source_rPr)
-    if vertalign_map:
-        token_re = re.compile('|'.join(re.escape(tok) for tok in vertalign_map.keys()))
-        last = 0
-        for m in token_re.finditer(text):
-            if m.start() > last:
-                pieces.append((text[last:m.start()], None, None))
-            tok = m.group(0)
-            kind = 'sup' if tok.startswith('@@VSUP_') else 'sub'
-            original_special = vertalign_map[tok]
-            original_text = original_special[0] if isinstance(original_special, tuple) else original_special
-            original_rpr = original_special[1] if isinstance(original_special, tuple) and len(original_special) > 1 else None
-            pieces.append((original_text, kind, original_rpr))
-            last = m.end()
-        if last < len(text):
-            pieces.append((text[last:], None, None))
-    else:
-        pieces.append((text, None, None))
-
-    if not pieces:
-        pieces = [(text, None, None)]
-
+def _apply_mixed_formatting_to_para(para, text: str, italic_terms: list[str], 
+                                     font_name: str = None, font_size: int = None) -> None:
+    """Terapkan formatting: kata di italic_terms jadi MIRING."""
+    if not italic_terms:
+        if para.runs:
+            para.runs[0].text = text
+            for r in para.runs[1:]: r.text = ''
+        else:
+            para.add_run(text)
+        return
+    
+    italic_positions = []
+    for term in italic_terms:
+        start = 0
+        term_lower = term.lower()
+        text_lower = text.lower()
+        while True:
+            idx = text_lower.find(term_lower, start)
+            if idx == -1: break
+            italic_positions.append((idx, idx + len(term)))
+            start = idx + 1
+    
+    italic_positions.sort(key=lambda x: x[0])
+    
+    filtered_positions = []
+    last_end = -1
+    for start, end in italic_positions:
+        if start >= last_end:
+            filtered_positions.append((start, end))
+            last_end = end
+    
+    if not filtered_positions:
+        if para.runs:
+            para.runs[0].text = text
+            for r in para.runs[1:]: r.text = ''
+        else:
+            para.add_run(text)
+        return
+    
+    segments = []
+    last_pos = 0
+    
+    for start, end in filtered_positions:
+        if start > last_pos:
+            segments.append((text[last_pos:start], False))
+        segments.append((text[start:end], True))
+        last_pos = end
+    
+    if last_pos < len(text):
+        segments.append((text[last_pos:], False))
+    
     for run in list(para.runs):
         run._element.getparent().remove(run._element)
-
-    for seg_text, vkind, source_rpr in pieces:
-        if not seg_text:
-            continue
-
-        if vkind:
-            # Bagian superscript/subscript — kembalikan teks asli apa
-            # adanya dengan format superscript/subscript, terpisah dari
-            # proteksi italic (proteksi ini sudah final, tidak dipecah lagi).
-            run = para.add_run(seg_text)
-
-            # Pulihkan rPr ASLI dari file input terlebih dahulu. Ini menjaga
-            # superscript/subscript sekaligus properti run lain yang melekat
-            # pada karakter tersebut.
-            if source_rpr is not None:
-                existing_rpr = run._element.find(f'{_W}rPr')
-                if existing_rpr is not None:
-                    run._element.remove(existing_rpr)
-                run._element.insert(0, copy.deepcopy(source_rpr))
-            else:
-                run.font.name = font_name or 'Arial'
-                if font_size:
-                    run.font.size = Pt(font_size)
-                if vkind == 'sup':
-                    run.font.superscript = True
-                else:
-                    run.font.subscript = True
-            continue
-
-        # Bagian teks biasa: terapkan italic_terms seperti semula.
-        if not italic_terms:
-            run = para.add_run(seg_text)
-            run.font.name = font_name or 'Arial'
-            if font_size:
-                run.font.size = Pt(font_size)
-            continue
-
-        italic_positions = []
-        for term in italic_terms:
-            start = 0
-            term_lower = term.lower()
-            seg_lower = seg_text.lower()
-            while True:
-                idx = seg_lower.find(term_lower, start)
-                if idx == -1: break
-                italic_positions.append((idx, idx + len(term)))
-                start = idx + 1
-
-        italic_positions.sort(key=lambda x: x[0])
-
-        filtered_positions = []
-        last_end = -1
-        for start, end in italic_positions:
-            if start >= last_end:
-                filtered_positions.append((start, end))
-                last_end = end
-
-        if not filtered_positions:
-            run = para.add_run(seg_text)
-            run.font.name = font_name or 'Arial'
-            if font_size:
-                run.font.size = Pt(font_size)
-            continue
-
-        sub_segments = []
-        last_pos = 0
-        for start, end in filtered_positions:
-            if start > last_pos:
-                sub_segments.append((seg_text[last_pos:start], False))
-            sub_segments.append((seg_text[start:end], True))
-            last_pos = end
-        if last_pos < len(seg_text):
-            sub_segments.append((seg_text[last_pos:], False))
-
-        for sub_text, is_italic in sub_segments:
-            if not sub_text:
-                continue
-            run = para.add_run(sub_text)
-            run.font.name = font_name or 'Arial'
-            if font_size:
-                run.font.size = Pt(font_size)
-            if is_italic:
-                run.italic = True
+    
+    for seg_text, is_italic in segments:
+        if not seg_text: continue
+        
+        run = para.add_run(seg_text)
+        run.font.name = font_name or 'Arial'
+        if font_size:
+            run.font.size = Pt(font_size)
+        
+        if is_italic:
+            run.italic = True
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1029,40 +875,7 @@ def _notify(cb, pct: int, msg: str) -> None:
 # TRANSLATOR WRAPPER
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Tanda-tanda hasil "terjemahan" sebenarnya adalah halaman error server
-# (mis. Google Translate rate-limit / down mengembalikan HTML error, dan
-# deep-translator ikut menelan teks error itu tanpa melempar Exception).
-# Jika hasil translate cocok salah satu pola ini, hasil tsb DIBUANG dan
-# dianggap gagal (fallback ke teks asli), bukan dimasukkan ke dokumen.
-_RE_TRANSLATE_ERROR_PAGE = re.compile(
-    r'error\s*5\d{2}|server\s*error|that.?s\s*an\s*error|that.?s\s*all\s*we\s*know|'
-    r'please\s*try\s*again\s*later|<\s*html|<!doctype|<\s*body|internal\s*server\s*error|'
-    r'bad\s*gateway|service\s*unavailable|gateway\s*time-?out',
-    re.IGNORECASE
-)
-
-
-def _is_bad_translation(original: str, result: str) -> bool:
-    """Deteksi hasil translate yang sebenarnya adalah pesan error, bukan terjemahan asli."""
-    if not result or not result.strip():
-        return True
-    if _RE_TRANSLATE_ERROR_PAGE.search(result):
-        return True
-    # Hasil error page umumnya jauh lebih panjang dari teks pendek asal dan
-    # tidak berkaitan sama sekali dengan teks sumber — proteksi tambahan
-    # untuk teks sumber pendek yang tiba-tiba menghasilkan blok teks panjang.
-    if len(original) <= 40 and len(result) > 200:
-        return True
-    return False
-
-
 class _Translator:
-    # Jumlah percobaan translate per potongan teks sebelum menyerah dan
-    # memakai teks asli (mencegah teks error/HTML dari server tersisip ke
-    # dalam dokumen akhir, dan mencegah proses berhenti/crash).
-    _MAX_ATTEMPTS = 4
-    _RETRY_BACKOFF = (0.8, 1.6, 3.0)  # detik, dipakai berurutan antar percobaan
-
     def __init__(self, source: str = 'auto', target: str = 'id', 
                  custom_dict: CustomDictionary | None = None,
                  italic_dict: ItalicDictionary | None = None):
@@ -1071,7 +884,6 @@ class _Translator:
         self._cls = GoogleTranslator
         self.source = source; self.target = target
         self.custom_dict = custom_dict; self.italic_dict = italic_dict
-        self.fail_count = 0  # jumlah potongan teks yang gagal diterjemahkan (fallback ke asli)
 
     def translate_one(self, text: str, italic_map: dict = None) -> tuple[str, list[str]]:
         t = text.strip()
@@ -1080,26 +892,15 @@ class _Translator:
         if self.custom_dict and len(self.custom_dict) > 0:
             t, token_map = self.custom_dict._apply_pre(t)
         final_italic_map = italic_map or {}
-
-        result = None
-        for attempt in range(self._MAX_ATTEMPTS):
+        try:
+            result = self._cls(source=self.source, target=self.target).translate(t)
+            if not result: result = t
+        except Exception:
+            time.sleep(0.8)
             try:
-                candidate = self._cls(source=self.source, target=self.target).translate(t)
-            except Exception:
-                candidate = None
-            if candidate and not _is_bad_translation(t, candidate):
-                result = candidate
-                break
-            if attempt < self._MAX_ATTEMPTS - 1:
-                time.sleep(self._RETRY_BACKOFF[min(attempt, len(self._RETRY_BACKOFF) - 1)])
-
-        if result is None:
-            # Semua percobaan gagal / hanya mengembalikan halaman error —
-            # pertahankan teks asli agar dokumen TIDAK pernah berisi pesan
-            # error server, dan proses tetap lanjut tanpa crash.
-            result = t
-            self.fail_count += 1
-
+                result = self._cls(source=self.source, target=self.target).translate(t)
+                if not result: result = t
+            except Exception: result = t
         if token_map: result = self.custom_dict._apply_post(result, token_map)
         italic_terms_found = []
         if final_italic_map:
@@ -1160,12 +961,10 @@ def _translate_para(para, tr, past_bibliography: bool = False) -> list[str]:
     original_for_case = combined
 
     # Proteksi 1: istilah/judul asing yang SUDAH miring di dokumen sumber
-    # (mis. judul standar acuan pada klausul "Acuan normatif") DAN bagian
-    # yang sudah superscript/subscript di sumber (mis. notasi satuan
-    # "kWm-2"). Bagian-bagian ini tidak diterjemahkan dan formatnya akan
-    # dikembalikan persis (miring / superscript / subscript) di hasil.
+    # (mis. judul standar acuan pada klausul "Acuan normatif"). Bagian ini
+    # tidak diterjemahkan dan akan dicetak miring kembali di hasil.
     para_style_italic = _get_para_style_italic(para)
-    combined_with_src_tokens, italic_map, vertalign_map = _extract_source_special_map(text_runs, para_style_italic)
+    combined_with_src_tokens, italic_map = _extract_source_italic_map(text_runs, para_style_italic)
     combined = combined_with_src_tokens.strip()
 
     # Proteksi 2: kamus istilah asing dari spreadsheet ("Kamus Istilah Asing")
@@ -1175,7 +974,7 @@ def _translate_para(para, tr, past_bibliography: bool = False) -> list[str]:
     
     # Terjemahkan
     translated, italic_terms_found = tr.translate_one(combined, italic_map)
-    time.sleep(_translate_delay())
+    time.sleep(_TRANSLATE_DELAY)
     if not translated or translated == combined: 
         if has_hl:
             _translate_hyperlinks_in_para(para, tr)
@@ -1183,8 +982,8 @@ def _translate_para(para, tr, past_bibliography: bool = False) -> list[str]:
     translated = _match_capitalization(original_for_case, translated)
     
     # Apply formatting ke teks normal
-    if italic_terms_found or vertalign_map:
-        _apply_mixed_formatting_to_para(para, translated, italic_terms_found, font_name, font_size, vertalign_map)
+    if italic_terms_found:
+        _apply_mixed_formatting_to_para(para, translated, italic_terms_found, font_name, font_size)
     else:
         if para.runs:
             para.runs[0].text = translated
@@ -1427,8 +1226,6 @@ class DocxFinalTranslatorEngine:
             summary = f"✅ Done!"
             if italic_count > 0: summary += f" Miring: {italic_count}."
             if link_count > 0: summary += f" Link: {link_count}."
-            if tr.fail_count > 0:
-                summary += f" ⚠️ {tr.fail_count} teks gagal diterjemahkan (server translate bermasalah), teks asli dipertahankan."
             _notify(progress_callback, 100, summary)
             return True, output_docx
 
