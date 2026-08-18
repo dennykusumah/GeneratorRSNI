@@ -292,10 +292,11 @@ def _strip_run_direct_formatting(paragraph):
             continue
         vert = rPr.find(qn('w:vertAlign'))
         if vert is not None:
-            # Buang semua properti langsung lain, sisakan hanya vertAlign
-            for child in list(rPr):
-                if child is not vert:
-                    rPr.remove(child)
+            # PENTING: run superscript/subscript berasal dari file input.
+            # Jangan menyisakan hanya w:vertAlign karena itu akan membuang
+            # font, bahasa, bold/italic, ukuran, character spacing, dll.
+            # Properti run asli harus tetap utuh sampai dokumen final.
+            continue
         else:
             r.remove(rPr)
 
