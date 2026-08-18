@@ -383,6 +383,51 @@ class DocxOptimizerEngine:
                         pass
 
             paragraphs = list(doc.paragraphs)
+
+            # Hapus kalimat pengantar tabel/gambar yang isinya cuma referensi
+            # nomor tabel/gambar (mis. "Table B.1 summarizes the operation
+            # categories." / "Tabel B.1 merangkum kategori operasi.") saat
+            # kalimat itu langsung diikuti oleh judul tabel/gambar dengan
+            # nomor yang SAMA (mis. "Table B.1 — Summary of the operation
+            # categories."). Kalimat ini double dengan judul di bawahnya,
+            # jadi teksnya dikosongkan (bukan paragrafnya yang dihapus,
+            # supaya page-break/format lain yang menempel di paragraf itu
+            # tetap terjaga).
+            re_table_ref_intro = re.compile(
+                r'^(table|tabel|figure|gambar)\s+([A-Za-z0-9]+(?:[.\-][A-Za-z0-9]+)*)\b',
+                re.IGNORECASE
+            )
+            for _idx, _p in enumerate(paragraphs):
+                _txt = _p.text.strip()
+                _m = re_table_ref_intro.match(_txt)
+                if not _m:
+                    continue
+                _ref_no = _m.group(2).lower()
+                # Cari paragraf non-kosong berikutnya
+                _j = _idx + 1
+                while _j < len(paragraphs) and not paragraphs[_j].text.strip():
+                    _j += 1
+                if _j >= len(paragraphs):
+                    continue
+                _nxt = paragraphs[_j]
+                _nxt_txt = _nxt.text.strip()
+                _nxt_m = re_table_ref_intro.match(_nxt_txt)
+                if not _nxt_m or _nxt_m.group(2).lower() != _ref_no:
+                    continue
+                # Paragraf berikutnya memang judul tabel/gambar dgn nomor sama
+                # -> kosongkan teks kalimat pengantar ini, pertahankan run
+                # non-teks (mis. page break) agar layout lain tidak berubah.
+                for _run in list(_p.runs):
+                    _has_break = (
+                        _run._element.find(qn('w:br')) is not None or
+                        _run._element.find(qn('w:cr')) is not None
+                    )
+                    if _has_break:
+                        for _t_el in _run._element.findall(qn('w:t')):
+                            _run._element.remove(_t_el)
+                    else:
+                        _run._element.getparent().remove(_run._element)
+
             tables = list(doc.tables)
 
             # Tambah enter setelah tabel
