@@ -139,9 +139,18 @@ def _build_di_elements(hdr_odd, hdr_even, ftr_odd, ftr_even):
     left = cm_to_twips(3);   right  = cm_to_twips(2)
     pw   = cm_to_twips(21);  ph     = cm_to_twips(29.7)
 
+    # Style penanda "jangan diterjemahkan" — style yang SAMA persis dipakai
+    # engine6 untuk melindungi halaman Prakata/Pendahuluan dari mesin
+    # terjemahan (engine9). Style ini tidak perlu didefinisikan di
+    # styles.xml — engine9 hanya mengecek atribut w:pStyle/@w:val secara
+    # mentah, jadi cukup ditandai di sini agar halaman Daftar Isi DIJAMIN
+    # tidak pernah tersentuh/terisi apapun oleh proses terjemahan.
+    NT = 'BSNNoTranslate'
+
     def title_p():
         return (
             f'<w:p><w:pPr>'
+            f'<w:pStyle w:val="{NT}"/>'
             f'<w:jc w:val="center"/>'
             f'<w:spacing w:before="0" w:after="0"/>'
             f'<w:tabs><w:tab w:val="right" w:leader="dot" w:pos="{TAB}"/></w:tabs>'
@@ -153,6 +162,7 @@ def _build_di_elements(hdr_odd, hdr_even, ftr_odd, ftr_even):
     def empty_p():
         return (
             f'<w:p><w:pPr>'
+            f'<w:pStyle w:val="{NT}"/>'
             f'<w:spacing w:before="0" w:after="0"/>'
             f'</w:pPr></w:p>'
         )
