@@ -509,44 +509,69 @@ def _run_vertalign_kind(run):
 
 def _extract_source_special_map(text_runs, para_style_italic: bool) -> tuple[str, dict, dict]:
     """
-    Gabungkan run menjadi satu teks, dengan proteksi GANDA:
-      1) Superscript/subscript asli -> token @@VSUP_xxx@@ / @@VSUB_xxx@@
-         (dilindungi berapa pun panjangnya, supaya notasi seperti "kWm-2"
-         tidak kehilangan format pangkatnya setelah diterjemahkan).
-      2) Istilah/judul miring di sumber -> token @@SRC_xxx@@ (seperti semula).
-    Kalau sebuah run superscript/subscript sekaligus miring, proteksi
-    superscript/subscript diutamakan (kasus ini jarang terjadi pada dokumen
-    ISO/SNI, dan formatnya tetap dikembalikan verbatim).
-    Return: (teks_dengan_token, italic_token_map, vertalign_token_map)
+    Gabungkan run menjadi satu teks dengan proteksi format khusus dari sumber.
+
+    Proteksi:
+      1) Superscript/subscript -> token yang tidak diterjemahkan.
+      2) Italic -> token yang tidak diterjemahkan.
+
+    Untuk superscript/subscript, selain teks dan jenis format, rPr XML ASLI
+    juga disimpan. Dengan demikian saat dipulihkan bukan hanya w:vertAlign
+    yang dipertahankan, tetapi juga font, ukuran, bahasa, bold, italic,
+    karakter spacing, dan properti run lain yang memang ada pada file input.
     """
-    segments = []  # [text, kind] kind in {'sup','sub','ital','normal'}
+    segments = []  # [text, kind, source_rPr]
     for _, r in text_runs:
         va = _run_vertalign_kind(r)
         if va:
             kind = va
         else:
             kind = 'ital' if _run_effective_italic(r, para_style_italic) else 'normal'
+
         t = r.text or ''
-        if segments and segments[-1][1] == kind:
+        rpr = None
+        if va:
+            rpr_el = r._element.find(f'{_W}rPr')
+            if rpr_el is not None:
+                rpr = copy.deepcopy(rpr_el)
+
+        # Hanya gabungkan run jika jenis formatnya sama.
+        # Untuk vertAlign, jangan menggabungkan dua run dengan rPr berbeda,
+        # karena masing-masing dapat memiliki font/language/size yang berbeda.
+        can_merge = bool(segments and segments[-1][1] == kind)
+        if can_merge and kind in ('sup', 'sub'):
+            prev_rpr = segments[-1][2]
+            if (prev_rpr is None) != (rpr is None):
+                can_merge = False
+            elif prev_rpr is not None and rpr is not None:
+                can_merge = etree.tostring(prev_rpr) == etree.tostring(rpr)
+
+        if can_merge:
             segments[-1][0] += t
         else:
-            segments.append([t, kind])
+            segments.append([t, kind, rpr])
 
     italic_map = {}
     vertalign_map = {}
     out_parts = []
-    for seg_text, kind in segments:
+
+    for seg_text, kind, rpr in segments:
         stripped = seg_text.strip()
+
         if kind in ('sup', 'sub') and stripped:
             token = f'@@V{"SUP" if kind == "sup" else "SUB"}_{uuid.uuid4().hex[:8].upper()}@@'
-            vertalign_map[token] = seg_text
+            # (teks asli, rPr asli)
+            vertalign_map[token] = (seg_text, copy.deepcopy(rpr))
             out_parts.append(token)
+
         elif kind == 'ital' and len(stripped) >= 3 and not _RE_PURE_NUMBER.fullmatch(stripped):
             token = f'@@SRC_{uuid.uuid4().hex[:8].upper()}@@'
             italic_map[token] = seg_text
             out_parts.append(token)
+
         else:
             out_parts.append(seg_text)
+
     return ''.join(out_parts), italic_map, vertalign_map
 
 
@@ -622,29 +647,32 @@ def _apply_mixed_formatting_to_para(para, text: str, italic_terms: list[str],
     """
     # 1) Pecah dulu berdasarkan token superscript/subscript (kalau ada),
     #    supaya potongan tsb tidak ikut diproses sebagai teks biasa/italic.
-    pieces = []  # list of (segment_text, vertalign_kind or None)
+    pieces = []  # list of (segment_text, vertalign_kind or None, source_rPr)
     if vertalign_map:
         token_re = re.compile('|'.join(re.escape(tok) for tok in vertalign_map.keys()))
         last = 0
         for m in token_re.finditer(text):
             if m.start() > last:
-                pieces.append((text[last:m.start()], None))
+                pieces.append((text[last:m.start()], None, None))
             tok = m.group(0)
             kind = 'sup' if tok.startswith('@@VSUP_') else 'sub'
-            pieces.append((vertalign_map[tok], kind))
+            original_special = vertalign_map[tok]
+            original_text = original_special[0] if isinstance(original_special, tuple) else original_special
+            original_rpr = original_special[1] if isinstance(original_special, tuple) and len(original_special) > 1 else None
+            pieces.append((original_text, kind, original_rpr))
             last = m.end()
         if last < len(text):
-            pieces.append((text[last:], None))
+            pieces.append((text[last:], None, None))
     else:
-        pieces.append((text, None))
+        pieces.append((text, None, None))
 
     if not pieces:
-        pieces = [(text, None)]
+        pieces = [(text, None, None)]
 
     for run in list(para.runs):
         run._element.getparent().remove(run._element)
 
-    for seg_text, vkind in pieces:
+    for seg_text, vkind, source_rpr in pieces:
         if not seg_text:
             continue
 
@@ -653,13 +681,23 @@ def _apply_mixed_formatting_to_para(para, text: str, italic_terms: list[str],
             # adanya dengan format superscript/subscript, terpisah dari
             # proteksi italic (proteksi ini sudah final, tidak dipecah lagi).
             run = para.add_run(seg_text)
-            run.font.name = font_name or 'Arial'
-            if font_size:
-                run.font.size = Pt(font_size)
-            if vkind == 'sup':
-                run.font.superscript = True
+
+            # Pulihkan rPr ASLI dari file input terlebih dahulu. Ini menjaga
+            # superscript/subscript sekaligus properti run lain yang melekat
+            # pada karakter tersebut.
+            if source_rpr is not None:
+                existing_rpr = run._element.find(f'{_W}rPr')
+                if existing_rpr is not None:
+                    run._element.remove(existing_rpr)
+                run._element.insert(0, copy.deepcopy(source_rpr))
             else:
-                run.font.subscript = True
+                run.font.name = font_name or 'Arial'
+                if font_size:
+                    run.font.size = Pt(font_size)
+                if vkind == 'sup':
+                    run.font.superscript = True
+                else:
+                    run.font.subscript = True
             continue
 
         # Bagian teks biasa: terapkan italic_terms seperti semula.
