@@ -298,13 +298,26 @@ def _enforce_empty_daftar_isi_page(doc) -> None:
     akhir (sebelum doc.save) di StyleFinalizerEngine.
 
     Cakupan: dari paragraf TEPAT SETELAH judul "Daftar Isi" (kemunculan
-    pertama di seluruh dokumen) sampai SEBELUM paragraf pembatas halaman
-    berikutnya (paragraf yang mengandung <w:sectPr>, termasuk paragraf
-    sectPr itu sendiri dibiarkan apa adanya). Hanya TEKS run yang dihapus
-    (run/paragraf itu sendiri tidak dihapus), supaya format/struktur
-    dokumen (spacing, style, dst.) tidak berubah — halaman tetap kosong
-    persis seperti sebelum judul ditambahkan.
+    pertama di seluruh dokumen), berhenti pada batas TERDEKAT dari:
+      1. paragraf "Prakata" atau "Pendahuluan" (heading halaman
+         berikutnya — PENTING: di pipeline ini, DI + Prakata +
+         Pendahuluan berbagi SATU section/sectPr yang sama, letaknya
+         jauh di akhir Pendahuluan — bukan tepat setelah Daftar Isi.
+         Maka deteksi sectPr SAJA tidak cukup & pernah salah menghapus
+         seluruh isi Prakata/Pendahuluan; heading berikutnya harus jadi
+         batas utama).
+      2. paragraf ber-style Heading (badan dokumen utama sudah mulai).
+      3. paragraf yang memuat <w:sectPr> (akhir section, jaga-jaga bila
+         Prakata/Pendahuluan belum ada sama sekali).
+      4. batas pengaman keras (_MAX_SCAN paragraf) supaya proses TIDAK
+         PERNAH menyapu ke bagian dokumen yang jauh meski 1–3 gagal
+         terdeteksi.
+    Hanya TEKS run yang dihapus (run/paragraf itu sendiri tidak
+    dihapus), supaya format/struktur dokumen tidak berubah.
     """
+    _MAX_SCAN = 8   # lebih dari cukup: DI hanya berisi judul + 3 paragraf kosong
+    _BOUNDARY_TITLES = {'prakata', 'pendahuluan'}
+
     paras = doc.paragraphs
     di_idx = None
     for i, p in enumerate(paras):
@@ -314,7 +327,19 @@ def _enforce_empty_daftar_isi_page(doc) -> None:
     if di_idx is None:
         return
 
+    scanned = 0
     for p in paras[di_idx + 1:]:
+        if scanned >= _MAX_SCAN:
+            break
+        scanned += 1
+
+        norm_text = _norm(p.text)
+        if norm_text in _BOUNDARY_TITLES:
+            break
+        style_name = (p.style.name or '') if p.style is not None else ''
+        if style_name.lower().startswith('heading'):
+            break
+
         pPr = p._p.find(qn('w:pPr'))
         has_sectpr = pPr is not None and pPr.find(qn('w:sectPr')) is not None
         for run in p.runs:
