@@ -220,10 +220,15 @@ def _build_di_elements(hdr_odd, hdr_even, ftr_odd, ftr_even):
         )
         return (
             f'<w:p><w:pPr><w:pStyle w:val="TOC1"/></w:pPr>'
+            # Field TOC dibuat sebagai field Word murni. JANGAN menaruh
+            # kalimat placeholder/cached result di antara separate-end,
+            # karena Word dapat mempertahankannya sebagai hasil TOC lama.
+            # Setelah dibuka, w:updateFields=true + w:dirty=true akan
+            # memaksa Word menghitung ulang entri, dot leader, hyperlink,
+            # dan nomor halaman.
             f'<w:r>{rpr}<w:fldChar w:fldCharType="begin" w:dirty="true"/></w:r>'
             f'<w:r>{rpr}<w:instrText xml:space="preserve"> {_TOC_FIELD_INSTR} </w:instrText></w:r>'
             f'<w:r>{rpr}<w:fldChar w:fldCharType="separate"/></w:r>'
-            f'<w:r>{rpr}<w:t xml:space="preserve">{_esc(_TOC_PLACEHOLDER)}</w:t></w:r>'
             f'<w:r>{rpr}<w:fldChar w:fldCharType="end"/></w:r>'
             f'</w:p>'
         )
@@ -326,23 +331,48 @@ def _ensure_toc_styles(files: dict) -> None:
 
 
 def _ensure_update_fields(files: dict) -> None:
-    """Set <w:updateFields w:val="true"/> supaya field TOC otomatis
-    ter-update (isi + nomor halaman) begitu dokumen dibuka di Word."""
+    """Paksa Word melakukan refresh field saat dokumen dibuka.
+
+    Penting: jangan hanya menambahkan <w:updateFields>. Dokumen sumber
+    kadang sudah memiliki elemen tersebut dengan nilai false. Pada kondisi
+    itu kode lama melakukan ``return`` sehingga TOC hasil akhir tetap
+    memakai cached result lama. Di sini nilainya SELALU dipaksa true dan
+    flag yang melarang update field dihapus.
+    """
     key = 'word/settings.xml'
     if key not in files:
         return
+
     settings_xml = files[key].decode('utf-8')
-    if '<w:updateFields' in settings_xml:
-        return
-    m = re.search(r'<w:settings[^>]*>', settings_xml)
-    if not m:
-        return
-    insert_at = m.end()
-    settings_xml = (
-        settings_xml[:insert_at]
-        + '<w:updateFields w:val="true"/>'
-        + settings_xml[insert_at:]
+
+    # Jangan biarkan setting ini menghalangi refresh field.
+    settings_xml = re.sub(
+        r'<w:doNotUpdateFields\b[^>]*/>',
+        '',
+        settings_xml,
+        flags=re.DOTALL,
     )
+
+    # Jika updateFields sudah ada, ganti seluruh elemennya menjadi true.
+    settings_xml, n = re.subn(
+        r'<w:updateFields\b[^>]*/>',
+        '<w:updateFields w:val="true"/>',
+        settings_xml,
+        count=1,
+        flags=re.DOTALL,
+    )
+
+    # Jika belum ada, sisipkan tepat setelah <w:settings>.
+    if n == 0:
+        m = re.search(r'<w:settings\b[^>]*>', settings_xml)
+        if m:
+            insert_at = m.end()
+            settings_xml = (
+                settings_xml[:insert_at]
+                + '<w:updateFields w:val="true"/>'
+                + settings_xml[insert_at:]
+            )
+
     files[key] = settings_xml.encode('utf-8')
 
 
