@@ -278,6 +278,18 @@ def _apply_pasal(doc, paragraph, ilvl, num_id):
 # Engine utama
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _enforce_italic_terms(doc, terms: list[str]) -> None:
+    """Jaring pengaman terakhir: paksa run yang teksnya PERSIS sama dengan
+    salah satu `terms` (mis. "Red Green Blue") agar SELALU tampil italic,
+    apa pun yang terjadi di tahap-tahap sebelumnya (terjemahan, dsb).
+    Dijalankan paling akhir (sebelum doc.save) di StyleFinalizerEngine
+    supaya jadi jaminan final. Tidak mengubah run/paragraf lain."""
+    for para in doc.paragraphs:
+        for run in para.runs:
+            if run.text in terms:
+                run.font.italic = True
+
+
 class StyleFinalizerEngine:
     """
     Menambahkan style "Judul" & "Pasal" ke dokumen lalu menerapkannya secara
@@ -383,6 +395,11 @@ class StyleFinalizerEngine:
 
             for idx, ilvl, num_id in pasal_targets:
                 _apply_pasal(doc, paras[idx], ilvl, num_id)
+
+            # 6) Jaring pengaman terakhir: pastikan "Red Green Blue" pada
+            #    Prakata SELALU tercetak italic, sebagai jaminan final
+            #    sebelum dokumen disimpan.
+            _enforce_italic_terms(doc, ['Red Green Blue'])
 
             doc.save(output_docx)
 
