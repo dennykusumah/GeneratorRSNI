@@ -632,7 +632,7 @@ class StyleFinalizerEngine:
                     # dan bagian Inggris tidak berubah menjadi C/D hanya karena
                     # bagian Indonesia sudah memiliki Annex A/B yang sama.
                     m_annex = re.search(
-                        r'\b(?:Lampiran|Annex)\s+([A-Z])\b',
+                        r'\b(?:Lampiran|Annex)\s+([A-Z])(?:\b|\s|$)',
                         paras[i].text.strip(),
                         flags=re.IGNORECASE
                     )
@@ -646,14 +646,14 @@ class StyleFinalizerEngine:
                     # Untuk Annex Bahasa Inggris, subpasal a2/a3 tetap diberi
                     # nomor berdasarkan huruf Annex-nya, tetapi Heading 1/2
                     # bahasa Inggris tidak disentuh.
-                    if sname == 'a2' and annex_a2_num_id and annex_letter:
+                    if sname.lower() == 'a2' and annex_letter:
                         annex_sub_counter += 1
                         annex_sub2_counter = 0
                         pasal_targets.append(
                             (i, annex_a2_ilvl, annex_a2_num_id,
                              f'{annex_letter}.{annex_sub_counter}')
                         )
-                    elif sname == 'a3' and annex_a3_num_id and annex_letter:
+                    elif sname.lower() == 'a3' and annex_letter:
                         annex_sub2_counter += 1
                         pasal_targets.append(
                             (i, annex_a3_ilvl, annex_a3_num_id,
@@ -670,14 +670,14 @@ class StyleFinalizerEngine:
                         continue
                     h2_counter += 1
                     pasal_targets.append((i, 1, heading2_num_id, f'{h1_counter}.{h2_counter}'))
-                elif sname == 'a2' and annex_a2_num_id and annex_letter:
+                elif sname.lower() == 'a2' and annex_letter:
                     annex_sub_counter += 1
                     annex_sub2_counter = 0
                     pasal_targets.append(
                         (i, annex_a2_ilvl, annex_a2_num_id,
                          f'{annex_letter}.{annex_sub_counter}')
                     )
-                elif sname == 'a3' and annex_a3_num_id and annex_letter:
+                elif sname.lower() == 'a3' and annex_letter:
                     annex_sub2_counter += 1
                     pasal_targets.append(
                         (i, annex_a3_ilvl, annex_a3_num_id,
