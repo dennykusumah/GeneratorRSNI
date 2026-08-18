@@ -91,6 +91,74 @@ def _norm(text: str) -> str:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Generator nomor Pasal/Subpasal
+# ─────────────────────────────────────────────────────────────────────────────
+# Dokumen sumber (hasil convert dari template ISO) menomori Pasal/Subpasal
+# HANYA lewat auto-numbering Word (numId terhubung ke style Heading1/Heading2/
+# a2/a3 di numbering.xml) — angka itu TIDAK pernah tersimpan sebagai teks
+# literal di XML, hanya dihitung/ditampilkan oleh aplikasi Word saat dibuka.
+# python-docx (dan proses translate berbasis teks di Engine9) sama sekali
+# tidak melihat angka tsb. Karena numbering Word DIMATIKAN secara eksplisit
+# di _apply_pasal (numId=0, supaya tidak dobel dengan render Word lain),
+# nomor Pasal/Subpasal HARUS dibangkitkan & ditulis sebagai teks literal di
+# sini, mengikuti urutan kemunculan heading yang sama persis dengan yang
+# akan dihasilkan Word dari auto-numbering aslinya:
+#   - Setiap "Heading 1" -> nomor Pasal urut (1, 2, 3, ...), reset counter
+#     Subpasal ("Heading 2") setiap kali masuk Pasal baru.
+#   - Setiap "Heading 2" (Subpasal, non-skip) -> "<no Pasal induk>.<urut>"
+#     (mis. 4.1, 4.2, ...).
+#   - Setiap heading "ANNEX" (Lampiran) -> menaikkan huruf Lampiran
+#     (A, B, C, ...), reset counter subpasal Lampiran ('a2'/'a3').
+#   - Setiap "a2" (subpasal Lampiran, level 1) -> "<huruf>.<urut>" (mis.
+#     A.1, A.2, ...), reset counter 'a3'.
+#   - Setiap "a3" (sub-subpasal Lampiran, level 2) -> "<huruf>.<urut a2>.
+#     <urut a3>" (mis. A.1.1, A.1.2, ...).
+_RE_LEADING_NUMBER = re.compile(r'^\s*[A-Za-z]?\d+(?:\.\d+)*\.?\s+')
+
+
+def _strip_existing_leading_number(paragraph) -> None:
+    """Buang prefix angka/no. Pasal yang MUNGKIN sudah ada sebagai teks
+    literal di run pertama paragraf (mis. jika dokumen sumber kebetulan
+    sudah punya nomor manual, atau proses ini dijalankan dua kali),
+    supaya nomor baru yang dibangkitkan _insert_number_run() tidak
+    dobel/duplikat (mis. "1    1    Ruang lingkup")."""
+    runs = paragraph.runs
+    if not runs:
+        return
+    first = runs[0]
+    text = first.text or ''
+    m = _RE_LEADING_NUMBER.match(text)
+    if not m:
+        return
+    remainder = text[m.end():]
+    if remainder:
+        first.text = remainder
+    else:
+        # Run pertama isinya cuma nomor -> hapus run itu supaya tidak
+        # menyisakan run kosong di depan.
+        r_el = first._element
+        parent = r_el.getparent()
+        if parent is not None:
+            parent.remove(r_el)
+
+
+def _insert_number_run(paragraph, number_text: str) -> None:
+    """Sisipkan run baru berisi '<number_text>    ' (nomor + 4 spasi,
+    mengikuti format asli SNI/ISO: "1    Ruang lingkup", "4.1    Umum",
+    dst.) sebagai run PALING AWAL di paragraf (persis setelah pPr &
+    bookmark, sebelum teks judul Pasal)."""
+    p_el = paragraph._p
+    r = OxmlElement('w:r')
+    t = OxmlElement('w:t')
+    t.set(qn('xml:space'), 'preserve')
+    t.text = f'{number_text}    '
+    r.append(t)
+    pPr = p_el.find(qn('w:pPr'))
+    insert_pos = list(p_el).index(pPr) + 1 if pPr is not None else 0
+    p_el.insert(insert_pos, r)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Style XML — "Judul" & "Pasal"
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -256,22 +324,31 @@ def _apply_judul(doc, paragraph, force_page_break_before=False):
     _strip_run_direct_formatting(paragraph)
 
 
-def _apply_pasal(doc, paragraph, ilvl, num_id):
+def _apply_pasal(doc, paragraph, ilvl, num_id, number_text=None):
     _set_pstyle(paragraph, 'Pasal')
     pPr = _clear_paragraph_direct_formatting(
         paragraph, ['w:jc', 'w:spacing', 'w:ind', 'w:numPr']
     )
     # Nonaktifkan bullet/numbering Word (numId=0) secara eksplisit per-paragraf.
     # Nomor Pasal/Subpasal TIDAK lagi dibangkitkan oleh Word auto-numbering —
-    # nomor yang tampil murni mengikuti teks literal apa adanya dari dokumen
-    # yang diupload user (ilvl/num_id asal tetap dihitung di caller hanya untuk
-    # menentukan target paragraf, bukan lagi untuk diterapkan sebagai numbering).
+    # sebagai gantinya, nomor yang BENAR (dihitung oleh _collect_pasal_targets
+    # berdasarkan urutan & level heading, lihat komentar di atas
+    # _RE_LEADING_NUMBER) dituliskan di sini sebagai teks literal, PERSIS
+    # meniru hasil auto-numbering Word yang asli (mis. "1", "4.2", "A.1").
     numPr_xml = (
         f'<w:numPr {nsdecls("w")}>'
         f'<w:ilvl w:val="0"/><w:numId w:val="0"/>'
         f'</w:numPr>'
     )
     pPr.insert(0, parse_xml(numPr_xml))
+
+    if number_text:
+        # Buang dulu nomor lama (jika ada, mis. sudah literal di sumber atau
+        # sisa dari proses sebelumnya) supaya tidak dobel, baru sisipkan
+        # nomor final yang benar di depan judul Pasal.
+        _strip_existing_leading_number(paragraph)
+        _insert_number_run(paragraph, number_text)
+
     _strip_run_direct_formatting(paragraph)
 
 
@@ -519,26 +596,49 @@ class StyleFinalizerEngine:
             annex_a2_ilvl = _resolve_style_ilvl(doc, 'a2')
             annex_a3_ilvl = _resolve_style_ilvl(doc, 'a3')
 
-            pasal_targets = []  # (idx, ilvl, num_id)
+            pasal_targets = []  # (idx, ilvl, num_id, number_text)
             skip_active = False
+            # Counter untuk membangkitkan nomor Pasal/Subpasal (lihat
+            # penjelasan lengkap di komentar atas _RE_LEADING_NUMBER).
+            h1_counter = 0          # nomor Pasal (Heading 1) berjalan
+            h2_counter = 0          # nomor Subpasal (Heading 2), reset tiap Pasal baru
+            annex_counter = 0       # huruf Lampiran: 0->belum ada, 1->A, 2->B, ...
+            annex_sub_counter = 0   # nomor 'a2' (mis. A.1, A.2, ...), reset tiap Lampiran baru
+            annex_sub2_counter = 0  # nomor 'a3' (mis. A.1.1, ...), reset tiap 'a2' baru
             for i in range(id_lo, id_hi):
                 sname = style_name(paras[i])
+                if sname == 'ANNEX':
+                    # Judul Lampiran sendiri TIDAK disentuh (tetap style asli),
+                    # tapi menandai mulainya huruf Lampiran baru untuk
+                    # subpasal 'a2'/'a3' di bawahnya.
+                    annex_counter += 1
+                    annex_sub_counter = 0
+                    annex_sub2_counter = 0
+                    continue
                 if sname == 'Heading 1':
                     skip_active = _norm(paras[i].text) in _SKIP_SUBSECTION_TITLES
-                    pasal_targets.append((i, 0, heading1_num_id))
+                    h1_counter += 1
+                    h2_counter = 0
+                    pasal_targets.append((i, 0, heading1_num_id, str(h1_counter)))
                 elif sname == 'Heading 2':
                     if skip_active:
                         continue
-                    pasal_targets.append((i, 1, heading2_num_id))
+                    h2_counter += 1
+                    pasal_targets.append((i, 1, heading2_num_id, f'{h1_counter}.{h2_counter}'))
                 elif sname == 'a2' and annex_a2_num_id:
-                    pasal_targets.append((i, annex_a2_ilvl, annex_a2_num_id))
+                    annex_sub_counter += 1
+                    annex_sub2_counter = 0
+                    letter = chr(ord('A') + max(annex_counter - 1, 0))
+                    pasal_targets.append((i, annex_a2_ilvl, annex_a2_num_id, f'{letter}.{annex_sub_counter}'))
                 elif sname == 'a3' and annex_a3_num_id:
-                    pasal_targets.append((i, annex_a3_ilvl, annex_a3_num_id))
+                    annex_sub2_counter += 1
+                    letter = chr(ord('A') + max(annex_counter - 1, 0))
+                    pasal_targets.append((i, annex_a3_ilvl, annex_a3_num_id, f'{letter}.{annex_sub_counter}.{annex_sub2_counter}'))
                 # Heading 3+ (sub-subpasal) sengaja tidak disentuh
                 # Judul Lampiran sendiri (style "ANNEX") sengaja tidak disentuh
 
-            for idx, ilvl, num_id in pasal_targets:
-                _apply_pasal(doc, paras[idx], ilvl, num_id)
+            for idx, ilvl, num_id, number_text in pasal_targets:
+                _apply_pasal(doc, paras[idx], ilvl, num_id, number_text)
 
             # 6) Jaring pengaman terakhir: pastikan "Red Green Blue" pada
             #    Prakata SELALU tercetak italic, & halaman "Daftar Isi"
