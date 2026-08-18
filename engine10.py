@@ -62,9 +62,10 @@ Deteksi batas bahasa Indonesia vs Inggris:
 """
 
 import re
+import copy
 from docx import Document
 from docx.oxml.ns import qn
-from docx.oxml import parse_xml
+from docx.oxml import parse_xml, OxmlElement
 from docx.oxml.ns import nsdecls
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -278,16 +279,101 @@ def _apply_pasal(doc, paragraph, ilvl, num_id):
 # Engine utama
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _split_run_and_italicize(run, term: str) -> bool:
+    """Pecah SATU run yang teksnya mengandung `term` di tengah/tepi teks lain
+    (bukan hanya sama persis) menjadi hingga 3 run: [sebelum][term][sesudah],
+    dengan run [term] dipaksa italic, sedangkan run sebelum/sesudah TETAP
+    memakai formatting asli run tsb (font, bold, size, dst — hanya teksnya
+    yang dipotong, tidak ada properti lain yang berubah).
+
+    Dirancang seaman mungkin: hanya menangani run dengan struktur sederhana
+    (satu elemen <w:t> per run, kasus normal untuk teks paragraf biasa).
+    Jika run punya struktur lain yang tidak terduga (mis. tab/break/drawing
+    di dalamnya), fungsi ini TIDAK melakukan apa-apa (aman, tidak mengubah
+    apa pun) — dikembalikan False supaya caller tahu belum tertangani.
+
+    Return True jika berhasil memecah & meng-italic-kan (atau run memang
+    sudah persis == term, tinggal di-italic-kan langsung tanpa split).
+    """
+    text = run.text
+    if not text or term not in text:
+        return False
+
+    r_el = run._element
+    t_els = r_el.findall(qn('w:t'))
+    # Hanya tangani run dengan tepat satu <w:t> (kasus umum). Run dengan
+    # elemen lain (tab, br, drawing, dst.) atau >1 <w:t> dilewati demi
+    # keamanan struktur dokumen.
+    other_children = [c for c in r_el if c.tag != qn('w:rPr') and c.tag != qn('w:t')]
+    if len(t_els) != 1 or other_children:
+        return False
+
+    if text == term:
+        run.font.italic = True
+        return True
+
+    idx = text.find(term)
+    if idx == -1:
+        return False
+    before, after = text[:idx], text[idx + len(term):]
+
+    parent = r_el.getparent()
+    if parent is None:
+        return False
+    pos = list(parent).index(r_el)
+
+    def _make_run(piece_text, force_italic):
+        new_r = copy.deepcopy(r_el)
+        new_t = new_r.find(qn('w:t'))
+        new_t.text = piece_text
+        new_t.set(qn('xml:space'), 'preserve')
+        if force_italic:
+            rPr = new_r.find(qn('w:rPr'))
+            if rPr is None:
+                rPr = OxmlElement('w:rPr')
+                new_r.insert(0, rPr)
+            if rPr.find(qn('w:i')) is None:
+                rPr.append(OxmlElement('w:i'))
+        return new_r
+
+    new_runs = []
+    if before:
+        new_runs.append(_make_run(before, force_italic=False))
+    new_runs.append(_make_run(term, force_italic=True))
+    if after:
+        new_runs.append(_make_run(after, force_italic=False))
+
+    for offset, nr in enumerate(new_runs):
+        parent.insert(pos + offset, nr)
+    parent.remove(r_el)
+    return True
+
+
 def _enforce_italic_terms(doc, terms: list[str]) -> None:
-    """Jaring pengaman terakhir: paksa run yang teksnya PERSIS sama dengan
-    salah satu `terms` (mis. "Red Green Blue") agar SELALU tampil italic,
-    apa pun yang terjadi di tahap-tahap sebelumnya (terjemahan, dsb).
-    Dijalankan paling akhir (sebelum doc.save) di StyleFinalizerEngine
-    supaya jadi jaminan final. Tidak mengubah run/paragraf lain."""
+    """Jaring pengaman terakhir: paksa teks yang PERSIS sama dengan salah
+    satu `terms` (mis. "Red Green Blue") agar SELALU tampil italic, apa pun
+    yang terjadi di tahap-tahap sebelumnya (terjemahan, dsb). Dijalankan
+    paling akhir (sebelum doc.save) di StyleFinalizerEngine supaya jadi
+    jaminan final.
+
+    Menangani DUA kasus:
+      1. Run yang teksnya PERSIS == term -> langsung di-italic-kan (cepat,
+         seperti semula).
+      2. Term muncul sebagai BAGIAN dari run yang lebih besar (mis. hasil
+         penggabungan run oleh proses lain) -> run tsb dipecah supaya
+         hanya bagian term-nya yang italic, sisanya tetap memakai
+         formatting asli tanpa berubah.
+    Tidak mengubah paragraf/run lain yang tidak mengandung salah satu term.
+    """
     for para in doc.paragraphs:
-        for run in para.runs:
-            if run.text in terms:
-                run.font.italic = True
+        for run in list(para.runs):
+            text = run.text
+            if not text:
+                continue
+            for term in terms:
+                if term in text:
+                    _split_run_and_italicize(run, term)
+                    break
 
 
 def _enforce_empty_daftar_isi_page(doc) -> None:
