@@ -582,9 +582,21 @@ class StyleFinalizerEngine:
             # tetap muncul di TOC sebagai level 1, sekaligus tampil dengan
             # format Judul (Arial 12 pt, bold, center) seperti F.docx.
             # Teks Lampiran TIDAK diubah.
-            for i in range(n):
-                if style_name(paras[i]) == 'ANNEX':
-                    judul_targets[i] = False
+            # force_page_break_before=True -> SETIAP Lampiran/Annex (ID
+            # maupun EN) WAJIB dimulai di halaman baru. Ini dijamin oleh
+            # kode (properti w:pageBreakBefore pada paragraf heading-nya
+            # sendiri), TIDAK bergantung pada apakah dokumen sumber sudah
+            # punya page break manual sebelum Annex atau belum.
+            # Simpan indeks paragraf ANNEX asli SEBELUM style-nya diubah
+            # menjadi "Judul" di bawah. Step 5 (penomoran Pasal Lampiran,
+            # mis. B.1, B.2, ...) butuh tahu paragraf mana yang merupakan
+            # batas Lampiran baru — kalau dicek SESUDAH mutasi, style-nya
+            # sudah jadi "Judul" untuk SEMUA Lampiran sehingga batas antar
+            # Lampiran (mis. A -> B -> C) tidak lagi terdeteksi dan seluruh
+            # subpasal akan salah dianggap masih milik Lampiran pertama.
+            annex_indices = set(i for i in range(n) if style_name(paras[i]) == 'ANNEX')
+            for i in annex_indices:
+                judul_targets[i] = True
 
             for idx, force_pb in judul_targets.items():
                 _apply_judul(doc, paras[idx], force_page_break_before=force_pb)
@@ -620,10 +632,12 @@ class StyleFinalizerEngine:
             annex_sub2_counter = 0  # nomor 'a3' (mis. A.1.1, ...), reset tiap 'a2' baru
             for i in range(id_lo, id_hi):
                 sname = style_name(paras[i])
-                if sname == 'ANNEX':
-                    # Judul Lampiran sendiri TIDAK disentuh (tetap style asli),
-                    # tapi menandai mulainya huruf Lampiran baru untuk
-                    # subpasal 'a2'/'a3' di bawahnya.
+                if i in annex_indices:
+                    # Paragraf ini adalah judul Lampiran (style aslinya
+                    # "ANNEX", sudah diubah jadi "Judul" di atas — makanya
+                    # dicek lewat annex_indices, bukan sname). Menandai
+                    # mulainya huruf Lampiran baru untuk subpasal 'a2'/'a3'
+                    # di bawahnya.
                     annex_counter += 1
                     annex_sub_counter = 0
                     annex_sub2_counter = 0
