@@ -1,48 +1,15 @@
 """
-Engine5: DaftarIsiEngine (v7 - Daftar Isi = replika PERSIS field TOC F.docx)
-=============================================================================
-Engine untuk menyisipkan halaman "Daftar Isi" sesuai standar BSN/SNI.
+Engine5: DaftarIsiEngine (v3 - Auto Heading Extraction)
+=========================================================
+Engine untuk membuat halaman Daftar Isi sesuai standar BSN/SNI.
 
-v7 (field TOC & style "TOC1" dipelajari & disamakan PERSIS dengan F.docx,
-menggantikan pendekatan v6 yang formatnya masih berbeda dari F.docx):
-  - Halaman Daftar Isi berisi judul "Daftar Isi" (rata tengah, bold, style
-    "Judul"), diikuti field TOC ASLI Word:
-        { TOC \\h \\z \\t "Judul;1;Pasal;1" }
-    Field ini disisipkan dalam bentuk "belum di-update" (persis seperti saat
-    pengguna melakukan Insert > Table of Contents secara manual di Word) —
-    satu paragraf berisi begin/instrText/separate/teks-placeholder/end.
-    Karena <w:updateFields w:val="true"/> sudah diset di settings.xml
-    (lihat _ensure_update_fields), Word otomatis meng-update SEMUA field
-    ketika dokumen dibuka — termasuk field TOC ini — sehingga daftar isi
-    langsung terisi rapi (entri + dot leader + nomor halaman + hyperlink)
-    begitu file dibuka, tanpa perlu pengguna menekan F9 secara manual.
-  - PEMISAH TITIK KOMA (;), bukan koma (,), pada switch \\t — dipelajari
-    langsung dari field TOC di F.docx. Pemisah daftar pada switch field
-    Word mengikuti Regional Settings Windows si pengguna; di locale
-    Indonesia (id-ID) pemisahnya titik koma, sama seperti di F.docx. Field
-    yang salah pemisah bisa gagal menghasilkan entri ("Error! No table of
-    contents entries found.") — inilah salah satu sumber "error" yang
-    ingin dihindari.
-  - Style paragraf "TOC1" (dipakai tiap entri field di atas) SEKARANG
-    disalin field-demi-field dari definisi "toc 1" asli di F.docx (lihat
-    komentar lengkap di _ensure_toc_styles): TIDAK bold, TIDAK ada
-    indentasi tambahan (hanging/right indent), tab kiri di 720 twips +
-    tab kanan dot-leader di batas kanan area konten — persis F.docx.
-    Sebelumnya (v6) style ini masih bold & pakai hanging-indent ala
-    "Modify Style manual", sehingga tampilannya BEDA dari F.docx.
-  - Field mengacu ke style "Judul" dan "Pasal" — SEMUA level 1
-    (flat, tanpa indentasi bertingkat), sesuai style yang diterapkan
-    Engine10 (StyleFinalizerEngine) pada judul halaman (Daftar Isi/Prakata/
-    Pendahuluan/Bibliografi), Pasal/Subpasal berbahasa Indonesia, dan
-    Lampiran (ANNEX) — persis pola yang terlihat di F.docx: "1  Ruang
-    lingkup", "4.1  Umum", "Lampiran A (informatif) ..." semuanya tampil
-    sebagai entri Daftar Isi.
-  - Engine10 TIDAK LAGI memaksa halaman ini tetap kosong (lihat perubahan
-    terkait pada engine10.py — fungsi _enforce_empty_daftar_isi_page tidak
-    lagi dipanggil) supaya field TOC yang disisipkan di sini tidak dihapus
-    isinya di tahap akhir pipeline.
-  - Bagian lain (header/footer, page size/margin, romawi nomor halaman,
-    posisi penyisipan setelah halaman Hak Cipta) TIDAK diubah.
+v3 (Auto):
+  - Isi Daftar Isi diambil OTOMATIS dari heading dokumen (logika identik engine2).
+  - Heading numbered (1, 2, 3...) → level 0 (no indent)
+  - Sub-heading (1.1, 1.2...) → level 1 (indent 360 twips)
+  - Sub-sub-heading (1.1.1...) → level 2 (indent 720 twips)
+  - Special heading (Bibliografi, Lampiran, Annex, dll) → level 0
+  - Fixed header selalu ada di atas: Kata Pendahuluan, Daftar Isi, Pendahuluan
 """
 
 import re
@@ -137,138 +104,147 @@ def _build_footer(copyright_text, pw, lm, rm):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# DAFTAR ISI BUILDER
-# Field TOC asli Word — mengacu ke style "Judul" (judul halaman: Daftar Isi/
-# Prakata/Pendahuluan/Bibliografi), "Pasal" (Pasal & Subpasal berbahasa
-# Indonesia) dan "ANNEX" (judul Lampiran), SEMUA didaftarkan sebagai level 1
-# supaya tampilannya flat (tanpa indentasi bertingkat) — sama seperti pada
-# dokumen referensi (mis. F.docx).
-#
-# PENTING — pemisah SEMICOLON (;), BUKAN koma (,):
-# Dipelajari langsung dari field TOC asli di F.docx (" TOC \h \z \t
-# "Base_Heading;1;ANNEX;1;ANNEX Head;1;Biblio Title;1;Judul;1;Pasal;1" ") —
-# daftar style pada switch \t dipisahkan titik koma. Ini BUKAN kebetulan:
-# pemisah daftar (list separator) untuk switch field Word mengikuti
-# pengaturan Regional Windows si pengguna, dan pada locale Indonesia
-# (id-ID) — sama seperti locale Eropa lain — pemisahnya adalah TITIK KOMA,
-# bukan koma. Field yang ditulis dengan koma bisa gagal di-parse / gagal
-# menghasilkan entri apa pun ("Error! No table of contents entries
-# found.") pada mesin Word dengan Regional Settings Indonesia. Memakai
-# titik koma (sama seperti F.docx) menghindari masalah ini.
+# HEADING EXTRACTOR (logika identik engine2)
+# Returns list of (display_text, indent_level)
+#   indent_level 0 = no indent (main chapter / special)
+#   indent_level 1 = sub-chapter (1.1, 1.2, ...)
+#   indent_level 2 = sub-sub-chapter (1.1.1, ...)
 # ─────────────────────────────────────────────────────────────────────────────
-_TOC_FIELD_INSTR = 'TOC \\h \\z \\t "Judul;1;Pasal;1"'
-_TOC_PLACEHOLDER = (
-    'Klik kanan pada teks ini lalu pilih "Update Field" '
-    '(atau tekan Ctrl+A kemudian F9) untuk menampilkan Daftar Isi.'
-)
+def extract_headings_from_docx(docx_path: str) -> list:
+    """
+    Membaca dokumen dan mengekstrak heading bernomor untuk Daftar Isi,
+    PERSIS seperti Word auto-TOC:
 
+    Strategi (prioritas):
+      1. Jika dokumen punya Heading style (Heading 1/2/3...) → gunakan style,
+         auto-nomori berdasarkan urutan (1, 1.1, 1.1.1, dst.)
+      2. Jika tidak ada Heading style → cari paragraf bold dengan teks
+         yang sudah bernomor (hasil engine2): "1    Ruang Lingkup", dst.
 
-def _build_di_content_elements():
-    """Isi halaman Daftar Isi tanpa membuat section baru.
-    Dipakai saat dokumen upload SUDAH memiliki halaman Daftar Isi:
-    section break/header/footer asli dipertahankan, hanya isi TOC yang
-    diganti. Engine10 kemudian mengganti field placeholder ini dengan
-    entri TOC final."""
-    NT = 'BSNNoTranslate'
-    title = (
-        f'<w:p><w:pPr><w:pStyle w:val="{NT}"/>'
-        f'<w:jc w:val="center"/><w:spacing w:before="0" w:after="0"/></w:pPr>'
-        f'{_run("Daftar Isi", bold=True, size_pt=12, italic=False)}</w:p>'
+    Returns:
+        list of (display_text: str, level: int)
+    """
+    try:
+        from docx import Document
+        doc = Document(docx_path)
+    except Exception:
+        return []
+
+    paragraphs = list(doc.paragraphs)
+    re_numbered = re.compile(r'^(\d[\d\.]*)\.?\s+(\S.*)')
+
+    # ── Cek apakah dokumen menggunakan Heading style ──────────────────
+    has_heading_styles = any(
+        p.style and p.style.name.startswith('Heading ')
+        for p in paragraphs
     )
-    empty = (
-        f'<w:p><w:pPr><w:pStyle w:val="{NT}"/>'
-        f'<w:spacing w:before="0" w:after="0"/></w:pPr></w:p>'
-    )
-    sz = pt_to_hpts(11)
-    rpr = (
-        f'<w:rPr><w:rFonts w:ascii="Arial" w:hAnsi="Arial" w:cs="Arial"/>'
-        f'<w:sz w:val="{sz}"/><w:szCs w:val="{sz}"/></w:rPr>'
-    )
-    toc = (
-        f'<w:p><w:pPr><w:pStyle w:val="TOC1"/></w:pPr>'
-        f'<w:r>{rpr}<w:fldChar w:fldCharType="begin" w:dirty="true"/></w:r>'
-        f'<w:r>{rpr}<w:instrText xml:space="preserve"> {_TOC_FIELD_INSTR} </w:instrText></w:r>'
-        f'<w:r>{rpr}<w:fldChar w:fldCharType="separate"/></w:r>'
-        f'<w:r>{rpr}<w:t xml:space="preserve">{_esc(_TOC_PLACEHOLDER)}</w:t></w:r>'
-        f'<w:r>{rpr}<w:fldChar w:fldCharType="end"/></w:r></w:p>'
-    )
-    return [title, empty, empty, toc]
 
+    headings = []
 
-def _find_existing_daftar_isi(body):
-    """Kembalikan indeks paragraf Daftar Isi yang paling awal, jika ada."""
-    for i, el in enumerate(list(body)):
-        if el.tag != f'{{{NS_W}}}p':
-            continue
-        txt = ''.join(el.itertext()).strip()
-        if txt.lower() == 'daftar isi':
-            return i
-    return None
+    if has_heading_styles:
+        # ── STRATEGI 1: Dari Heading style (seperti Word auto-TOC) ─────
+        # Auto-number sesuai urutan per level
+        counters = {}
 
+        for p in paragraphs:
+            txt = p.text.strip()
+            if not txt:
+                continue
+            style = p.style.name if p.style else ''
+            if not style.startswith('Heading '):
+                continue
 
-def _replace_existing_daftar_isi(body, start_idx):
-    """Hapus isi TOC lama sampai sebelum Prakata/section boundary lalu
-    sisipkan placeholder TOC baru. Section break yang sudah ada dibiarkan."""
-    children = list(body)
-    end_idx = len(children)
-    for j in range(start_idx + 1, len(children)):
-        el = children[j]
-        if el.tag == f'{{{NS_W}}}p':
-            txt = ''.join(el.itertext()).strip().lower()
-            if txt == 'prakata':
-                end_idx = j
-                break
-            pPr = el.find(f'{{{NS_W}}}pPr')
-            if pPr is not None and pPr.find(f'{{{NS_W}}}sectPr') is not None:
-                end_idx = j
-                break
+            try:
+                h_level = int(style.split()[-1]) - 1  # Heading 1→0, Heading 2→1, dst.
+            except (ValueError, IndexError):
+                continue
 
-    # Hapus semua child di antara judul Daftar Isi dan batas akhir TOC.
-    # Judulnya sendiri juga dihapus agar formatnya seragam dengan F.docx.
-    for el in children[start_idx:end_idx]:
-        body.remove(el)
+            level_num = h_level + 1  # 1-based untuk counter
+            counters[level_num] = counters.get(level_num, 0) + 1
+            # Reset semua sub-level di bawahnya
+            for k in list(counters.keys()):
+                if k > level_num:
+                    counters[k] = 0
 
-    new_nodes = _parse_elements(_build_di_content_elements())
-    insert_pos = start_idx
-    for off, el in enumerate(new_nodes):
-        body.insert(insert_pos + off, el)
+            # Bangun string nomor: "1", "1.1", "1.1.1", dll.
+            num_parts = [str(counters.get(i, 1)) for i in range(1, level_num + 1)]
+            num_str = '.'.join(num_parts)
 
-    return True
+            display = f'{num_str}    {txt}'
+            headings.append((display, h_level))
 
+    else:
+        # ── STRATEGI 2: Dari teks bernomor bold (output engine2) ───────
+        re_list_item = re.compile(
+            r'^(?:[a-z]\)|[a-z]\.|[A-Z]\)|[A-Z]\.\|'
+            r'\([a-z]\)|\([0-9]+\)|[ivxlcdm]+\.|[IVXLCDM]+\.)\s+',
+            re.IGNORECASE
+        )
+        re_note = re.compile(r'^(note|catatan)\b', re.IGNORECASE)
 
-def _build_di_elements(hdr_odd, hdr_even, ftr_odd, ftr_even):
+        title_processed = False
+
+        for p in paragraphs:
+            txt = p.text.strip()
+            if not txt:
+                continue
+
+            is_bold = any(r.bold for r in p.runs)
+            if not is_bold and p.style:
+                try:
+                    if p.style.font and p.style.font.bold:
+                        is_bold = True
+                except Exception:
+                    pass
+
+            match_number = re_numbered.match(txt)
+
+            if not title_processed:
+                if not match_number:
+                    title_processed = True
+                continue
+
+            title_processed = True
+
+            if not match_number:
+                continue
+            if bool(re_list_item.match(txt)):
+                continue
+            if bool(re_note.match(txt)):
+                continue
+            if any(r.font.size and r.font.size.pt == 10 for r in p.runs):
+                continue
+
+            num_part   = match_number.group(1).rstrip('.')
+            title_part = match_number.group(2).strip()
+            dot_count  = num_part.count('.')
+
+            display = f'{num_part}    {title_part}'
+            headings.append((display, dot_count))
+
+    return headings
+
+# ─────────────────────────────────────────────────────────────────────────────
+# DAFTAR ISI BUILDER
+# ─────────────────────────────────────────────────────────────────────────────
+# Indent twips per level
+LEVEL_INDENT = {0: 0, 1: 360, 2: 720}
+
+def _build_di_elements(hdr_odd, hdr_even, ftr_odd, ftr_even, heading_entries=None):
     """
     Return list of raw XML strings untuk paragraf DI + inline sectPr.
 
-    Halaman Daftar Isi berisi judul "Daftar Isi" (rata tengah, bold),
-    2 paragraf kosong (spasi), lalu SATU paragraf berisi field TOC asli
-    Word (belum di-update — begin/instrText/separate/placeholder/end
-    semuanya dalam satu paragraf, persis seperti hasil Insert > Table of
-    Contents manual di Word). Field ini otomatis ter-update & terisi penuh
-    (entri + dot leader + nomor halaman + hyperlink) begitu dokumen dibuka
-    di Word, karena <w:updateFields w:val="true"/> sudah diset di
-    settings.xml (lihat _ensure_update_fields).
+    heading_entries: list of (text, level) dari extract_headings_from_docx().
+                     Jika None → gunakan fallback statis.
     """
+    TAB  = 9061
     top  = cm_to_twips(3);   bottom = cm_to_twips(2)
     left = cm_to_twips(3);   right  = cm_to_twips(2)
     pw   = cm_to_twips(21);  ph     = cm_to_twips(29.7)
-    # Posisi tab kanan (dot leader) = lebar area konten (page width dikurangi
-    # margin kiri & kanan), persis prinsip yang dipakai F.docx (tab kanan
-    # diposisikan tepat di margin kanan area teks).
-    TAB  = pw - left - right
-
-    # Style penanda "jangan diterjemahkan" — style yang SAMA persis dipakai
-    # engine6 untuk melindungi halaman Prakata/Pendahuluan dari mesin
-    # terjemahan (engine9). Style ini tidak perlu didefinisikan di
-    # styles.xml — engine9 hanya mengecek atribut w:pStyle/@w:val secara
-    # mentah, jadi cukup ditandai di sini agar halaman Daftar Isi DIJAMIN
-    # tidak pernah tersentuh/terisi apapun oleh proses terjemahan.
-    NT = 'BSNNoTranslate'
 
     def title_p():
         return (
             f'<w:p><w:pPr>'
-            f'<w:pStyle w:val="{NT}"/>'
             f'<w:jc w:val="center"/>'
             f'<w:spacing w:before="0" w:after="0"/>'
             f'<w:tabs><w:tab w:val="right" w:leader="dot" w:pos="{TAB}"/></w:tabs>'
@@ -280,24 +256,28 @@ def _build_di_elements(hdr_odd, hdr_even, ftr_odd, ftr_even):
     def empty_p():
         return (
             f'<w:p><w:pPr>'
-            f'<w:pStyle w:val="{NT}"/>'
             f'<w:spacing w:before="0" w:after="0"/>'
             f'</w:pPr></w:p>'
         )
 
-    def toc_field_p():
+    def entry_p(text, level=0):
+        indent_val = LEVEL_INDENT.get(level, 0)
+        ind = f'<w:ind w:left="{indent_val}"/>' if indent_val else ''
         sz  = pt_to_hpts(11)
-        rpr = (
-            f'<w:rPr><w:rFonts w:ascii="Arial" w:hAnsi="Arial" w:cs="Arial"/>'
-            f'<w:sz w:val="{sz}"/><w:szCs w:val="{sz}"/></w:rPr>'
-        )
+        run = (
+            f'<w:r><w:rPr>'
+            f'<w:rFonts w:ascii="Arial" w:hAnsi="Arial" w:cs="Arial"/>'
+            f'<w:b/><w:sz w:val="{sz}"/><w:szCs w:val="{sz}"/>'
+            f'</w:rPr><w:t xml:space="preserve">{_esc(text)}</w:t></w:r>'
+        ) if text else ''
         return (
-            f'<w:p><w:pPr><w:pStyle w:val="TOC1"/></w:pPr>'
-            f'<w:r>{rpr}<w:fldChar w:fldCharType="begin" w:dirty="true"/></w:r>'
-            f'<w:r>{rpr}<w:instrText xml:space="preserve"> {_TOC_FIELD_INSTR} </w:instrText></w:r>'
-            f'<w:r>{rpr}<w:fldChar w:fldCharType="separate"/></w:r>'
-            f'<w:r>{rpr}<w:t xml:space="preserve">{_esc(_TOC_PLACEHOLDER)}</w:t></w:r>'
-            f'<w:r>{rpr}<w:fldChar w:fldCharType="end"/></w:r>'
+            f'<w:p><w:pPr>'
+            f'<w:jc w:val="left"/>'
+            f'<w:spacing w:before="0" w:after="120"/>'
+            f'<w:tabs><w:tab w:val="right" w:leader="dot" w:pos="{TAB}"/></w:tabs>'
+            f'{ind}'
+            f'</w:pPr>'
+            f'{run}<w:r><w:tab/></w:r>'
             f'</w:p>'
         )
 
@@ -317,106 +297,33 @@ def _build_di_elements(hdr_odd, hdr_even, ftr_odd, ftr_even):
             f'</w:sectPr></w:pPr></w:p>'
         )
 
+    # ── Fallback statis jika tidak ada heading yang diekstrak ──
+    if not heading_entries:
+        heading_entries = [
+            ('1    Ruang Lingkup', 0),
+            ('2    Acuan Normatif', 0),
+            ('3    Istilah dan Definisi', 0),
+            ('4    ...', 0),
+            ('5    ...', 0),
+            ('Lampiran A (informatif)', 0),
+            ('Bibliografi', 0),
+        ]
+
+    # ── Header tetap ──
+    fixed_top = [
+        ('Kata Pendahuluan', 0),
+        ('Daftar Isi', 0),
+        ('Pendahuluan', 0),
+    ]
+
+    all_entries = fixed_top + heading_entries
+
     xmls = (
-        [title_p(), empty_p(), empty_p(), toc_field_p()]
+        [title_p(), empty_p(), empty_p(), empty_p()]
+        + [entry_p(text, level) for text, level in all_entries]
         + [sect_p()]
     )
     return xmls
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# STYLE "TOC1" — dipelajari & disalin PERSIS dari definisi style "toc 1" di
-# F.docx (word/styles.xml), supaya hasil tampilan Daftar Isi identik:
-#
-#   <w:style w:type="paragraph" w:styleId="TOC1">
-#     <w:name w:val="toc 1"/><w:basedOn w:val="Normal"/><w:next w:val="Normal"/>
-#     <w:uiPriority w:val="39"/>
-#     <w:pPr>
-#       <w:tabs>
-#         <w:tab w:val="left" w:pos="720"/>
-#         <w:tab w:val="right" w:leader="dot" w:pos="<lebar area konten>"/>
-#       </w:tabs>
-#       <w:suppressAutoHyphens/>
-#       <w:spacing w:after="120" w:line="240" w:lineRule="auto"/>
-#     </w:pPr>
-#     <w:rPr><w:rFonts w:ascii="Arial" w:hAnsi="Arial"/><w:sz w:val="22"/></w:rPr>
-#   </w:style>
-#
-# Catatan penting (beda dari versi sebelumnya, sekarang diperbaiki):
-#   - TIDAK bold (F.docx TIDAK menebalkan entri Daftar Isi — hanya judul
-#     halaman "Daftar Isi" yang bold, itu style "Judul", bukan "TOC1").
-#   - TIDAK ada w:ind (hanging/right indent) — F.docx murni memakai dua
-#     tab stop (kiri 720 twips & kanan dot-leader), tanpa indentasi
-#     tambahan apa pun.
-#   - TIDAK ada w:jc override — mengikuti default (inherit dari Normal).
-#   - Posisi tab kanan (dot leader) DIHITUNG dinamis dari lebar area
-#     konten dokumen ini (page width - margin kiri - margin kanan),
-#     mengikuti prinsip yang sama dengan F.docx (tab kanan pas di margin
-#     kanan area teks) — bukan angka mentah hasil copy dari F.docx, karena
-#     margin dokumen ini berbeda dari F.docx.
-#   - w:styleId TETAP "TOC1" (dipakai field TOC & referensi lain di file
-#     ini) meski w:name aslinya "toc 1" (huruf kecil, sesuai F.docx).
-#
-# Hanya SATU level dipakai (Judul, Pasal & ANNEX sama-sama TOC level 1),
-# jadi hanya style "TOC1" yang diperlukan.
-# ─────────────────────────────────────────────────────────────────────────────
-def _ensure_toc_styles(files: dict) -> None:
-    key = 'word/styles.xml'
-    if key not in files:
-        return
-    styles_xml = files[key].decode('utf-8')
-
-    pw   = cm_to_twips(21)
-    left = cm_to_twips(3)
-    right = cm_to_twips(2)
-    TAB  = pw - left - right   # posisi tab kanan (dot leader) = lebar konten
-
-    toc1_xml = (
-        f'<w:style w:type="paragraph" w:styleId="TOC1">'
-        f'<w:name w:val="toc 1"/><w:basedOn w:val="Normal"/><w:next w:val="Normal"/>'
-        f'<w:uiPriority w:val="39"/>'
-        f'<w:pPr>'
-        f'<w:tabs>'
-        f'<w:tab w:val="left" w:pos="720"/>'
-        f'<w:tab w:val="right" w:leader="dot" w:pos="{TAB}"/>'
-        f'</w:tabs>'
-        f'<w:suppressAutoHyphens/>'
-        f'<w:spacing w:after="120" w:line="240" w:lineRule="auto"/>'
-        f'</w:pPr>'
-        f'<w:rPr><w:rFonts w:ascii="Arial" w:hAnsi="Arial" w:cs="Arial"/>'
-        f'<w:sz w:val="22"/><w:szCs w:val="22"/></w:rPr>'
-        f'</w:style>'
-    )
-
-    # Buang definisi TOC1/TOC2 lama (jika ada dari hasil generate sebelumnya)
-    # supaya selalu memakai spesifikasi terbaru, lalu sisipkan TOC1 yang baru.
-    styles_xml = re.sub(
-        r'<w:style\b[^>]*w:styleId="TOC[12]"[^>]*>.*?</w:style>',
-        '', styles_xml, flags=re.DOTALL
-    )
-    styles_xml = styles_xml.replace('</w:styles>', toc1_xml + '</w:styles>')
-    files[key] = styles_xml.encode('utf-8')
-
-
-def _ensure_update_fields(files: dict) -> None:
-    """Set <w:updateFields w:val="true"/> supaya field TOC otomatis
-    ter-update (isi + nomor halaman) begitu dokumen dibuka di Word."""
-    key = 'word/settings.xml'
-    if key not in files:
-        return
-    settings_xml = files[key].decode('utf-8')
-    if '<w:updateFields' in settings_xml:
-        return
-    m = re.search(r'<w:settings[^>]*>', settings_xml)
-    if not m:
-        return
-    insert_at = m.end()
-    settings_xml = (
-        settings_xml[:insert_at]
-        + '<w:updateFields w:val="true"/>'
-        + settings_xml[insert_at:]
-    )
-    files[key] = settings_xml.encode('utf-8')
 
 
 def _parse_elements(xml_list):
@@ -451,8 +358,7 @@ def _find_nth_section_paragraph_index(body, n=2):
 class DaftarIsiEngine:
     """
     Engine untuk menyisipkan halaman Daftar Isi setelah halaman Hak Cipta (page 2).
-    Halaman berisi judul "Daftar Isi" dan placeholder TOC. Isi TOC lama pada file upload
-    diganti, lalu Engine10 membangun entri final agar tampil seperti F.docx.
+    Isi Daftar Isi diambil OTOMATIS dari heading dokumen (sama dengan logika engine2).
     Penomoran: Romawi (i, ii, iii, ...).
     """
 
@@ -460,13 +366,12 @@ class DaftarIsiEngine:
                doc_title: str = 'SNI ISO XXXXX:20XX',
                copyright_text: str = '©BSN 20XX') -> tuple[bool, str]:
         try:
-            # 1. Baca input
+            # 1. Ekstrak heading dari input docx
+            heading_entries = extract_headings_from_docx(input_docx)
+
+            # 2. Baca input
             with zipfile.ZipFile(input_docx, 'r') as z:
                 files = {n: z.read(n) for n in z.namelist()}
-
-            # 1b. Pastikan style "TOC 1"/"TOC 2" ada & field auto-update saat dibuka
-            _ensure_toc_styles(files)
-            _ensure_update_fields(files)
 
             # 3. Hitung rId dan file number berikutnya
             rels_xml = files['word/_rels/document.xml.rels'].decode('utf-8')
@@ -517,28 +422,24 @@ class DaftarIsiEngine:
             tree = etree.fromstring(files['word/document.xml'])
             body = tree.find(f'{{{NS_W}}}body')
 
-            # 8. Jika file upload SUDAH memiliki Daftar Isi, JANGAN
-            # menambah halaman kedua. Ganti isi Daftar Isi eksisting.
-            existing_di = _find_existing_daftar_isi(body)
-            if existing_di is not None:
-                _replace_existing_daftar_isi(body, existing_di)
-            else:
-                # Tidak ada Daftar Isi pada file upload -> buat halaman baru
-                # setelah section Hak Cipta seperti perilaku sebelumnya.
-                hakcip_idx, found = _find_nth_section_paragraph_index(body, n=2)
-                if found < 2:
-                    hakcip_idx, _ = _find_nth_section_paragraph_index(body, n=1)
+            # 8. Cari posisi insert (setelah sectPr ke-2 / Hak Cipta)
+            hakcip_idx, found = _find_nth_section_paragraph_index(body, n=2)
+            if found < 2:
+                hakcip_idx, _ = _find_nth_section_paragraph_index(body, n=1)
 
-                insert_pos = hakcip_idx + 1
-                di_xmls = _build_di_elements(rid_ho, rid_he, rid_fo, rid_fe)
-                di_els  = _parse_elements(di_xmls)
-                for offset, el in enumerate(di_els):
-                    body.insert(insert_pos + offset, el)
+            insert_pos = hakcip_idx + 1
 
-            # 9. Serialisasi
+            # 9. Build & insert DI elements (dengan heading otomatis)
+            di_xmls = _build_di_elements(rid_ho, rid_he, rid_fo, rid_fe, heading_entries)
+            di_els  = _parse_elements(di_xmls)
+            for offset, el in enumerate(di_els):
+                body.insert(insert_pos + offset, el)
+
+            # 10. Serialisasi
             files['word/document.xml'] = etree.tostring(
                 tree, xml_declaration=True, encoding='UTF-8', standalone=True
             )
+
             # 11. Tulis output
             with zipfile.ZipFile(output_docx, 'w', zipfile.ZIP_DEFLATED) as zout:
                 for prio in ['[Content_Types].xml', '_rels/.rels']:
