@@ -1,22 +1,34 @@
 """
-Engine5: DaftarIsiEngine (v5 - Halaman Daftar Isi kosong)
-=========================================================
+Engine5: DaftarIsiEngine (v6 - Daftar Isi otomatis, mengikuti field TOC asli Word)
+===================================================================================
 Engine untuk menyisipkan halaman "Daftar Isi" sesuai standar BSN/SNI.
 
-v5 (halaman kosong, tanpa field/teks apapun di bawah judul):
-  - Halaman Daftar Isi HANYA berisi judul "Daftar Isi" (rata tengah, bold).
-    TIDAK ADA lagi field TOC Word maupun teks statis apapun di bawahnya —
-    persis seperti halaman Pendahuluan yang juga hanya berisi judulnya saja.
-  - Sebelumnya (v4) halaman ini berisi field TOC asli Word
-    ({ TOC \\t "Judul,1,Pasal,1" \\h \\z }) yang otomatis ter-update saat
-    dokumen dibuka (karena <w:updateFields w:val="true"/> di settings.xml),
-    sehingga field itu langsung terisi teks hasil hitung Word begitu file
-    dibuka/disimpan — halaman jadi TIDAK pernah benar-benar kosong. Field
-    itu SUDAH DIHAPUS SEPENUHNYA dari elemen yang disisipkan; halaman kini
-    dijamin kosong walau dokumen dibuka & field lain di-update.
-  - Style paragraf "TOC 1" tetap ditambahkan ke styles.xml (tidak dipakai
-    paragraf manapun lagi, tapi dibiarkan ada / tidak dihapus dari
-    styles.xml supaya bagian lain tidak berubah).
+v6 (halaman berisi field TOC asli Word, terisi otomatis & rapi seperti
+contoh referensi F.docx):
+  - Halaman Daftar Isi berisi judul "Daftar Isi" (rata tengah, bold),
+    diikuti field TOC ASLI Word ({ TOC \\h \\z \\t "Judul,1,Pasal,1,ANNEX,1" }).
+    Field ini disisipkan dalam bentuk "belum di-update" (persis seperti saat
+    pengguna melakukan Insert > Table of Contents secara manual di Word) —
+    satu paragraf berisi begin/instrText/separate/teks-placeholder/end.
+  - Karena <w:updateFields w:val="true"/> sudah diset di settings.xml
+    (lihat _ensure_update_fields), Word otomatis meng-update SEMUA field
+    ketika dokumen dibuka — termasuk field TOC ini — sehingga daftar isi
+    langsung terisi rapi (entri + dot leader + nomor halaman + hyperlink)
+    begitu file dibuka, tanpa perlu pengguna menekan F9 secara manual.
+  - Field mengacu ke style "Judul", "Pasal", dan "ANNEX" — SEMUA level 1
+    (flat, tanpa indentasi bertingkat), sesuai style yang diterapkan
+    Engine10 (StyleFinalizerEngine) pada judul halaman (Daftar Isi/Prakata/
+    Pendahuluan/Bibliografi), Pasal/Subpasal berbahasa Indonesia, dan
+    Lampiran (ANNEX) — persis pola yang terlihat pada dokumen referensi
+    (mis. F.docx): "1  Ruang lingkup", "4.1  Umum", "Lampiran A
+    (informatif) ..." semuanya tampil sebagai entri Daftar Isi.
+  - Engine10 TIDAK LAGI memaksa halaman ini tetap kosong (lihat perubahan
+    terkait pada engine10.py — fungsi _enforce_empty_daftar_isi_page tidak
+    lagi dipanggil) supaya field TOC yang disisipkan di sini tidak dihapus
+    isinya di tahap akhir pipeline.
+  - Style paragraf "TOC 1" (dipakai field di atas) tetap didefinisikan di
+    styles.xml sesuai spesifikasi Modify Style manual (Arial 11 Bold,
+    tab kanan dengan dot leader, hanging indent).
   - Bagian lain (header/footer, page size/margin, romawi nomor halaman,
     posisi penyisipan setelah halaman Hak Cipta) TIDAK diubah.
 """
@@ -114,11 +126,13 @@ def _build_footer(copyright_text, pw, lm, rm):
 
 # ─────────────────────────────────────────────────────────────────────────────
 # DAFTAR ISI BUILDER
-# Konstanta & fungsi toc_field_p() di bawah ini TIDAK LAGI dipanggil (lihat
-# xmls di _build_di_elements) — sengaja dibiarkan ada (tidak dihapus) sebagai
-# referensi, TIDAK berpengaruh apapun ke dokumen hasil karena tidak dipakai.
+# Field TOC asli Word — mengacu ke style "Judul" (judul halaman: Daftar Isi/
+# Prakata/Pendahuluan/Bibliografi), "Pasal" (Pasal & Subpasal berbahasa
+# Indonesia) dan "ANNEX" (judul Lampiran), SEMUA didaftarkan sebagai level 1
+# supaya tampilannya flat (tanpa indentasi bertingkat) — sama seperti pada
+# dokumen referensi (mis. F.docx).
 # ─────────────────────────────────────────────────────────────────────────────
-_TOC_FIELD_INSTR = 'TOC \\t "Judul,1,Pasal,1" \\h \\z'
+_TOC_FIELD_INSTR = 'TOC \\h \\z \\t "Judul,1,Pasal,1,ANNEX,1"'
 _TOC_PLACEHOLDER = (
     'Klik kanan pada teks ini lalu pilih "Update Field" '
     '(atau tekan Ctrl+A kemudian F9) untuk menampilkan Daftar Isi.'
@@ -129,10 +143,14 @@ def _build_di_elements(hdr_odd, hdr_even, ftr_odd, ftr_even):
     """
     Return list of raw XML strings untuk paragraf DI + inline sectPr.
 
-    Halaman Daftar Isi HANYA berisi judul "Daftar Isi" (rata tengah, bold)
-    diikuti 3 paragraf kosong — TIDAK ADA field TOC atau teks apapun lagi
-    di bawahnya, supaya halaman ini dijamin kosong (sama seperti halaman
-    Pendahuluan) walaupun dokumen dibuka & field lain di-update di Word.
+    Halaman Daftar Isi berisi judul "Daftar Isi" (rata tengah, bold),
+    2 paragraf kosong (spasi), lalu SATU paragraf berisi field TOC asli
+    Word (belum di-update — begin/instrText/separate/placeholder/end
+    semuanya dalam satu paragraf, persis seperti hasil Insert > Table of
+    Contents manual di Word). Field ini otomatis ter-update & terisi penuh
+    (entri + dot leader + nomor halaman + hyperlink) begitu dokumen dibuka
+    di Word, karena <w:updateFields w:val="true"/> sudah diset di
+    settings.xml (lihat _ensure_update_fields).
     """
     TAB  = 9061
     top  = cm_to_twips(3);   bottom = cm_to_twips(2)
@@ -200,7 +218,7 @@ def _build_di_elements(hdr_odd, hdr_even, ftr_odd, ftr_even):
         )
 
     xmls = (
-        [title_p(), empty_p(), empty_p(), empty_p()]
+        [title_p(), empty_p(), empty_p(), toc_field_p()]
         + [sect_p()]
     )
     return xmls
