@@ -156,14 +156,43 @@ def _build_footer(copyright_text, pw, lm, rm):
 # found.") pada mesin Word dengan Regional Settings Indonesia. Memakai
 # titik koma (sama seperti F.docx) menghindari masalah ini.
 # ─────────────────────────────────────────────────────────────────────────────
-_TOC_FIELD_INSTR = 'TOC \\h \\z \\t "Judul;1;Pasal;1"'
 _TOC_PLACEHOLDER = (
     'Klik kanan pada teks ini lalu pilih "Update Field" '
     '(atau tekan Ctrl+A kemudian F9) untuk menampilkan Daftar Isi.'
 )
 
+# ─────────────────────────────────────────────────────────────────────────────
+# BOOKMARK PEMBATAS CAKUPAN FIELD TOC (switch \b)
+# ─────────────────────────────────────────────────────────────────────────────
+# Paragraf judul halaman "Daftar Isi" TETAP diberi style "Judul" oleh
+# Engine10 (sama seperti Prakata/Pendahuluan/Bibliografi), supaya formatnya
+# konsisten (Arial 12pt bold center). Masalahnya, field TOC di bawah
+# mengambil SEMUA paragraf berstyle "Judul" sebagai entri — kalau tidak
+# dibatasi, judul "Daftar Isi" akan ikut terdaftar sebagai entri di dalam
+# daftar isinya sendiri (menaut ke halaman dirinya sendiri).
+#
+# Solusinya BUKAN mengganti style paragraf itu, melainkan membatasi
+# JANGKAUAN field TOC memakai switch resmi Word "\b <bookmark>": field hanya
+# akan men-scan heading di DALAM rentang bookmark tsb. Bookmark
+# "GenRSNI_ToCScope" dipasang mulai TEPAT SETELAH paragraf judul "Daftar
+# Isi" (lihat _build_di_elements -> bookmark_start_p()) sampai akhir body
+# dokumen (lihat DaftarIsiEngine.insert -> _insert_bookmark_end_at_body_end).
+# Dengan begitu paragraf judul "Daftar Isi" sendiri berada DI LUAR rentang
+# yang di-scan field, walau stylenya tetap identik dengan entri Judul yang
+# lain.
+_TOC_BOOKMARK_NAME = 'GenRSNI_ToCScope'
+_TOC_FIELD_INSTR = f'TOC \\h \\z \\t "Judul;1;Pasal;1" \\b {_TOC_BOOKMARK_NAME}'
 
-def _build_di_elements(hdr_odd, hdr_even, ftr_odd, ftr_even):
+
+def _bookmark_start_xml(bmk_id: int, name: str) -> str:
+    return f'<w:bookmarkStart w:id="{bmk_id}" w:name="{name}"/>'
+
+
+def _bookmark_end_xml(bmk_id: int) -> str:
+    return f'<w:bookmarkEnd w:id="{bmk_id}"/>'
+
+
+def _build_di_elements(hdr_odd, hdr_even, ftr_odd, ftr_even, bmk_id):
     """
     Return list of raw XML strings untuk paragraf DI + inline sectPr.
 
@@ -245,7 +274,11 @@ def _build_di_elements(hdr_odd, hdr_even, ftr_odd, ftr_even):
         )
 
     xmls = (
-        [title_p(), empty_p(), empty_p(), toc_field_p()]
+        # bookmark start dipasang TEPAT SETELAH judul "Daftar Isi" (di luar
+        # rentang bookmark = tidak ikut ter-scan field TOC, meski stylenya
+        # tetap "Judul" sama seperti entri Judul lainnya).
+        [title_p(), _bookmark_start_xml(bmk_id, _TOC_BOOKMARK_NAME),
+         empty_p(), empty_p(), toc_field_p()]
         + [sect_p()]
     )
     return xmls
@@ -359,6 +392,51 @@ def _parse_elements(xml_list):
     return elements
 
 
+def _next_bookmark_id(document_xml: str) -> int:
+    """Cari w:id bookmark terbesar yang sudah dipakai di dokumen supaya
+    bookmark baru ("GenRSNI_ToCScope") tidak bentrok id dengan bookmark
+    lain (mis. cross-reference bawaan Word) yang mungkin sudah ada di
+    dokumen sumber."""
+    ids = [int(m) for m in re.findall(r'<w:bookmarkStart\b[^>]*w:id="(\d+)"', document_xml)]
+    return (max(ids) + 1) if ids else 1
+
+
+def _strip_existing_toc_scope_bookmark(document_xml: str) -> str:
+    """Buang bookmark "GenRSNI_ToCScope" lama (jika dokumen ini pernah
+    diproses pipeline sebelumnya) supaya tidak ada nama bookmark dobel,
+    yang bisa membuat Word menolak/membingungkan field TOC."""
+    m = re.search(
+        r'<w:bookmarkStart\b[^>]*w:name="' + re.escape(_TOC_BOOKMARK_NAME) + r'"[^>]*/>',
+        document_xml
+    )
+    if not m:
+        return document_xml
+    start_tag = m.group(0)
+    id_m = re.search(r'w:id="(\d+)"', start_tag)
+    document_xml = document_xml.replace(start_tag, '')
+    if id_m:
+        end_pat = re.compile(r'<w:bookmarkEnd\b[^>]*w:id="' + id_m.group(1) + r'"[^>]*/>')
+        document_xml = end_pat.sub('', document_xml, count=1)
+    return document_xml
+
+
+def _insert_bookmark_end_at_body_end(body, bmk_id: int) -> None:
+    """Sisipkan <w:bookmarkEnd/> sebagai elemen KEDUA-DARI-AKHIR body, yaitu
+    tepat SEBELUM sectPr penutup body (properti section default/terakhir
+    dokumen — selalu jadi child terakhir body per skema OOXML). Ini
+    menjamin bookmark "GenRSNI_ToCScope" mencakup SELURUH sisa dokumen
+    (semua Pasal/Lampiran/Bibliografi yang ditambahkan engine-engine
+    berikutnya di pipeline), berapa pun jumlah kontennya, karena
+    engine-engine tsb. selalu menyisipkan konten SEBELUM sectPr penutup
+    ini — bukan sesudahnya."""
+    end_el = _parse_elements([_bookmark_end_xml(bmk_id)])[0]
+    last = list(body)[-1] if len(body) else None
+    if last is not None and last.tag == f'{{{NS_W}}}sectPr':
+        last.addprevious(end_el)
+    else:
+        body.append(end_el)
+
+
 def _find_nth_section_paragraph_index(body, n=2):
     count = 0
     last_idx = None
@@ -394,6 +472,14 @@ class DaftarIsiEngine:
             # 1b. Pastikan style "TOC 1"/"TOC 2" ada & field auto-update saat dibuka
             _ensure_toc_styles(files)
             _ensure_update_fields(files)
+
+            # 1c. Bersihkan sisa bookmark "GenRSNI_ToCScope" lama (idempoten,
+            #     jaga-jaga jika file ini sudah pernah lewat pipeline ini
+            #     sebelumnya), lalu tentukan w:id baru yang aman/tidak bentrok.
+            doc_xml_str = files['word/document.xml'].decode('utf-8')
+            doc_xml_str = _strip_existing_toc_scope_bookmark(doc_xml_str)
+            bmk_id = _next_bookmark_id(doc_xml_str)
+            files['word/document.xml'] = doc_xml_str.encode('utf-8')
 
             # 3. Hitung rId dan file number berikutnya
             rels_xml = files['word/_rels/document.xml.rels'].decode('utf-8')
@@ -452,10 +538,15 @@ class DaftarIsiEngine:
             insert_pos = hakcip_idx + 1
 
             # 9. Build & insert DI elements (field TOC native Word)
-            di_xmls = _build_di_elements(rid_ho, rid_he, rid_fo, rid_fe)
+            di_xmls = _build_di_elements(rid_ho, rid_he, rid_fo, rid_fe, bmk_id)
             di_els  = _parse_elements(di_xmls)
             for offset, el in enumerate(di_els):
                 body.insert(insert_pos + offset, el)
+
+            # 9b. Tutup bookmark di akhir body (mencakup SELURUH sisa
+            #     dokumen setelah judul "Daftar Isi" — lihat docstring
+            #     _insert_bookmark_end_at_body_end).
+            _insert_bookmark_end_at_body_end(body, bmk_id)
 
             # 10. Serialisasi
             files['word/document.xml'] = etree.tostring(
