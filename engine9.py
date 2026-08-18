@@ -484,6 +484,73 @@ def _extract_source_italic_map(text_runs, para_style_italic: bool) -> tuple[str,
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# PROTEKSI SUPERSCRIPT / SUBSCRIPT DI SUMBER
+# ─────────────────────────────────────────────────────────────────────────────
+# Dokumen ISO sering memakai superscript/subscript untuk notasi satuan atau
+# pangkat (mis. "kWm-2" -> "kWm superscript -2"). Sebelumnya _translate_para
+# menggabungkan semua run menjadi satu string polos sebelum diterjemahkan,
+# sehingga info superscript/subscript per-run ikut hilang (teks hasil
+# terjemahan hanya mewarisi format run pertama). Fungsi di bawah ini
+# mendeteksi run superscript/subscript tsb dan melindunginya dengan
+# mekanisme token yang sama seperti proteksi istilah miring, supaya
+# formatnya bisa dikembalikan persis setelah proses terjemahan selesai.
+
+def _run_vertalign_kind(run):
+    """Return 'sup' jika run superscript, 'sub' jika subscript, selain itu None."""
+    try:
+        if run.font.superscript:
+            return 'sup'
+        if run.font.subscript:
+            return 'sub'
+    except Exception:
+        pass
+    return None
+
+
+def _extract_source_special_map(text_runs, para_style_italic: bool) -> tuple[str, dict, dict]:
+    """
+    Gabungkan run menjadi satu teks, dengan proteksi GANDA:
+      1) Superscript/subscript asli -> token @@VSUP_xxx@@ / @@VSUB_xxx@@
+         (dilindungi berapa pun panjangnya, supaya notasi seperti "kWm-2"
+         tidak kehilangan format pangkatnya setelah diterjemahkan).
+      2) Istilah/judul miring di sumber -> token @@SRC_xxx@@ (seperti semula).
+    Kalau sebuah run superscript/subscript sekaligus miring, proteksi
+    superscript/subscript diutamakan (kasus ini jarang terjadi pada dokumen
+    ISO/SNI, dan formatnya tetap dikembalikan verbatim).
+    Return: (teks_dengan_token, italic_token_map, vertalign_token_map)
+    """
+    segments = []  # [text, kind] kind in {'sup','sub','ital','normal'}
+    for _, r in text_runs:
+        va = _run_vertalign_kind(r)
+        if va:
+            kind = va
+        else:
+            kind = 'ital' if _run_effective_italic(r, para_style_italic) else 'normal'
+        t = r.text or ''
+        if segments and segments[-1][1] == kind:
+            segments[-1][0] += t
+        else:
+            segments.append([t, kind])
+
+    italic_map = {}
+    vertalign_map = {}
+    out_parts = []
+    for seg_text, kind in segments:
+        stripped = seg_text.strip()
+        if kind in ('sup', 'sub') and stripped:
+            token = f'@@V{"SUP" if kind == "sup" else "SUB"}_{uuid.uuid4().hex[:8].upper()}@@'
+            vertalign_map[token] = seg_text
+            out_parts.append(token)
+        elif kind == 'ital' and len(stripped) >= 3 and not _RE_PURE_NUMBER.fullmatch(stripped):
+            token = f'@@SRC_{uuid.uuid4().hex[:8].upper()}@@'
+            italic_map[token] = seg_text
+            out_parts.append(token)
+        else:
+            out_parts.append(seg_text)
+    return ''.join(out_parts), italic_map, vertalign_map
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # LINK HANDLING (FIXED - AMAN, TIDAK MERUSAK XML)
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -544,70 +611,111 @@ def _translate_hyperlinks_in_para(para, tr) -> None:
 # ITALIC FORMATTING
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _apply_mixed_formatting_to_para(para, text: str, italic_terms: list[str], 
-                                     font_name: str = None, font_size: int = None) -> None:
-    """Terapkan formatting: kata di italic_terms jadi MIRING."""
-    if not italic_terms:
-        if para.runs:
-            para.runs[0].text = text
-            for r in para.runs[1:]: r.text = ''
-        else:
-            para.add_run(text)
-        return
-    
-    italic_positions = []
-    for term in italic_terms:
-        start = 0
-        term_lower = term.lower()
-        text_lower = text.lower()
-        while True:
-            idx = text_lower.find(term_lower, start)
-            if idx == -1: break
-            italic_positions.append((idx, idx + len(term)))
-            start = idx + 1
-    
-    italic_positions.sort(key=lambda x: x[0])
-    
-    filtered_positions = []
-    last_end = -1
-    for start, end in italic_positions:
-        if start >= last_end:
-            filtered_positions.append((start, end))
-            last_end = end
-    
-    if not filtered_positions:
-        if para.runs:
-            para.runs[0].text = text
-            for r in para.runs[1:]: r.text = ''
-        else:
-            para.add_run(text)
-        return
-    
-    segments = []
-    last_pos = 0
-    
-    for start, end in filtered_positions:
-        if start > last_pos:
-            segments.append((text[last_pos:start], False))
-        segments.append((text[start:end], True))
-        last_pos = end
-    
-    if last_pos < len(text):
-        segments.append((text[last_pos:], False))
-    
+def _apply_mixed_formatting_to_para(para, text: str, italic_terms: list[str],
+                                     font_name: str = None, font_size: int = None,
+                                     vertalign_map: dict | None = None) -> None:
+    """
+    Terapkan formatting: kata di italic_terms jadi MIRING, dan token
+    @@VSUP_xxx@@ / @@VSUB_xxx@@ (proteksi superscript/subscript sumber, jika
+    ada) dikembalikan menjadi teks asli dengan format superscript/subscript
+    -- BUKAN diperlakukan sebagai teks biasa atau ikut diterjemahkan.
+    """
+    # 1) Pecah dulu berdasarkan token superscript/subscript (kalau ada),
+    #    supaya potongan tsb tidak ikut diproses sebagai teks biasa/italic.
+    pieces = []  # list of (segment_text, vertalign_kind or None)
+    if vertalign_map:
+        token_re = re.compile('|'.join(re.escape(tok) for tok in vertalign_map.keys()))
+        last = 0
+        for m in token_re.finditer(text):
+            if m.start() > last:
+                pieces.append((text[last:m.start()], None))
+            tok = m.group(0)
+            kind = 'sup' if tok.startswith('@@VSUP_') else 'sub'
+            pieces.append((vertalign_map[tok], kind))
+            last = m.end()
+        if last < len(text):
+            pieces.append((text[last:], None))
+    else:
+        pieces.append((text, None))
+
+    if not pieces:
+        pieces = [(text, None)]
+
     for run in list(para.runs):
         run._element.getparent().remove(run._element)
-    
-    for seg_text, is_italic in segments:
-        if not seg_text: continue
-        
-        run = para.add_run(seg_text)
-        run.font.name = font_name or 'Arial'
-        if font_size:
-            run.font.size = Pt(font_size)
-        
-        if is_italic:
-            run.italic = True
+
+    for seg_text, vkind in pieces:
+        if not seg_text:
+            continue
+
+        if vkind:
+            # Bagian superscript/subscript — kembalikan teks asli apa
+            # adanya dengan format superscript/subscript, terpisah dari
+            # proteksi italic (proteksi ini sudah final, tidak dipecah lagi).
+            run = para.add_run(seg_text)
+            run.font.name = font_name or 'Arial'
+            if font_size:
+                run.font.size = Pt(font_size)
+            if vkind == 'sup':
+                run.font.superscript = True
+            else:
+                run.font.subscript = True
+            continue
+
+        # Bagian teks biasa: terapkan italic_terms seperti semula.
+        if not italic_terms:
+            run = para.add_run(seg_text)
+            run.font.name = font_name or 'Arial'
+            if font_size:
+                run.font.size = Pt(font_size)
+            continue
+
+        italic_positions = []
+        for term in italic_terms:
+            start = 0
+            term_lower = term.lower()
+            seg_lower = seg_text.lower()
+            while True:
+                idx = seg_lower.find(term_lower, start)
+                if idx == -1: break
+                italic_positions.append((idx, idx + len(term)))
+                start = idx + 1
+
+        italic_positions.sort(key=lambda x: x[0])
+
+        filtered_positions = []
+        last_end = -1
+        for start, end in italic_positions:
+            if start >= last_end:
+                filtered_positions.append((start, end))
+                last_end = end
+
+        if not filtered_positions:
+            run = para.add_run(seg_text)
+            run.font.name = font_name or 'Arial'
+            if font_size:
+                run.font.size = Pt(font_size)
+            continue
+
+        sub_segments = []
+        last_pos = 0
+        for start, end in filtered_positions:
+            if start > last_pos:
+                sub_segments.append((seg_text[last_pos:start], False))
+            sub_segments.append((seg_text[start:end], True))
+            last_pos = end
+        if last_pos < len(seg_text):
+            sub_segments.append((seg_text[last_pos:], False))
+
+        for sub_text, is_italic in sub_segments:
+            if not sub_text:
+                continue
+            run = para.add_run(sub_text)
+            run.font.name = font_name or 'Arial'
+            if font_size:
+                run.font.size = Pt(font_size)
+            if is_italic:
+                run.italic = True
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1014,10 +1122,12 @@ def _translate_para(para, tr, past_bibliography: bool = False) -> list[str]:
     original_for_case = combined
 
     # Proteksi 1: istilah/judul asing yang SUDAH miring di dokumen sumber
-    # (mis. judul standar acuan pada klausul "Acuan normatif"). Bagian ini
-    # tidak diterjemahkan dan akan dicetak miring kembali di hasil.
+    # (mis. judul standar acuan pada klausul "Acuan normatif") DAN bagian
+    # yang sudah superscript/subscript di sumber (mis. notasi satuan
+    # "kWm-2"). Bagian-bagian ini tidak diterjemahkan dan formatnya akan
+    # dikembalikan persis (miring / superscript / subscript) di hasil.
     para_style_italic = _get_para_style_italic(para)
-    combined_with_src_tokens, italic_map = _extract_source_italic_map(text_runs, para_style_italic)
+    combined_with_src_tokens, italic_map, vertalign_map = _extract_source_special_map(text_runs, para_style_italic)
     combined = combined_with_src_tokens.strip()
 
     # Proteksi 2: kamus istilah asing dari spreadsheet ("Kamus Istilah Asing")
@@ -1035,8 +1145,8 @@ def _translate_para(para, tr, past_bibliography: bool = False) -> list[str]:
     translated = _match_capitalization(original_for_case, translated)
     
     # Apply formatting ke teks normal
-    if italic_terms_found:
-        _apply_mixed_formatting_to_para(para, translated, italic_terms_found, font_name, font_size)
+    if italic_terms_found or vertalign_map:
+        _apply_mixed_formatting_to_para(para, translated, italic_terms_found, font_name, font_size, vertalign_map)
     else:
         if para.runs:
             para.runs[0].text = translated
