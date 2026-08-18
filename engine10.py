@@ -63,13 +63,10 @@ Deteksi batas bahasa Indonesia vs Inggris:
 
 import re
 import copy
-import os
-import zipfile
 from docx import Document
 from docx.oxml.ns import qn
 from docx.oxml import parse_xml, OxmlElement
 from docx.oxml.ns import nsdecls
-from lxml import etree
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Konstanta
@@ -301,68 +298,6 @@ def _strip_run_direct_formatting(paragraph):
                     rPr.remove(child)
         else:
             r.remove(rPr)
-
-
-def _finalize_toc_fields(output_docx: str) -> None:
-    """Final pass setelah python-docx save.
-
-    Engine5 membuat field TOC, kemudian Engine9 dan Engine10 membuka/simpan
-    dokumen dengan python-docx. Final pass ini memastikan hasil terakhir
-    tetap meminta Word melakukan update TOC saat file dibuka. Ini penting
-    karena setting field dapat berasal dari dokumen sumber dan cached TOC
-    lama tidak boleh dipakai.
-    """
-    tmp = output_docx + '.tocfix.tmp'
-    try:
-        with zipfile.ZipFile(output_docx, 'r') as zin:
-            files = {name: zin.read(name) for name in zin.namelist()}
-
-        # 1. Paksa updateFields=true dan hapus doNotUpdateFields.
-        key = 'word/settings.xml'
-        if key in files:
-            settings = files[key].decode('utf-8')
-            settings = re.sub(r'<w:doNotUpdateFields\b[^>]*/>', '', settings, flags=re.DOTALL)
-            settings, n = re.subn(
-                r'<w:updateFields\b[^>]*/>',
-                '<w:updateFields w:val="true"/>',
-                settings, count=1, flags=re.DOTALL
-            )
-            if n == 0:
-                m = re.search(r'<w:settings\b[^>]*>', settings)
-                if m:
-                    pos = m.end()
-                    settings = settings[:pos] + '<w:updateFields w:val="true"/>' + settings[pos:]
-            files[key] = settings.encode('utf-8')
-
-        # 2. Tandai semua field TOC sebagai dirty.
-        key = 'word/document.xml'
-        if key in files:
-            root = etree.fromstring(files[key])
-            ns = {'w': 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'}
-            toc_found = False
-            for p in root.xpath('.//w:p', namespaces=ns):
-                instr = ' '.join(p.xpath('.//w:instrText/text()', namespaces=ns))
-                if 'TOC ' not in instr and not instr.strip().startswith('TOC'):
-                    continue
-                toc_found = True
-                for fld in p.xpath('.//w:fldChar[@w:fldCharType="begin"]', namespaces=ns):
-                    fld.set(qn('w:dirty'), 'true')
-
-            if toc_found:
-                files[key] = etree.tostring(
-                    root, xml_declaration=True, encoding='UTF-8', standalone=True
-                )
-
-        with zipfile.ZipFile(tmp, 'w', zipfile.ZIP_DEFLATED) as zout:
-            for name, data in files.items():
-                zout.writestr(name, data)
-        os.replace(tmp, output_docx)
-    finally:
-        if os.path.exists(tmp):
-            try:
-                os.remove(tmp)
-            except OSError:
-                pass
 
 
 def _set_pstyle(paragraph, style_id):
@@ -732,10 +667,6 @@ class StyleFinalizerEngine:
             _enforce_italic_terms(doc, ['Red Green Blue'])
 
             doc.save(output_docx)
-
-            # Finalize setelah python-docx save agar settings.xml dan field
-            # TOC pada FILE PALING AKHIR tetap meminta Word melakukan update.
-            _finalize_toc_fields(output_docx)
 
             msg = (
                 f'OK: {len(judul_targets)} heading/Lampiran -> "Judul", '
