@@ -270,6 +270,15 @@ class DocxOptimizerEngine:
         try:
             doc = Document(input_path)
 
+            # Tandai paragraf yang berasal LANGSUNG dari file .docx yang
+            # di-upload pengguna. Marker ini tidak mengubah tampilan dokumen
+            # dan dipertahankan oleh Word/python-docx. Engine10 memakai marker
+            # ini agar style custom "Judul" / "Pasal" TIDAK diterapkan ke
+            # isi asli file pengguna.
+            _USER_MARK_NS = 'urn:generatorrsni:user-content'
+            for _p in doc.paragraphs:
+                _p._p.set('{%s}uploaded' % _USER_MARK_NS, '1')
+
             # Hapus semua hyperlink → jadikan teks biasa
             remove_all_hyperlinks(doc)
 
