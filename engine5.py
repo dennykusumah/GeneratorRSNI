@@ -163,6 +163,79 @@ _TOC_PLACEHOLDER = (
 )
 
 
+def _build_di_content_elements():
+    """Isi halaman Daftar Isi tanpa membuat section baru.
+    Dipakai saat dokumen upload SUDAH memiliki halaman Daftar Isi:
+    section break/header/footer asli dipertahankan, hanya isi TOC yang
+    diganti. Engine10 kemudian mengganti field placeholder ini dengan
+    entri TOC final."""
+    NT = 'BSNNoTranslate'
+    title = (
+        f'<w:p><w:pPr><w:pStyle w:val="{NT}"/>'
+        f'<w:jc w:val="center"/><w:spacing w:before="0" w:after="0"/></w:pPr>'
+        f'{_run("Daftar Isi", bold=True, size_pt=12, italic=False)}</w:p>'
+    )
+    empty = (
+        f'<w:p><w:pPr><w:pStyle w:val="{NT}"/>'
+        f'<w:spacing w:before="0" w:after="0"/></w:pPr></w:p>'
+    )
+    sz = pt_to_hpts(11)
+    rpr = (
+        f'<w:rPr><w:rFonts w:ascii="Arial" w:hAnsi="Arial" w:cs="Arial"/>'
+        f'<w:sz w:val="{sz}"/><w:szCs w:val="{sz}"/></w:rPr>'
+    )
+    toc = (
+        f'<w:p><w:pPr><w:pStyle w:val="TOC1"/></w:pPr>'
+        f'<w:r>{rpr}<w:fldChar w:fldCharType="begin" w:dirty="true"/></w:r>'
+        f'<w:r>{rpr}<w:instrText xml:space="preserve"> {_TOC_FIELD_INSTR} </w:instrText></w:r>'
+        f'<w:r>{rpr}<w:fldChar w:fldCharType="separate"/></w:r>'
+        f'<w:r>{rpr}<w:t xml:space="preserve">{_esc(_TOC_PLACEHOLDER)}</w:t></w:r>'
+        f'<w:r>{rpr}<w:fldChar w:fldCharType="end"/></w:r></w:p>'
+    )
+    return [title, empty, empty, toc]
+
+
+def _find_existing_daftar_isi(body):
+    """Kembalikan indeks paragraf Daftar Isi yang paling awal, jika ada."""
+    for i, el in enumerate(list(body)):
+        if el.tag != f'{{{NS_W}}}p':
+            continue
+        txt = ''.join(el.itertext()).strip()
+        if txt.lower() == 'daftar isi':
+            return i
+    return None
+
+
+def _replace_existing_daftar_isi(body, start_idx):
+    """Hapus isi TOC lama sampai sebelum Prakata/section boundary lalu
+    sisipkan placeholder TOC baru. Section break yang sudah ada dibiarkan."""
+    children = list(body)
+    end_idx = len(children)
+    for j in range(start_idx + 1, len(children)):
+        el = children[j]
+        if el.tag == f'{{{NS_W}}}p':
+            txt = ''.join(el.itertext()).strip().lower()
+            if txt == 'prakata':
+                end_idx = j
+                break
+            pPr = el.find(f'{{{NS_W}}}pPr')
+            if pPr is not None and pPr.find(f'{{{NS_W}}}sectPr') is not None:
+                end_idx = j
+                break
+
+    # Hapus semua child di antara judul Daftar Isi dan batas akhir TOC.
+    # Judulnya sendiri juga dihapus agar formatnya seragam dengan F.docx.
+    for el in children[start_idx:end_idx]:
+        body.remove(el)
+
+    new_nodes = _parse_elements(_build_di_content_elements())
+    insert_pos = start_idx
+    for off, el in enumerate(new_nodes):
+        body.insert(insert_pos + off, el)
+
+    return True
+
+
 def _build_di_elements(hdr_odd, hdr_even, ftr_odd, ftr_even):
     """
     Return list of raw XML strings untuk paragraf DI + inline sectPr.
@@ -378,8 +451,8 @@ def _find_nth_section_paragraph_index(body, n=2):
 class DaftarIsiEngine:
     """
     Engine untuk menyisipkan halaman Daftar Isi setelah halaman Hak Cipta (page 2).
-    Halaman hanya berisi judul "Daftar Isi" — TIDAK ADA isi/entri apapun,
-    persis seperti halaman Pendahuluan.
+    Halaman berisi judul "Daftar Isi" dan placeholder TOC. Isi TOC lama pada file upload
+    diganti, lalu Engine10 membangun entri final agar tampil seperti F.docx.
     Penomoran: Romawi (i, ii, iii, ...).
     """
 
@@ -444,20 +517,25 @@ class DaftarIsiEngine:
             tree = etree.fromstring(files['word/document.xml'])
             body = tree.find(f'{{{NS_W}}}body')
 
-            # 8. Cari posisi insert (setelah sectPr ke-2 / Hak Cipta)
-            hakcip_idx, found = _find_nth_section_paragraph_index(body, n=2)
-            if found < 2:
-                hakcip_idx, _ = _find_nth_section_paragraph_index(body, n=1)
+            # 8. Jika file upload SUDAH memiliki Daftar Isi, JANGAN
+            # menambah halaman kedua. Ganti isi Daftar Isi eksisting.
+            existing_di = _find_existing_daftar_isi(body)
+            if existing_di is not None:
+                _replace_existing_daftar_isi(body, existing_di)
+            else:
+                # Tidak ada Daftar Isi pada file upload -> buat halaman baru
+                # setelah section Hak Cipta seperti perilaku sebelumnya.
+                hakcip_idx, found = _find_nth_section_paragraph_index(body, n=2)
+                if found < 2:
+                    hakcip_idx, _ = _find_nth_section_paragraph_index(body, n=1)
 
-            insert_pos = hakcip_idx + 1
+                insert_pos = hakcip_idx + 1
+                di_xmls = _build_di_elements(rid_ho, rid_he, rid_fo, rid_fe)
+                di_els  = _parse_elements(di_xmls)
+                for offset, el in enumerate(di_els):
+                    body.insert(insert_pos + offset, el)
 
-            # 9. Build & insert DI elements (field TOC native Word)
-            di_xmls = _build_di_elements(rid_ho, rid_he, rid_fo, rid_fe)
-            di_els  = _parse_elements(di_xmls)
-            for offset, el in enumerate(di_els):
-                body.insert(insert_pos + offset, el)
-
-            # 10. Serialisasi
+            # 9. Serialisasi
             files['word/document.xml'] = etree.tostring(
                 tree, xml_declaration=True, encoding='UTF-8', standalone=True
             )
