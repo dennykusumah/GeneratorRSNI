@@ -90,6 +90,261 @@ def _norm(text: str) -> str:
     return re.sub(r'\s+', ' ', (text or '').strip()).strip().lower()
 
 
+# Marker yang ditanam Engine2 pada paragraf yang berasal langsung dari
+# file .docx yang di-upload pengguna. Engine10 WAJIB mempertahankan style
+# paragraf tersebut; marker ini tidak memengaruhi tampilan Word.
+_USER_MARK_NS = 'urn:generatorrsni:user-content'
+_USER_MARK_QN = '{%s}uploaded' % _USER_MARK_NS
+
+def _is_user_uploaded_paragraph(paragraph) -> bool:
+    return paragraph._p.get(_USER_MARK_QN) == '1'
+
+
+def _strip_number_for_toc(text: str) -> str:
+    """Hilangkan nomor literal di awal heading agar TOC tidak dobel.
+    Nomor otomatis Word tidak muncul pada paragraph.text, sehingga pada
+    dokumen ISO yang masih memakai numbering ini fungsi ini tidak menghapus
+    apa pun dan nomor ditambahkan oleh generator TOC dari counter."""
+    return _RE_LEADING_NUMBER.sub('', (text or '').strip(), count=1)
+
+
+def _bookmark_name_for_para(paragraph, index: int) -> str:
+    """Buat bookmark unik untuk target TOC jika belum ada bookmark."""
+    p_el = paragraph._p
+    # Gunakan bookmark yang sudah ada bila paragraf sumber memang memilikinya.
+    for b in p_el.findall('.//' + qn('w:bookmarkStart')):
+        name = b.get(qn('w:name'))
+        if name and not name.startswith('_Toc'):
+            return name
+    return f'_GeneratorTOC_{index}'
+
+
+def _ensure_bookmark(paragraph, name: str, bookmark_id: int) -> None:
+    """Pasang bookmark mengelilingi isi paragraf tanpa mengubah teks/style."""
+    p_el = paragraph._p
+    starts = p_el.findall('.//' + qn('w:bookmarkStart'))
+    for b in starts:
+        if b.get(qn('w:name')) == name:
+            return
+
+    end_id = str(bookmark_id)
+    start = OxmlElement('w:bookmarkStart')
+    start.set(qn('w:id'), end_id)
+    start.set(qn('w:name'), name)
+
+    end = OxmlElement('w:bookmarkEnd')
+    end.set(qn('w:id'), end_id)
+
+    # Sisipkan bookmark setelah pPr dan sebelum run pertama; end di akhir.
+    pPr = p_el.find(qn('w:pPr'))
+    insert_at = list(p_el).index(pPr) + 1 if pPr is not None else 0
+    p_el.insert(insert_at, start)
+    p_el.append(end)
+
+
+def _next_bookmark_id(doc) -> int:
+    ids = []
+    for b in doc.element.body.iter(qn('w:bookmarkStart')):
+        try:
+            ids.append(int(b.get(qn('w:id'))))
+        except Exception:
+            pass
+    return max(ids, default=0) + 1
+
+
+def _make_toc_run(text: str, *, bold=False, color=None, underline=False):
+    r = OxmlElement('w:r')
+    rPr = OxmlElement('w:rPr')
+    rFonts = OxmlElement('w:rFonts')
+    rFonts.set(qn('w:ascii'), 'Arial')
+    rFonts.set(qn('w:hAnsi'), 'Arial')
+    rFonts.set(qn('w:cs'), 'Arial')
+    rPr.append(rFonts)
+    if bold:
+        rPr.append(OxmlElement('w:b'))
+    if color:
+        c = OxmlElement('w:color'); c.set(qn('w:val'), color); rPr.append(c)
+    if underline:
+        u = OxmlElement('w:u'); u.set(qn('w:val'), 'single'); rPr.append(u)
+    r.append(rPr)
+    fld = OxmlElement('w:t')
+    fld.set(qn('xml:space'), 'preserve')
+    fld.text = text
+    r.append(fld)
+    return r
+
+
+def _make_pageref_field_run(bookmark_name: str):
+    """Field PAGEREF yang menghasilkan nomor halaman + hyperlink."""
+    rpr = OxmlElement('w:rPr')
+    rFonts = OxmlElement('w:rFonts')
+    rFonts.set(qn('w:ascii'), 'Arial'); rFonts.set(qn('w:hAnsi'), 'Arial'); rFonts.set(qn('w:cs'), 'Arial')
+    rpr.append(rFonts)
+    color = OxmlElement('w:color'); color.set(qn('w:val'), '0070C0'); rpr.append(color)
+    u = OxmlElement('w:u'); u.set(qn('w:val'), 'single'); rpr.append(u)
+
+    def rr(child):
+        r = OxmlElement('w:r'); r.append(copy.deepcopy(rpr)); r.append(child); return r
+
+    begin = OxmlElement('w:fldChar'); begin.set(qn('w:fldCharType'), 'begin')
+    instr = OxmlElement('w:instrText'); instr.set(qn('xml:space'), 'preserve'); instr.text = f' PAGEREF {bookmark_name} \\h '
+    sep = OxmlElement('w:fldChar'); sep.set(qn('w:fldCharType'), 'separate')
+    text = OxmlElement('w:t'); text.text = '1'
+    end = OxmlElement('w:fldChar'); end.set(qn('w:fldCharType'), 'end')
+    return [rr(begin), rr(instr), rr(sep), rr(text), rr(end)]
+
+
+def _build_custom_toc_paragraph(doc, label: str, bookmark_name: str):
+    """Buat satu entri TOC visual seperti F.docx: Arial, dot leader,
+    hyperlink nomor halaman, tanpa mengubah paragraf sumber."""
+    p = OxmlElement('w:p')
+    pPr = OxmlElement('w:pPr')
+    pStyle = OxmlElement('w:pStyle'); pStyle.set(qn('w:val'), 'TOC1'); pPr.append(pStyle)
+    p.append(pPr)
+
+    # Label kiri.
+    p.append(_make_toc_run(label))
+    tab = OxmlElement('w:r'); tab.append(OxmlElement('w:tab')); p.append(tab)
+
+    # Nomor halaman kanan; Word akan menghitung ulang PAGEREF saat field di-update.
+    for r in _make_pageref_field_run(bookmark_name):
+        p.append(r)
+    return p
+
+
+def _replace_engine5_toc_with_generated(doc, toc_entries):
+    """Ganti field/placeholder TOC dari Engine5 dengan entri TOC final
+    yang dibangun Engine10. Halaman, dot leader, dan hyperlink mengikuti
+    tampilan F.docx, sementara isi sumber tetap mempertahankan style aslinya."""
+    paras = doc.paragraphs
+    di_idx = None
+    for i, p in enumerate(paras):
+        if _norm(p.text) == 'daftar isi':
+            di_idx = i
+            break
+    if di_idx is None:
+        return 0
+
+    # Temukan batas TOC: dari setelah judul DI sampai sebelum Prakata.
+    end_idx = len(paras)
+    for j in range(di_idx + 1, len(paras)):
+        if _norm(paras[j].text) == 'prakata':
+            end_idx = j
+            break
+
+    candidates = []
+    for p in paras[di_idx + 1:end_idx]:
+        txt = p.text or ''
+        if p.style is not None and p.style.name in ('TOC1', 'toc 1', 'TOC2', 'toc 2'):
+            candidates.append(p)
+        elif 'TOC \\h' in txt or 'Klik kanan pada teks ini' in txt:
+            candidates.append(p)
+
+    if not candidates:
+        return 0
+
+    first = candidates[0]
+    parent = first._p.getparent()
+    pos = list(parent).index(first._p)
+
+    # Hapus semua paragraf TOC lama, tetapi JANGAN menghapus tiga paragraf
+    # kosong yang sengaja dibuat Engine5 untuk jarak judul -> daftar isi.
+    for old in candidates:
+        try:
+            old._p.getparent().remove(old._p)
+        except Exception:
+            pass
+
+    new_nodes = [_build_custom_toc_paragraph(doc, label, bm) for label, bm in toc_entries]
+    for offset, node in enumerate(new_nodes):
+        parent.insert(pos + offset, node)
+    return len(new_nodes)
+
+
+def _collect_toc_entries(doc, id_lo, id_hi):
+    """Kumpulkan target TOC tanpa mengubah style paragraf sumber.
+    Semua entri dibuat level datar (TOC1), sama seperti F.docx."""
+    paras = doc.paragraphs
+    entries = []
+    bookmark_id = _next_bookmark_id(doc)
+
+    # Judul halaman yang dibuat generator.
+    generated_titles = {'daftar isi', 'prakata', 'pendahuluan'}
+
+    # Daftar Isi sendiri, Prakata, Pendahuluan.
+    for i, p in enumerate(paras):
+        norm = _norm(p.text)
+        if norm in generated_titles and not _is_user_uploaded_paragraph(p):
+            name = _bookmark_name_for_para(p, i)
+            _ensure_bookmark(p, name, bookmark_id); bookmark_id += 1
+            entries.append((p.text.strip(), name))
+
+    # Heading/pasal sumber: tetap dengan style asli.
+    h1 = 0; h2 = 0; skip_sub = False
+    annex_no = 0; annex_sub = 0; annex_sub2 = 0
+    for i in range(id_lo, id_hi):
+        p = paras[i]
+        s = p.style.name if p.style is not None else ''
+        if _is_user_uploaded_paragraph(p):
+            if s in ('Heading 1', 'Pasal'):
+                raw = _strip_number_for_toc(p.text)
+                m_num = re.match(r'^\s*(\d+)(?:\.(\d+))?\s+', p.text or '')
+                if s == 'Pasal' and m_num and m_num.group(2):
+                    h2 += 1
+                    label = f'{m_num.group(1)}.{m_num.group(2)}    {raw}'
+                else:
+                    h1 += 1
+                    h2 = 0
+                    skip_sub = _norm(raw) in _SKIP_SUBSECTION_TITLES
+                    label = f'{h1}    {raw}'
+                name = _bookmark_name_for_para(p, i)
+                _ensure_bookmark(p, name, bookmark_id); bookmark_id += 1
+                entries.append((label, name))
+            elif s == 'Heading 2':
+                if skip_sub:
+                    continue
+                h2 += 1
+                label = f'{h1}.{h2}    {_strip_number_for_toc(p.text)}'
+                name = _bookmark_name_for_para(p, i)
+                _ensure_bookmark(p, name, bookmark_id); bookmark_id += 1
+                entries.append((label, name))
+            elif s == 'Judul' and _norm(p.text) not in generated_titles:
+                name = _bookmark_name_for_para(p, i)
+                _ensure_bookmark(p, name, bookmark_id); bookmark_id += 1
+                entries.append((p.text.strip(), name))
+            elif s == 'ANNEX':
+                annex_no += 1; annex_sub = 0; annex_sub2 = 0
+                letter = chr(ord('A') + annex_no - 1)
+                label = f'Lampiran {letter} {_strip_number_for_toc(p.text)}'
+                name = _bookmark_name_for_para(p, i)
+                _ensure_bookmark(p, name, bookmark_id); bookmark_id += 1
+                entries.append((label, name))
+            elif s == 'a2':
+                annex_sub += 1; annex_sub2 = 0
+                letter = chr(ord('A') + max(annex_no - 1, 0))
+                label = f'{letter}.{annex_sub}    {_strip_number_for_toc(p.text)}'
+                name = _bookmark_name_for_para(p, i)
+                _ensure_bookmark(p, name, bookmark_id); bookmark_id += 1
+                entries.append((label, name))
+            elif s == 'a3':
+                annex_sub2 += 1
+                letter = chr(ord('A') + max(annex_no - 1, 0))
+                label = f'{letter}.{annex_sub}.{annex_sub2}    {_strip_number_for_toc(p.text)}'
+                name = _bookmark_name_for_para(p, i)
+                _ensure_bookmark(p, name, bookmark_id); bookmark_id += 1
+                entries.append((label, name))
+
+    # Bibliografi: masukkan sekali bila berasal dari dokumen upload.
+    for i, p in enumerate(paras):
+        if _norm(p.text) == 'bibliografi' and _is_user_uploaded_paragraph(p):
+            name = _bookmark_name_for_para(p, i)
+            _ensure_bookmark(p, name, bookmark_id); bookmark_id += 1
+            entries.append((p.text.strip(), name))
+            break
+
+    return entries
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Generator nomor Pasal/Subpasal
 # ─────────────────────────────────────────────────────────────────────────────
@@ -551,25 +806,25 @@ class StyleFinalizerEngine:
 
             # "Daftar Isi" -> kemunculan PERTAMA di seluruh dokumen (judul halaman TOC)
             for i in range(n):
-                if _norm(paras[i].text) == 'daftar isi':
+                if _norm(paras[i].text) == 'daftar isi' and not _is_user_uploaded_paragraph(paras[i]):
                     judul_targets[i] = False
                     break
 
             # "Pendahuluan" -> kemunculan TERAKHIR sebelum heading/pasal pertama
             # (yaitu heading halaman Pendahuluan, bukan entri di daftar isi)
-            cand = [i for i in range(first_heading_idx) if _norm(paras[i].text) == 'pendahuluan']
+            cand = [i for i in range(first_heading_idx) if _norm(paras[i].text) == 'pendahuluan' and not _is_user_uploaded_paragraph(paras[i])]
             if cand:
                 judul_targets[cand[-1]] = False
 
             # "Prakata" -> semua kemunculan sebelum heading/pasal pertama
             for i in range(first_heading_idx):
-                if _norm(paras[i].text) == 'prakata':
+                if _norm(paras[i].text) == 'prakata' and not _is_user_uploaded_paragraph(paras[i]):
                     judul_targets[i] = False
 
             # "Bibliografi" -> semua kemunculan SETELAH heading/pasal pertama
             # (di badan dokumen, bukan entri di daftar isi front-matter)
             for i in range(first_heading_idx, n):
-                if _norm(paras[i].text) == 'bibliografi':
+                if _norm(paras[i].text) == 'bibliografi' and not _is_user_uploaded_paragraph(paras[i]):
                     was_biblio_title = style_name(paras[i]) == 'Biblio Title'
                     judul_targets[i] = was_biblio_title  # pertahankan page-break-before
 
@@ -594,7 +849,7 @@ class StyleFinalizerEngine:
             # sudah jadi "Judul" untuk SEMUA Lampiran sehingga batas antar
             # Lampiran (mis. A -> B -> C) tidak lagi terdeteksi dan seluruh
             # subpasal akan salah dianggap masih milik Lampiran pertama.
-            annex_indices = set(i for i in range(n) if style_name(paras[i]) == 'ANNEX')
+            annex_indices = set(i for i in range(n) if style_name(paras[i]) == 'ANNEX' and not _is_user_uploaded_paragraph(paras[i]))
             for i in annex_indices:
                 judul_targets[i] = True
 
@@ -646,21 +901,25 @@ class StyleFinalizerEngine:
                     skip_active = _norm(paras[i].text) in _SKIP_SUBSECTION_TITLES
                     h1_counter += 1
                     h2_counter = 0
-                    pasal_targets.append((i, 0, heading1_num_id, str(h1_counter)))
+                    if not _is_user_uploaded_paragraph(paras[i]):
+                        pasal_targets.append((i, 0, heading1_num_id, str(h1_counter)))
                 elif sname == 'Heading 2':
                     if skip_active:
                         continue
                     h2_counter += 1
-                    pasal_targets.append((i, 1, heading2_num_id, f'{h1_counter}.{h2_counter}'))
+                    if not _is_user_uploaded_paragraph(paras[i]):
+                        pasal_targets.append((i, 1, heading2_num_id, f'{h1_counter}.{h2_counter}'))
                 elif sname == 'a2' and annex_a2_num_id:
                     annex_sub_counter += 1
                     annex_sub2_counter = 0
                     letter = chr(ord('A') + max(annex_counter - 1, 0))
-                    pasal_targets.append((i, annex_a2_ilvl, annex_a2_num_id, f'{letter}.{annex_sub_counter}'))
+                    if not _is_user_uploaded_paragraph(paras[i]):
+                        pasal_targets.append((i, annex_a2_ilvl, annex_a2_num_id, f'{letter}.{annex_sub_counter}'))
                 elif sname == 'a3' and annex_a3_num_id:
                     annex_sub2_counter += 1
                     letter = chr(ord('A') + max(annex_counter - 1, 0))
-                    pasal_targets.append((i, annex_a3_ilvl, annex_a3_num_id, f'{letter}.{annex_sub_counter}.{annex_sub2_counter}'))
+                    if not _is_user_uploaded_paragraph(paras[i]):
+                        pasal_targets.append((i, annex_a3_ilvl, annex_a3_num_id, f'{letter}.{annex_sub_counter}.{annex_sub2_counter}'))
                 # Heading 3+ (sub-subpasal) sengaja tidak disentuh
                 # Judul Lampiran sendiri (style "ANNEX") sengaja tidak disentuh
 
@@ -680,11 +939,21 @@ class StyleFinalizerEngine:
             #    supaya tidak mengubah bagian lain dari engine ini.
             _enforce_italic_terms(doc, ['Red Green Blue'])
 
+            # 7) TOC FINAL:
+            # Engine5 membuat halaman Daftar Isi dan placeholder field. Pada
+            # tahap terakhir ini Engine10 membangun entri TOC berdasarkan
+            # heading final, lalu mengganti placeholder tersebut. Heading yang
+            # berasal dari file upload pengguna TIDAK diubah style-nya; TOC
+            # memakai bookmark + PAGEREF sehingga nomor halaman tetap dinamis.
+            toc_entries = _collect_toc_entries(doc, id_lo, id_hi)
+            toc_count = _replace_engine5_toc_with_generated(doc, toc_entries)
+
             doc.save(output_docx)
 
             msg = (
-                f'OK: {len(judul_targets)} heading/Lampiran -> "Judul", '
-                f'{len(pasal_targets)} pasal/subpasal -> "Pasal".'
+                f'OK: {len(judul_targets)} heading generator -> "Judul", '
+                f'{len(pasal_targets)} pasal generator -> "Pasal", '
+                f'{toc_count} entri TOC dibuat.'
             )
             return True, msg
 
