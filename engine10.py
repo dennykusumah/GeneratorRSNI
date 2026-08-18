@@ -15,13 +15,13 @@ Spesifikasi style (hasil dari Word "Modify Style"):
   "Pasal"  — based on Heading 1, style untuk paragraf berikutnya: Body Text
              Font Arial 11pt Bold, rata kiri-kanan (justified),
              spasi sebelum/sesudah 0pt, spasi baris single,
-             auto-numbering TETAP mengikuti Heading 1 / Heading 2 asal
-             (levelnya dipertahankan lewat override w:numPr per-paragraf).
-             Berlaku juga untuk subpasal di dalam Lampiran/Annex (paragraf
-             ber-style "a2"/"a3"): penomorannya TETAP mengikuti huruf
-             Lampiran yang bersangkutan (mis. Lampiran B -> B.1, B.2, dst.)
-             karena ilvl & numId diambil dari style "a2"/"a3" itu sendiri,
-             BUKAN dari Heading 1/Heading 2.
+             TANPA bullet/numbering Word (numId=0, dinonaktifkan eksplisit
+             baik di style maupun override per-paragraf). Nomor Pasal/Subpasal
+             TIDAK dibangkitkan oleh auto-numbering Word — nomor yang tampil
+             murni mengikuti teks literal apa adanya dari dokumen yang
+             diupload user (termasuk untuk subpasal di dalam Lampiran/Annex,
+             paragraf ber-style "a2"/"a3", mis. Lampiran B -> B.1, B.2, dst.,
+             angkanya tetap berasal dari teks asli, bukan dari list Word).
 
 Penerapan otomatis:
 
@@ -119,6 +119,7 @@ _PASAL_STYLE_XML = f'''<w:style {nsdecls("w")} w:type="paragraph" w:customStyle=
   <w:next w:val="BodyText"/>
   <w:qFormat/>
   <w:pPr>
+    <w:numPr><w:ilvl w:val="0"/><w:numId w:val="0"/></w:numPr>
     <w:spacing w:before="0" w:after="0" w:line="240" w:lineRule="auto"/>
     <w:jc w:val="both"/>
   </w:pPr>
@@ -259,15 +260,17 @@ def _apply_pasal(doc, paragraph, ilvl, num_id):
     pPr = _clear_paragraph_direct_formatting(
         paragraph, ['w:jc', 'w:spacing', 'w:ind', 'w:numPr']
     )
-    # Pertahankan level numbering asal (Pasal = level 0, Subpasal = level 1)
-    # supaya penomoran otomatis "1", "4.1", dst. tidak berubah/rusak.
-    if num_id:
-        numPr_xml = (
-            f'<w:numPr {nsdecls("w")}>'
-            f'<w:ilvl w:val="{ilvl}"/><w:numId w:val="{num_id}"/>'
-            f'</w:numPr>'
-        )
-        pPr.insert(0, parse_xml(numPr_xml))
+    # Nonaktifkan bullet/numbering Word (numId=0) secara eksplisit per-paragraf.
+    # Nomor Pasal/Subpasal TIDAK lagi dibangkitkan oleh Word auto-numbering —
+    # nomor yang tampil murni mengikuti teks literal apa adanya dari dokumen
+    # yang diupload user (ilvl/num_id asal tetap dihitung di caller hanya untuk
+    # menentukan target paragraf, bukan lagi untuk diterapkan sebagai numbering).
+    numPr_xml = (
+        f'<w:numPr {nsdecls("w")}>'
+        f'<w:ilvl w:val="0"/><w:numId w:val="0"/>'
+        f'</w:numPr>'
+    )
+    pPr.insert(0, parse_xml(numPr_xml))
     _strip_run_direct_formatting(paragraph)
 
 
@@ -348,10 +351,13 @@ class StyleFinalizerEngine:
             heading1_num_id = _resolve_num_id(doc, 'Heading1')
             heading2_num_id = _resolve_num_id(doc, 'Heading2') or heading1_num_id
 
-            # Subpasal di dalam Lampiran/Annex ('a2'/'a3') memakai numId &
-            # ilvl milik style-nya SENDIRI (bukan Heading1/2), supaya
-            # penomorannya tetap mengikuti huruf Lampiran (mis. B.1, B.2,
-            # ... untuk Lampiran B), bukan melanjutkan nomor Pasal biasa.
+            # Subpasal di dalam Lampiran/Annex ('a2'/'a3'): numId & ilvl
+            # style-nya SENDIRI (bukan Heading1/2) hanya dipakai sebagai
+            # PENANDA bahwa paragraf tsb memang bagian dari list Lampiran
+            # (untuk menentukan target). Nomor yang tampil TIDAK lagi
+            # dibangkitkan dari numId ini — auto-numbering Word dinonaktifkan
+            # di _apply_pasal, nomor mengikuti teks literal dokumen asli
+            # (mis. B.1, B.2, ... untuk Lampiran B, apa adanya dari teks).
             annex_a2_num_id = _resolve_num_id(doc, 'a2')
             annex_a3_num_id = _resolve_num_id(doc, 'a3') or annex_a2_num_id
             annex_a2_ilvl = _resolve_style_ilvl(doc, 'a2')
