@@ -10,11 +10,11 @@ Spesifikasi style (hasil dari Word "Modify Style"):
   "Judul"  — based on Heading 1, style untuk paragraf berikutnya: Body Text
              Font Arial 12pt Bold, rata tengah (center), outline level 1,
              indentasi kiri/kanan 0, spasi sebelum/sesudah 0pt,
-             spasi baris 1,5 lines, TANPA auto-numbering.
+             spasi baris single, TANPA auto-numbering.
 
   "Pasal"  — based on Heading 1, style untuk paragraf berikutnya: Body Text
              Font Arial 11pt Bold, rata kiri-kanan (justified),
-             spasi sebelum/sesudah 0pt, spasi baris 1,5 lines,
+             spasi sebelum/sesudah 0pt, spasi baris single,
              auto-numbering TETAP mengikuti Heading 1 / Heading 2 asal
              (levelnya dipertahankan lewat override w:numPr per-paragraf).
              Berlaku juga untuk subpasal di dalam Lampiran/Annex (paragraf
@@ -101,7 +101,7 @@ _JUDUL_STYLE_XML = f'''<w:style {nsdecls("w")} w:type="paragraph" w:customStyle=
   <w:pPr>
     <w:numPr><w:ilvl w:val="0"/><w:numId w:val="0"/></w:numPr>
     <w:outlineLvl w:val="0"/>
-    <w:spacing w:before="0" w:after="0" w:line="360" w:lineRule="auto"/>
+    <w:spacing w:before="0" w:after="0" w:line="240" w:lineRule="auto"/>
     <w:ind w:left="0" w:right="0" w:firstLine="0"/>
     <w:jc w:val="center"/>
   </w:pPr>
@@ -119,7 +119,7 @@ _PASAL_STYLE_XML = f'''<w:style {nsdecls("w")} w:type="paragraph" w:customStyle=
   <w:next w:val="BodyText"/>
   <w:qFormat/>
   <w:pPr>
-    <w:spacing w:before="0" w:after="0" w:line="360" w:lineRule="auto"/>
+    <w:spacing w:before="0" w:after="0" w:line="240" w:lineRule="auto"/>
     <w:jc w:val="both"/>
   </w:pPr>
   <w:rPr>
