@@ -1,34 +1,46 @@
 """
-Engine5: DaftarIsiEngine (v6 - Daftar Isi otomatis, mengikuti field TOC asli Word)
-===================================================================================
+Engine5: DaftarIsiEngine (v7 - Daftar Isi = replika PERSIS field TOC F.docx)
+=============================================================================
 Engine untuk menyisipkan halaman "Daftar Isi" sesuai standar BSN/SNI.
 
-v6 (halaman berisi field TOC asli Word, terisi otomatis & rapi seperti
-contoh referensi F.docx):
-  - Halaman Daftar Isi berisi judul "Daftar Isi" (rata tengah, bold),
-    diikuti field TOC ASLI Word ({ TOC \\h \\z \\t "Judul,1,Pasal,1,ANNEX,1" }).
+v7 (field TOC & style "TOC1" dipelajari & disamakan PERSIS dengan F.docx,
+menggantikan pendekatan v6 yang formatnya masih berbeda dari F.docx):
+  - Halaman Daftar Isi berisi judul "Daftar Isi" (rata tengah, bold, style
+    "Judul"), diikuti field TOC ASLI Word:
+        { TOC \\h \\z \\t "Judul;1;Pasal;1;ANNEX;1" }
     Field ini disisipkan dalam bentuk "belum di-update" (persis seperti saat
     pengguna melakukan Insert > Table of Contents secara manual di Word) —
     satu paragraf berisi begin/instrText/separate/teks-placeholder/end.
-  - Karena <w:updateFields w:val="true"/> sudah diset di settings.xml
+    Karena <w:updateFields w:val="true"/> sudah diset di settings.xml
     (lihat _ensure_update_fields), Word otomatis meng-update SEMUA field
     ketika dokumen dibuka — termasuk field TOC ini — sehingga daftar isi
     langsung terisi rapi (entri + dot leader + nomor halaman + hyperlink)
     begitu file dibuka, tanpa perlu pengguna menekan F9 secara manual.
+  - PEMISAH TITIK KOMA (;), bukan koma (,), pada switch \\t — dipelajari
+    langsung dari field TOC di F.docx. Pemisah daftar pada switch field
+    Word mengikuti Regional Settings Windows si pengguna; di locale
+    Indonesia (id-ID) pemisahnya titik koma, sama seperti di F.docx. Field
+    yang salah pemisah bisa gagal menghasilkan entri ("Error! No table of
+    contents entries found.") — inilah salah satu sumber "error" yang
+    ingin dihindari.
+  - Style paragraf "TOC1" (dipakai tiap entri field di atas) SEKARANG
+    disalin field-demi-field dari definisi "toc 1" asli di F.docx (lihat
+    komentar lengkap di _ensure_toc_styles): TIDAK bold, TIDAK ada
+    indentasi tambahan (hanging/right indent), tab kiri di 720 twips +
+    tab kanan dot-leader di batas kanan area konten — persis F.docx.
+    Sebelumnya (v6) style ini masih bold & pakai hanging-indent ala
+    "Modify Style manual", sehingga tampilannya BEDA dari F.docx.
   - Field mengacu ke style "Judul", "Pasal", dan "ANNEX" — SEMUA level 1
     (flat, tanpa indentasi bertingkat), sesuai style yang diterapkan
     Engine10 (StyleFinalizerEngine) pada judul halaman (Daftar Isi/Prakata/
     Pendahuluan/Bibliografi), Pasal/Subpasal berbahasa Indonesia, dan
-    Lampiran (ANNEX) — persis pola yang terlihat pada dokumen referensi
-    (mis. F.docx): "1  Ruang lingkup", "4.1  Umum", "Lampiran A
-    (informatif) ..." semuanya tampil sebagai entri Daftar Isi.
+    Lampiran (ANNEX) — persis pola yang terlihat di F.docx: "1  Ruang
+    lingkup", "4.1  Umum", "Lampiran A (informatif) ..." semuanya tampil
+    sebagai entri Daftar Isi.
   - Engine10 TIDAK LAGI memaksa halaman ini tetap kosong (lihat perubahan
     terkait pada engine10.py — fungsi _enforce_empty_daftar_isi_page tidak
     lagi dipanggil) supaya field TOC yang disisipkan di sini tidak dihapus
     isinya di tahap akhir pipeline.
-  - Style paragraf "TOC 1" (dipakai field di atas) tetap didefinisikan di
-    styles.xml sesuai spesifikasi Modify Style manual (Arial 11 Bold,
-    tab kanan dengan dot leader, hanging indent).
   - Bagian lain (header/footer, page size/margin, romawi nomor halaman,
     posisi penyisipan setelah halaman Hak Cipta) TIDAK diubah.
 """
@@ -131,8 +143,20 @@ def _build_footer(copyright_text, pw, lm, rm):
 # Indonesia) dan "ANNEX" (judul Lampiran), SEMUA didaftarkan sebagai level 1
 # supaya tampilannya flat (tanpa indentasi bertingkat) — sama seperti pada
 # dokumen referensi (mis. F.docx).
+#
+# PENTING — pemisah SEMICOLON (;), BUKAN koma (,):
+# Dipelajari langsung dari field TOC asli di F.docx (" TOC \h \z \t
+# "Base_Heading;1;ANNEX;1;ANNEX Head;1;Biblio Title;1;Judul;1;Pasal;1" ") —
+# daftar style pada switch \t dipisahkan titik koma. Ini BUKAN kebetulan:
+# pemisah daftar (list separator) untuk switch field Word mengikuti
+# pengaturan Regional Windows si pengguna, dan pada locale Indonesia
+# (id-ID) — sama seperti locale Eropa lain — pemisahnya adalah TITIK KOMA,
+# bukan koma. Field yang ditulis dengan koma bisa gagal di-parse / gagal
+# menghasilkan entri apa pun ("Error! No table of contents entries
+# found.") pada mesin Word dengan Regional Settings Indonesia. Memakai
+# titik koma (sama seperti F.docx) menghindari masalah ini.
 # ─────────────────────────────────────────────────────────────────────────────
-_TOC_FIELD_INSTR = 'TOC \\h \\z \\t "Judul,1,Pasal,1,ANNEX,1"'
+_TOC_FIELD_INSTR = 'TOC \\h \\z \\t "Judul;1;Pasal;1;ANNEX;1"'
 _TOC_PLACEHOLDER = (
     'Klik kanan pada teks ini lalu pilih "Update Field" '
     '(atau tekan Ctrl+A kemudian F9) untuk menampilkan Daftar Isi.'
@@ -152,10 +176,13 @@ def _build_di_elements(hdr_odd, hdr_even, ftr_odd, ftr_even):
     di Word, karena <w:updateFields w:val="true"/> sudah diset di
     settings.xml (lihat _ensure_update_fields).
     """
-    TAB  = 9061
     top  = cm_to_twips(3);   bottom = cm_to_twips(2)
     left = cm_to_twips(3);   right  = cm_to_twips(2)
     pw   = cm_to_twips(21);  ph     = cm_to_twips(29.7)
+    # Posisi tab kanan (dot leader) = lebar area konten (page width dikurangi
+    # margin kiri & kanan), persis prinsip yang dipakai F.docx (tab kanan
+    # diposisikan tepat di margin kanan area teks).
+    TAB  = pw - left - right
 
     # Style penanda "jangan diterjemahkan" — style yang SAMA persis dipakai
     # engine6 untuk melindungi halaman Prakata/Pendahuluan dari mesin
@@ -225,12 +252,40 @@ def _build_di_elements(hdr_odd, hdr_even, ftr_odd, ftr_even):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# STYLE "TOC 1" — sesuai Modify Style yang dibuat manual di Word:
-#   Based on: Normal, Next: Normal, Font Arial 11 Bold, rata kiri (Left),
-#   Outline level: Body Text, Spacing before 0pt / after 6pt / Single,
-#   Indentation: Left 0 cm, Hanging 1,27 cm, Right 0,88 cm.
-# Hanya SATU level dipakai (Judul & Pasal sama-sama TOC level 1), jadi
-# hanya style "TOC 1" yang diperlukan.
+# STYLE "TOC1" — dipelajari & disalin PERSIS dari definisi style "toc 1" di
+# F.docx (word/styles.xml), supaya hasil tampilan Daftar Isi identik:
+#
+#   <w:style w:type="paragraph" w:styleId="TOC1">
+#     <w:name w:val="toc 1"/><w:basedOn w:val="Normal"/><w:next w:val="Normal"/>
+#     <w:uiPriority w:val="39"/>
+#     <w:pPr>
+#       <w:tabs>
+#         <w:tab w:val="left" w:pos="720"/>
+#         <w:tab w:val="right" w:leader="dot" w:pos="<lebar area konten>"/>
+#       </w:tabs>
+#       <w:suppressAutoHyphens/>
+#       <w:spacing w:after="120" w:line="240" w:lineRule="auto"/>
+#     </w:pPr>
+#     <w:rPr><w:rFonts w:ascii="Arial" w:hAnsi="Arial"/><w:sz w:val="22"/></w:rPr>
+#   </w:style>
+#
+# Catatan penting (beda dari versi sebelumnya, sekarang diperbaiki):
+#   - TIDAK bold (F.docx TIDAK menebalkan entri Daftar Isi — hanya judul
+#     halaman "Daftar Isi" yang bold, itu style "Judul", bukan "TOC1").
+#   - TIDAK ada w:ind (hanging/right indent) — F.docx murni memakai dua
+#     tab stop (kiri 720 twips & kanan dot-leader), tanpa indentasi
+#     tambahan apa pun.
+#   - TIDAK ada w:jc override — mengikuti default (inherit dari Normal).
+#   - Posisi tab kanan (dot leader) DIHITUNG dinamis dari lebar area
+#     konten dokumen ini (page width - margin kiri - margin kanan),
+#     mengikuti prinsip yang sama dengan F.docx (tab kanan pas di margin
+#     kanan area teks) — bukan angka mentah hasil copy dari F.docx, karena
+#     margin dokumen ini berbeda dari F.docx.
+#   - w:styleId TETAP "TOC1" (dipakai field TOC & referensi lain di file
+#     ini) meski w:name aslinya "toc 1" (huruf kecil, sesuai F.docx).
+#
+# Hanya SATU level dipakai (Judul, Pasal & ANNEX sama-sama TOC level 1),
+# jadi hanya style "TOC1" yang diperlukan.
 # ─────────────────────────────────────────────────────────────────────────────
 def _ensure_toc_styles(files: dict) -> None:
     key = 'word/styles.xml'
@@ -238,22 +293,25 @@ def _ensure_toc_styles(files: dict) -> None:
         return
     styles_xml = files[key].decode('utf-8')
 
-    TAB     = 9061
-    hang    = cm_to_twips(1.27)   # 720
-    rindent = cm_to_twips(0.88)   # 498
+    pw   = cm_to_twips(21)
+    left = cm_to_twips(3)
+    right = cm_to_twips(2)
+    TAB  = pw - left - right   # posisi tab kanan (dot leader) = lebar konten
 
     toc1_xml = (
-        f'<w:style w:type="paragraph" w:customStyle="1" w:styleId="TOC1">'
-        f'<w:name w:val="TOC 1"/><w:basedOn w:val="Normal"/><w:next w:val="Normal"/>'
-        f'<w:autoRedefine/><w:uiPriority w:val="39"/><w:unhideWhenUsed/><w:qFormat/>'
+        f'<w:style w:type="paragraph" w:styleId="TOC1">'
+        f'<w:name w:val="toc 1"/><w:basedOn w:val="Normal"/><w:next w:val="Normal"/>'
+        f'<w:uiPriority w:val="39"/>'
         f'<w:pPr>'
-        f'<w:jc w:val="left"/>'
-        f'<w:tabs><w:tab w:val="right" w:leader="dot" w:pos="{TAB}"/></w:tabs>'
-        f'<w:spacing w:before="0" w:after="120" w:line="240" w:lineRule="auto"/>'
-        f'<w:ind w:left="0" w:right="{rindent}" w:hanging="{hang}"/>'
+        f'<w:tabs>'
+        f'<w:tab w:val="left" w:pos="720"/>'
+        f'<w:tab w:val="right" w:leader="dot" w:pos="{TAB}"/>'
+        f'</w:tabs>'
+        f'<w:suppressAutoHyphens/>'
+        f'<w:spacing w:after="120" w:line="240" w:lineRule="auto"/>'
         f'</w:pPr>'
         f'<w:rPr><w:rFonts w:ascii="Arial" w:hAnsi="Arial" w:cs="Arial"/>'
-        f'<w:b/><w:sz w:val="22"/><w:szCs w:val="22"/></w:rPr>'
+        f'<w:sz w:val="22"/><w:szCs w:val="22"/></w:rPr>'
         f'</w:style>'
     )
 
