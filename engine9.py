@@ -13,6 +13,7 @@ FIX v2:
 import re
 import copy
 import time
+import random
 import uuid
 import traceback
 import csv
@@ -57,7 +58,14 @@ _HEADING_STYLES_WITH_NUM = {
     'ANNEX', 'a2', 'a3',
     'Heading4', 'Heading5', 'Heading6',
 }
-_TRANSLATE_DELAY = 0.15
+# Jeda antar-request ke server translate. Dinaikkan dari 0.15 dan diberi
+# sedikit jitter acak agar pola request tidak terlalu beraturan — mengurangi
+# risiko server translate melakukan rate-limit/menolak (500) yang sebelumnya
+# menyebabkan teks error server ikut tersisip ke dokumen hasil.
+_TRANSLATE_DELAY = 0.35
+
+def _translate_delay() -> float:
+    return _TRANSLATE_DELAY + random.uniform(0, 0.15)
 _EM_DASH = '—'
 
 _LINK_PLACEHOLDER_BASE = "https://placeholder-link.local/"
@@ -875,7 +883,40 @@ def _notify(cb, pct: int, msg: str) -> None:
 # TRANSLATOR WRAPPER
 # ─────────────────────────────────────────────────────────────────────────────
 
+# Tanda-tanda hasil "terjemahan" sebenarnya adalah halaman error server
+# (mis. Google Translate rate-limit / down mengembalikan HTML error, dan
+# deep-translator ikut menelan teks error itu tanpa melempar Exception).
+# Jika hasil translate cocok salah satu pola ini, hasil tsb DIBUANG dan
+# dianggap gagal (fallback ke teks asli), bukan dimasukkan ke dokumen.
+_RE_TRANSLATE_ERROR_PAGE = re.compile(
+    r'error\s*5\d{2}|server\s*error|that.?s\s*an\s*error|that.?s\s*all\s*we\s*know|'
+    r'please\s*try\s*again\s*later|<\s*html|<!doctype|<\s*body|internal\s*server\s*error|'
+    r'bad\s*gateway|service\s*unavailable|gateway\s*time-?out',
+    re.IGNORECASE
+)
+
+
+def _is_bad_translation(original: str, result: str) -> bool:
+    """Deteksi hasil translate yang sebenarnya adalah pesan error, bukan terjemahan asli."""
+    if not result or not result.strip():
+        return True
+    if _RE_TRANSLATE_ERROR_PAGE.search(result):
+        return True
+    # Hasil error page umumnya jauh lebih panjang dari teks pendek asal dan
+    # tidak berkaitan sama sekali dengan teks sumber — proteksi tambahan
+    # untuk teks sumber pendek yang tiba-tiba menghasilkan blok teks panjang.
+    if len(original) <= 40 and len(result) > 200:
+        return True
+    return False
+
+
 class _Translator:
+    # Jumlah percobaan translate per potongan teks sebelum menyerah dan
+    # memakai teks asli (mencegah teks error/HTML dari server tersisip ke
+    # dalam dokumen akhir, dan mencegah proses berhenti/crash).
+    _MAX_ATTEMPTS = 4
+    _RETRY_BACKOFF = (0.8, 1.6, 3.0)  # detik, dipakai berurutan antar percobaan
+
     def __init__(self, source: str = 'auto', target: str = 'id', 
                  custom_dict: CustomDictionary | None = None,
                  italic_dict: ItalicDictionary | None = None):
@@ -884,6 +925,7 @@ class _Translator:
         self._cls = GoogleTranslator
         self.source = source; self.target = target
         self.custom_dict = custom_dict; self.italic_dict = italic_dict
+        self.fail_count = 0  # jumlah potongan teks yang gagal diterjemahkan (fallback ke asli)
 
     def translate_one(self, text: str, italic_map: dict = None) -> tuple[str, list[str]]:
         t = text.strip()
@@ -892,15 +934,26 @@ class _Translator:
         if self.custom_dict and len(self.custom_dict) > 0:
             t, token_map = self.custom_dict._apply_pre(t)
         final_italic_map = italic_map or {}
-        try:
-            result = self._cls(source=self.source, target=self.target).translate(t)
-            if not result: result = t
-        except Exception:
-            time.sleep(0.8)
+
+        result = None
+        for attempt in range(self._MAX_ATTEMPTS):
             try:
-                result = self._cls(source=self.source, target=self.target).translate(t)
-                if not result: result = t
-            except Exception: result = t
+                candidate = self._cls(source=self.source, target=self.target).translate(t)
+            except Exception:
+                candidate = None
+            if candidate and not _is_bad_translation(t, candidate):
+                result = candidate
+                break
+            if attempt < self._MAX_ATTEMPTS - 1:
+                time.sleep(self._RETRY_BACKOFF[min(attempt, len(self._RETRY_BACKOFF) - 1)])
+
+        if result is None:
+            # Semua percobaan gagal / hanya mengembalikan halaman error —
+            # pertahankan teks asli agar dokumen TIDAK pernah berisi pesan
+            # error server, dan proses tetap lanjut tanpa crash.
+            result = t
+            self.fail_count += 1
+
         if token_map: result = self.custom_dict._apply_post(result, token_map)
         italic_terms_found = []
         if final_italic_map:
@@ -974,7 +1027,7 @@ def _translate_para(para, tr, past_bibliography: bool = False) -> list[str]:
     
     # Terjemahkan
     translated, italic_terms_found = tr.translate_one(combined, italic_map)
-    time.sleep(_TRANSLATE_DELAY)
+    time.sleep(_translate_delay())
     if not translated or translated == combined: 
         if has_hl:
             _translate_hyperlinks_in_para(para, tr)
@@ -1226,6 +1279,8 @@ class DocxFinalTranslatorEngine:
             summary = f"✅ Done!"
             if italic_count > 0: summary += f" Miring: {italic_count}."
             if link_count > 0: summary += f" Link: {link_count}."
+            if tr.fail_count > 0:
+                summary += f" ⚠️ {tr.fail_count} teks gagal diterjemahkan (server translate bermasalah), teks asli dipertahankan."
             _notify(progress_callback, 100, summary)
             return True, output_docx
 
