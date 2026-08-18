@@ -34,17 +34,31 @@ def _esc(t: str) -> str:
 
 
 def _rpr(bold=False, italic=False, size_pt=11, color=None) -> str:
-    """Return <w:rPr> — selalu menyertakan <w:noproof/>."""
+    """Return <w:rPr> — selalu menyertakan <w:noProof/>.
+
+    PENTING: urutan child element di dalam <w:rPr> WAJIB mengikuti urutan
+    skema resmi OOXML (ECMA-376 CT_RPr), yaitu:
+    rFonts -> b -> bCs -> i -> iCs -> ... -> noProof -> ... -> color -> ...
+    -> sz -> szCs -> ...
+    Sebelumnya <w:noProof/> diletakkan PALING AKHIR (setelah w:sz/w:szCs),
+    yang melanggar urutan skema tsb. Meski sering "dimaafkan" oleh Word,
+    urutan yang salah berisiko membuat properti run (termasuk <w:i/> /
+    italic) diabaikan atau dibuang saat dokumen dibuka/disimpan ulang oleh
+    aplikasi yang lebih ketat terhadap validasi skema. Urutan di bawah ini
+    memastikan formatting (termasuk italic) selalu tampil sempurna &
+    konsisten di semua versi Word.
+    """
     b  = '<w:b/>'  if bold   else ''
-    i  = '<w:i/>'  if italic else ''
+    i  = '<w:i/><w:iCs/>' if italic else ''
     sz = int(size_pt * 2)
     cl = f'<w:color w:val="{color}"/>' if color else ''
     return (
         f'<w:rPr>'
         f'<w:rFonts w:ascii="Arial" w:eastAsia="Arial" w:hAnsi="Arial" w:cs="Arial"/>'
-        f'{b}{i}{cl}'
+        f'{b}{i}'
+        f'<w:noProof/>'
+        f'{cl}'
         f'<w:sz w:val="{sz}"/><w:szCs w:val="{sz}"/>'
-        f'<w:noproof/>'
         f'</w:rPr>'
     )
 
