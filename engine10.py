@@ -27,7 +27,11 @@ Penerapan otomatis:
   Style "Pasal" -> semua Pasal (paragraf ber-style "Heading 1") dan Subpasal
       (paragraf ber-style "Heading 2") yang BERBAHASA INDONESIA saja, KECUALI:
         - Sub-subpasal ke bawah (Heading 3, Heading 4, dst.) — tidak disentuh.
-        - Pasal "Istilah dan Definisi" beserta subpasal di bawahnya — dilewati.
+        - Subpasal (3.1, 3.2, ...) di bawah Pasal "Istilah dan Definisi" —
+          tetap dilewati (supaya tidak membanjiri Daftar Isi/ToC). TAPI
+          Pasal "Istilah dan Definisi" itu SENDIRI (mis. Pasal 3) TETAP
+          diberi style "Pasal" supaya ikut muncul di Daftar Isi (ToC
+          dibangun dari style "Judul" & "Pasal").
         - Seluruh bagian berbahasa Inggris — dilewati sepenuhnya.
 
 Bagian lain dokumen (tabel, isi paragraf biasa, cover, entri daftar isi,
@@ -55,9 +59,11 @@ from docx.oxml.ns import nsdecls
 # Konstanta
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Teks heading yang harus DILEWATI saat menerapkan style "Pasal"
-# (pasal "istilah dan definisi" & turunannya tidak diberi style Pasal).
-_SKIP_SECTION_TITLES = {
+# Teks heading Pasal yang SUBPASAL-nya (Heading 2, mis. 3.1, 3.2, ...) harus
+# DILEWATI saat menerapkan style "Pasal" (supaya tidak membanjiri Daftar
+# Isi/ToC). Pasal itu sendiri (Heading 1, mis. "3  Istilah dan Definisi")
+# TETAP diberi style "Pasal" — lihat _collect_pasal_targets().
+_SKIP_SUBSECTION_TITLES = {
     'istilah dan definisi',
     'istilah dan definisi umum',
 }
@@ -167,10 +173,21 @@ def _clear_paragraph_direct_formatting(paragraph, drop_tags):
 
 
 def _strip_run_direct_formatting(paragraph):
-    """Hapus rPr langsung pada tiap run agar teks mengikuti rPr dari style paragraf."""
+    """Hapus rPr langsung pada tiap run agar teks mengikuti rPr dari style
+    paragraf, TAPI pertahankan w:vertAlign (superscript/subscript) supaya
+    superscript pada teks (mis. m², catatan kaki angka) tidak ikut hilang
+    dan tetap berfungsi normal."""
     for r in paragraph._p.findall(qn('w:r')):
         rPr = r.find(qn('w:rPr'))
-        if rPr is not None:
+        if rPr is None:
+            continue
+        vert = rPr.find(qn('w:vertAlign'))
+        if vert is not None:
+            # Buang semua properti langsung lain, sisakan hanya vertAlign
+            for child in list(rPr):
+                if child is not vert:
+                    rPr.remove(child)
+        else:
             r.remove(rPr)
 
 
@@ -285,8 +302,10 @@ class StyleFinalizerEngine:
                 _apply_judul(doc, paras[idx], force_page_break_before=force_pb)
 
             # 5) Kumpulkan target paragraf untuk style "Pasal"
-            #    (hanya Heading 1 & Heading 2, hanya di rentang bahasa Indonesia,
-            #     lewati pasal "Istilah dan Definisi" & turunannya)
+            #    (hanya Heading 1 & Heading 2, hanya di rentang bahasa Indonesia).
+            #    Pasal "Istilah dan Definisi" (Heading 1) SENDIRI tetap diberi
+            #    style "Pasal" (supaya muncul di Daftar Isi/ToC); hanya
+            #    subpasal-nya (Heading 2, mis. 3.1, 3.2, ...) yang dilewati.
             heading1_num_id = _resolve_num_id(doc, 'Heading1')
             heading2_num_id = _resolve_num_id(doc, 'Heading2') or heading1_num_id
 
@@ -295,9 +314,7 @@ class StyleFinalizerEngine:
             for i in range(id_lo, id_hi):
                 sname = style_name(paras[i])
                 if sname == 'Heading 1':
-                    skip_active = _norm(paras[i].text) in _SKIP_SECTION_TITLES
-                    if skip_active:
-                        continue
+                    skip_active = _norm(paras[i].text) in _SKIP_SUBSECTION_TITLES
                     pasal_targets.append((i, 0, heading1_num_id))
                 elif sname == 'Heading 2':
                     if skip_active:
