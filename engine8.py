@@ -27,6 +27,7 @@ import re
 import copy
 import time
 import traceback
+import uuid
 
 from docx import Document
 from docx.oxml.ns import qn
@@ -546,6 +547,114 @@ def _empty_para() -> etree._Element:
     )
 
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PROTEKSI SUPERSCRIPT / SUBSCRIPT DARI FILE INPUT
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _run_vertalign_kind(run):
+    """Return 'sup' / 'sub' sesuai format run sumber, atau None."""
+    try:
+        if run.font.superscript:
+            return 'sup'
+        if run.font.subscript:
+            return 'sub'
+    except Exception:
+        pass
+    return None
+
+
+def _extract_source_vertalign_map(text_runs):
+    """
+    Menggabungkan teks seperti perilaku lama Engine8, tetapi bagian yang
+    superscript/subscript diganti token sementara.
+
+    Token dibuat sangat unik agar mesin terjemahan tidak mengubah isi/posisinya.
+    Nilai asli disimpan VERBATIM, kemudian dikembalikan dengan formatting
+    superscript/subscript yang sama.
+    """
+    segments = []
+    for _, run in text_runs:
+        kind = _run_vertalign_kind(run)
+        text = run.text or ""
+
+        if segments and segments[-1][1] == kind:
+            segments[-1][0] += text
+        else:
+            segments.append([text, kind])
+
+    vertalign_map = {}
+    parts = []
+
+    for text, kind in segments:
+        if kind in ("sup", "sub") and text:
+            token = (
+                "@@VSUP_" if kind == "sup" else "@@VSUB_"
+            ) + uuid.uuid4().hex[:10].upper() + "@@"
+            vertalign_map[token] = (text, kind)
+            parts.append(token)
+        else:
+            parts.append(text)
+
+    return "".join(parts), vertalign_map
+
+
+def _write_translated_with_vertalign(para, translated, vertalign_map, template_run):
+    """
+    Menulis hasil terjemahan kembali ke paragraph.
+
+    Perilaku teks biasa tetap seperti Engine8 sebelumnya: hasil terjemahan
+    ditempatkan pada run pertama. Bedanya, token superscript/subscript
+    direkonstruksi menjadi run tersendiri sehingga format vertAlign tidak hilang.
+    """
+    if not vertalign_map:
+        template_run.text = translated
+        return
+
+    token_re = re.compile("|".join(re.escape(k) for k in vertalign_map.keys()))
+    pieces = []
+    last = 0
+
+    for m in token_re.finditer(translated):
+        if m.start() > last:
+            pieces.append(("normal", translated[last:m.start()]))
+        original_text, kind = vertalign_map[m.group(0)]
+        pieces.append((kind, original_text))
+        last = m.end()
+
+    if last < len(translated):
+        pieces.append(("normal", translated[last:]))
+
+    # Hapus run teks lama, lalu bangun ulang.
+    for run in list(para.runs):
+        run._element.getparent().remove(run._element)
+
+    for kind, text in pieces:
+        if not text:
+            continue
+
+        run = para.add_run(text)
+
+        # Pertahankan format dasar dari run pertama seperti perilaku Engine8
+        # sebelumnya, lalu hanya ubah vertAlign untuk bagian khusus.
+        try:
+            if template_run.font.name:
+                run.font.name = template_run.font.name
+            if template_run.font.size:
+                run.font.size = template_run.font.size
+            if template_run.bold is not None:
+                run.bold = template_run.bold
+            if template_run.italic is not None:
+                run.italic = template_run.italic
+        except Exception:
+            pass
+
+        if kind == "sup":
+            run.font.superscript = True
+        elif kind == "sub":
+            run.font.subscript = True
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # CORE: TRANSLATION
 # ─────────────────────────────────────────────────────────────────────────────
@@ -557,17 +666,24 @@ def _translate_para(para, tr, past_bibliography: bool = False) -> None:
                  if r.text and r.text.strip()]
     if not text_runs: return
 
-    combined = ''.join(r.text for _, r in text_runs)
-    if _skip_text(combined): return
+    combined_raw = ''.join(r.text for _, r in text_runs)
+    if _skip_text(combined_raw): return
 
-    translated = tr.translate_one(combined.strip())
+    # Lindungi superscript/subscript dari dokumen input sebelum teks
+    # dikirim ke mesin terjemahan.
+    combined_protected, vertalign_map = _extract_source_vertalign_map(text_runs)
+
+    translated = tr.translate_one(combined_protected.strip())
     time.sleep(_TRANSLATE_DELAY)
-    if not translated or translated == combined: return
+    if not translated or translated == combined_protected: return
 
     _, first_run = text_runs[0]
-    first_run.text = translated
-    for _, run in text_runs[1:]:
-        run.text = ''
+    _write_translated_with_vertalign(
+        para,
+        translated,
+        vertalign_map,
+        first_run
+    )
 
 def _translate_table(table, tr) -> None:
     for row in table.rows:
