@@ -17,6 +17,11 @@ Spesifikasi style (hasil dari Word "Modify Style"):
              spasi sebelum/sesudah 0pt, spasi baris 1,5 lines,
              auto-numbering TETAP mengikuti Heading 1 / Heading 2 asal
              (levelnya dipertahankan lewat override w:numPr per-paragraf).
+             Berlaku juga untuk subpasal di dalam Lampiran/Annex (paragraf
+             ber-style "a2"/"a3"): penomorannya TETAP mengikuti huruf
+             Lampiran yang bersangkutan (mis. Lampiran B -> B.1, B.2, dst.)
+             karena ilvl & numId diambil dari style "a2"/"a3" itu sendiri,
+             BUKAN dari Heading 1/Heading 2.
 
 Penerapan otomatis:
 
@@ -33,6 +38,13 @@ Penerapan otomatis:
           diberi style "Pasal" supaya ikut muncul di Daftar Isi (ToC
           dibangun dari style "Judul" & "Pasal").
         - Seluruh bagian berbahasa Inggris — dilewati sepenuhnya.
+      Style "Pasal" JUGA diterapkan pada subpasal di dalam Lampiran/Annex
+      berbahasa Indonesia (paragraf ber-style "a2"/"a3"), dengan penomoran
+      yang mengikuti huruf Lampirannya sendiri (mis. B.1, B.2, ... untuk
+      Lampiran B), BUKAN nomor Heading 1/2 dari badan dokumen utama.
+      Judul Lampiran itu sendiri (paragraf ber-style "ANNEX", mis.
+      "Lampiran B (informatif)") TIDAK disentuh — tetap memakai style
+      aslinya.
 
 Bagian lain dokumen (tabel, isi paragraf biasa, cover, entri daftar isi,
 header/footer, dst.) TIDAK diubah sama sekali.
@@ -156,6 +168,33 @@ def _resolve_num_id(doc, style_id, _depth=0):
         if parent_id and parent_id != style_id:
             return _resolve_num_id(doc, parent_id, _depth + 1)
     return None
+
+
+def _resolve_style_ilvl(doc, style_id, _depth=0):
+    """Telusuri rantai basedOn untuk menemukan w:ilvl yang dideklarasikan
+    langsung pada style ini (mis. 'a2' -> ilvl 1, 'a3' -> ilvl 2, sesuai
+    struktur multilevel list ANNEX di dokumen sumber). Default '0' jika
+    tidak ditemukan sama sekali di sepanjang rantai."""
+    if _depth > 8:
+        return '0'
+    st = _find_style_el(doc, style_id)
+    if st is None:
+        return '0'
+    pPr = st.find(qn('w:pPr'))
+    if pPr is not None:
+        numPr = pPr.find(qn('w:numPr'))
+        if numPr is not None:
+            ilvl_el = numPr.find(qn('w:ilvl'))
+            if ilvl_el is not None:
+                val = ilvl_el.get(qn('w:val'))
+                if val is not None:
+                    return val
+    based = st.find(qn('w:basedOn'))
+    if based is not None:
+        parent_id = based.get(qn('w:val'))
+        if parent_id and parent_id != style_id:
+            return _resolve_style_ilvl(doc, parent_id, _depth + 1)
+    return '0'
 
 
 def _clear_paragraph_direct_formatting(paragraph, drop_tags):
@@ -309,6 +348,15 @@ class StyleFinalizerEngine:
             heading1_num_id = _resolve_num_id(doc, 'Heading1')
             heading2_num_id = _resolve_num_id(doc, 'Heading2') or heading1_num_id
 
+            # Subpasal di dalam Lampiran/Annex ('a2'/'a3') memakai numId &
+            # ilvl milik style-nya SENDIRI (bukan Heading1/2), supaya
+            # penomorannya tetap mengikuti huruf Lampiran (mis. B.1, B.2,
+            # ... untuk Lampiran B), bukan melanjutkan nomor Pasal biasa.
+            annex_a2_num_id = _resolve_num_id(doc, 'a2')
+            annex_a3_num_id = _resolve_num_id(doc, 'a3') or annex_a2_num_id
+            annex_a2_ilvl = _resolve_style_ilvl(doc, 'a2')
+            annex_a3_ilvl = _resolve_style_ilvl(doc, 'a3')
+
             pasal_targets = []  # (idx, ilvl, num_id)
             skip_active = False
             for i in range(id_lo, id_hi):
@@ -320,7 +368,12 @@ class StyleFinalizerEngine:
                     if skip_active:
                         continue
                     pasal_targets.append((i, 1, heading2_num_id))
+                elif sname == 'a2' and annex_a2_num_id:
+                    pasal_targets.append((i, annex_a2_ilvl, annex_a2_num_id))
+                elif sname == 'a3' and annex_a3_num_id:
+                    pasal_targets.append((i, annex_a3_ilvl, annex_a3_num_id))
                 # Heading 3+ (sub-subpasal) sengaja tidak disentuh
+                # Judul Lampiran sendiri (style "ANNEX") sengaja tidak disentuh
 
             for idx, ilvl, num_id in pasal_targets:
                 _apply_pasal(doc, paras[idx], ilvl, num_id)
