@@ -270,15 +270,6 @@ class DocxOptimizerEngine:
         try:
             doc = Document(input_path)
 
-            # Tandai paragraf yang berasal LANGSUNG dari file .docx yang
-            # di-upload pengguna. Marker ini tidak mengubah tampilan dokumen
-            # dan dipertahankan oleh Word/python-docx. Engine10 memakai marker
-            # ini agar style custom "Judul" / "Pasal" TIDAK diterapkan ke
-            # isi asli file pengguna.
-            _USER_MARK_NS = 'urn:generatorrsni:user-content'
-            for _p in doc.paragraphs:
-                _p._p.set('{%s}uploaded' % _USER_MARK_NS, '1')
-
             # Hapus semua hyperlink → jadikan teks biasa
             remove_all_hyperlinks(doc)
 
@@ -360,92 +351,8 @@ class DocxOptimizerEngine:
                 pf.space_after  = Pt(0)
                 pf.line_spacing = 1.0
                 for run in paragraph.runs:
-                    # Hanya ubah font keluarga/ukuran. Jangan menyentuh
-                    # rPr lain (termasuk w:vertAlign = superscript/subscript).
                     run.font.name = font_name
                     run.font.size = Pt(font_size)  # selalu 11pt, termasuk heading/pasal
-
-            def _replace_paragraph_text_preserve_run_formatting(paragraph, new_text):
-                """Ganti teks paragraf tanpa meratakan seluruh run menjadi satu run.
-
-                Word menyimpan superscript/subscript pada level run melalui
-                w:vertAlign. Penggunaan ``paragraph.text = ...`` menghapus seluruh
-                run asli sehingga formatting seperti x², m³, CO₂, dll. dapat hilang.
-                Fungsi ini memetakan karakter teks baru ke formatting run asli.
-
-                Jika panjang teks hanya berubah karena penyisipan/penggantian nomor
-                heading, formatting karakter isi tetap mengikuti run sumber.
-                """
-                from copy import deepcopy
-                from lxml import etree
-
-                old_runs = list(paragraph.runs)
-                if not old_runs:
-                    paragraph.add_run(new_text)
-                    return
-
-                # Simpan teks + rPr tiap run. Ini mempertahankan superscript,
-                # subscript, bold, italic, underline, font, warna, dll.
-                segments = []
-                for run in old_runs:
-                    txt = run.text or ''
-                    rpr = run._r.find(qn('w:rPr'))
-                    segments.append((txt, deepcopy(rpr) if rpr is not None else None))
-
-                old_text = ''.join(t for t, _ in segments)
-
-                # Cari titik perubahan sederhana: prefix dan suffix yang sama.
-                prefix = 0
-                max_prefix = min(len(old_text), len(new_text))
-                while prefix < max_prefix and old_text[prefix] == new_text[prefix]:
-                    prefix += 1
-
-                suffix = 0
-                old_remaining = len(old_text) - prefix
-                new_remaining = len(new_text) - prefix
-                while suffix < old_remaining and suffix < new_remaining and \
-                        old_text[len(old_text) - 1 - suffix] == new_text[len(new_text) - 1 - suffix]:
-                    suffix += 1
-
-                # Buat daftar unit karakter + rPr sumber.
-                char_props = []
-                for txt, rpr in segments:
-                    for ch in txt:
-                        char_props.append(deepcopy(rpr) if rpr is not None else None)
-
-                def props_for_position(pos):
-                    if not char_props:
-                        return None
-                    if pos < prefix:
-                        return char_props[pos]
-                    if pos >= len(new_text) - suffix:
-                        old_pos = len(old_text) - (len(new_text) - pos)
-                        if 0 <= old_pos < len(char_props):
-                            return char_props[old_pos]
-                    # Karakter baru (mis. spasi setelah nomor) mengikuti
-                    # formatting karakter terdekat di sisi kiri.
-                    left = min(max(prefix - 1, 0), len(char_props) - 1)
-                    return char_props[left]
-
-                # Hapus semua run lama, tetapi pertahankan elemen non-run seperti
-                # bookmark/drawing yang mungkin ada pada paragraf.
-                for run in old_runs:
-                    run._element.getparent().remove(run._element)
-
-                # Kelompokkan karakter berurutan yang mempunyai rPr sama.
-                groups = []
-                for i, ch in enumerate(new_text):
-                    rpr = props_for_position(i)
-                    key = etree.tostring(rpr) if rpr is not None else b''
-                    if groups and groups[-1][2] == key:
-                        groups[-1][1] += ch
-                    else:
-                        groups.append([ch, ch, key, rpr])
-
-                for _, text, _, rpr in groups:
-                    r = paragraph.add_run(text)
-                    if rpr is not None:
-                        r._r.insert(0, deepcopy(rpr))
 
             def is_subpasal_3(text):
                 return bool(re.match(r'^3\.\d+(\s|$)', text))
@@ -476,51 +383,6 @@ class DocxOptimizerEngine:
                         pass
 
             paragraphs = list(doc.paragraphs)
-
-            # Hapus kalimat pengantar tabel/gambar yang isinya cuma referensi
-            # nomor tabel/gambar (mis. "Table B.1 summarizes the operation
-            # categories." / "Tabel B.1 merangkum kategori operasi.") saat
-            # kalimat itu langsung diikuti oleh judul tabel/gambar dengan
-            # nomor yang SAMA (mis. "Table B.1 — Summary of the operation
-            # categories."). Kalimat ini double dengan judul di bawahnya,
-            # jadi teksnya dikosongkan (bukan paragrafnya yang dihapus,
-            # supaya page-break/format lain yang menempel di paragraf itu
-            # tetap terjaga).
-            re_table_ref_intro = re.compile(
-                r'^(table|tabel|figure|gambar)\s+([A-Za-z0-9]+(?:[.\-][A-Za-z0-9]+)*)\b',
-                re.IGNORECASE
-            )
-            for _idx, _p in enumerate(paragraphs):
-                _txt = _p.text.strip()
-                _m = re_table_ref_intro.match(_txt)
-                if not _m:
-                    continue
-                _ref_no = _m.group(2).lower()
-                # Cari paragraf non-kosong berikutnya
-                _j = _idx + 1
-                while _j < len(paragraphs) and not paragraphs[_j].text.strip():
-                    _j += 1
-                if _j >= len(paragraphs):
-                    continue
-                _nxt = paragraphs[_j]
-                _nxt_txt = _nxt.text.strip()
-                _nxt_m = re_table_ref_intro.match(_nxt_txt)
-                if not _nxt_m or _nxt_m.group(2).lower() != _ref_no:
-                    continue
-                # Paragraf berikutnya memang judul tabel/gambar dgn nomor sama
-                # -> kosongkan teks kalimat pengantar ini, pertahankan run
-                # non-teks (mis. page break) agar layout lain tidak berubah.
-                for _run in list(_p.runs):
-                    _has_break = (
-                        _run._element.find(qn('w:br')) is not None or
-                        _run._element.find(qn('w:cr')) is not None
-                    )
-                    if _has_break:
-                        for _t_el in _run._element.findall(qn('w:t')):
-                            _run._element.remove(_t_el)
-                    else:
-                        _run._element.getparent().remove(_run._element)
-
             tables = list(doc.tables)
 
             # Tambah enter setelah tabel
@@ -822,19 +684,19 @@ class DocxOptimizerEngine:
                         # Format sub-heading annex: left align, bold
                         p.alignment = WD_ALIGN_PARAGRAPH.LEFT
                         if match_annex_sub:
-                            _replace_paragraph_text_preserve_run_formatting(p, f"{match_annex_sub.group(1)}    {match_annex_sub.group(2)}")
+                            p.text = f"{match_annex_sub.group(1)}    {match_annex_sub.group(2)}"
                         for run in p.runs:
                             run.bold = True
                             run.font.name = font_name
                             run.font.size = Pt(font_size)
                     elif match_annex_sub:
-                        _replace_paragraph_text_preserve_run_formatting(p, f"{match_annex_sub.group(1)}    {match_annex_sub.group(2)}")
+                        p.text = f"{match_annex_sub.group(1)}    {match_annex_sub.group(2)}"
                         for run in p.runs:
                             run.bold = True
                             run.font.name = font_name
                             run.font.size = Pt(font_size)
                     elif match_number and not match_bab:
-                        _replace_paragraph_text_preserve_run_formatting(p, f"{match_number.group(1)}    {match_number.group(2)}")
+                        p.text = f"{match_number.group(1)}    {match_number.group(2)}"
                         for run in p.runs:
                             run.bold = True
                             run.font.name = font_name
@@ -928,6 +790,8 @@ class DocxOptimizerEngine:
                     # Note
                     if txt.lower().startswith('note') or txt.lower().startswith('catatan'):
                         full_text = p.text
+                        for run in p.runs[:]:
+                            run._element.getparent().remove(run._element)
 
                         import re as _re
                         m = _re.match(
@@ -935,25 +799,27 @@ class DocxOptimizerEngine:
                             full_text, _re.IGNORECASE
                         )
                         if m:
-                            bold_end = m.end()
+                            bold_part = m.group(1)
+                            normal_part = full_text[m.end():]
                         elif ':' in full_text:
-                            bold_end = full_text.find(':') + 1
+                            parts = full_text.split(':', 1)
+                            bold_part = parts[0] + ':'
+                            normal_part = parts[1] if len(parts) > 1 else ''
                         else:
                             words = full_text.split(None, 1)
-                            bold_end = len(words[0]) if words else 0
+                            bold_part = words[0]
+                            normal_part = ' ' + words[1] if len(words) > 1 else ''
 
-                        # Jangan gunakan p.text / hapus-run + add_run di sini:
-                        # itu akan menghilangkan w:vertAlign pada superscript/subscript.
-                        _replace_paragraph_text_preserve_run_formatting(p, full_text)
+                        run_bold = p.add_run(bold_part)
+                        run_bold.bold = True
+                        run_bold.font.size = Pt(10)
+                        run_bold.font.name = font_name
 
-                        pos = 0
-                        for run in p.runs:
-                            run_len = len(run.text or '')
-                            run.font.size = Pt(10)
-                            run.font.name = font_name
-                            if pos < bold_end:
-                                run.bold = True
-                            pos += run_len
+                        if normal_part:
+                            run_normal = p.add_run(' ' + normal_part.lstrip())
+                            run_normal.bold = False
+                            run_normal.font.size = Pt(10)
+                            run_normal.font.name = font_name
 
                     # Spacing setelah
                     should_add_enter = True
