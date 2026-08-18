@@ -6,11 +6,17 @@ Engine untuk membuat halaman Daftar Isi sesuai standar BSN/SNI.
 v4 (Native TOC field):
   - Isi Daftar Isi TIDAK LAGI diketik manual / diekstrak sebagai teks statis.
   - Sebagai gantinya, disisipkan field TOC asli Word:
-        { TOC \\t "Judul,1,Pasal,1" \\h \\z \\u }
+        { TOC \\t "Judul,1,Pasal,1" \\h \\z }
     persis seperti hasil "References > Table of Contents > Custom Table of
     Contents" di Word dengan opsi "Styles" dicentang HANYA untuk style
-    "Judul" (TOC level 1) dan "Pasal" (TOC level 1) — style lain di-uncheck,
-    Show levels: 1.
+    "Judul" (TOC level 1) dan "Pasal" (TOC level 1) — opsi "Outline levels"
+    DI-UNCHECK (sengaja TANPA switch \\u), supaya Daftar Isi HANYA berisi
+    paragraf ber-style "Judul"/"Pasal" — bukan seluruh paragraf yang punya
+    outline level (mis. heading asli "Heading 1"/"Heading 2" sebelum
+    dikonversi, atau heading pada bagian berbahasa Inggris), yang sebelumnya
+    ikut nyasar masuk Daftar Isi tanpa titik-titik/nomor halaman karena
+    switch \\u membuat Word menyertakan SEMUA paragraf ber-outline-level
+    (union dengan hasil \\t), bukan hanya yang ber-style Judul/Pasal.
   - Word yang menghitung isi + nomor halaman secara otomatis saat dokumen
     dibuka (bukan dihitung oleh Python), sehingga Daftar Isi selalu akurat
     mengikuti pagination final. Ditambahkan <w:updateFields w:val="true"/>
@@ -119,7 +125,7 @@ def _build_footer(copyright_text, pw, lm, rm):
 # ─────────────────────────────────────────────────────────────────────────────
 # DAFTAR ISI BUILDER (native Word TOC field)
 # ─────────────────────────────────────────────────────────────────────────────
-_TOC_FIELD_INSTR = 'TOC \\t "Judul,1,Pasal,1" \\h \\z \\u'
+_TOC_FIELD_INSTR = 'TOC \\t "Judul,1,Pasal,1" \\h \\z'
 _TOC_PLACEHOLDER = (
     'Klik kanan pada teks ini lalu pilih "Update Field" '
     '(atau tekan Ctrl+A kemudian F9) untuk menampilkan Daftar Isi.'
