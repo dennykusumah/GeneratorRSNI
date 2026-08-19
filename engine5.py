@@ -297,30 +297,11 @@ def _build_di_elements(hdr_odd, hdr_even, ftr_odd, ftr_even, heading_entries=Non
             f'</w:sectPr></w:pPr></w:p>'
         )
 
-    # ── Fallback statis jika tidak ada heading yang diekstrak ──
-    if not heading_entries:
-        heading_entries = [
-            ('1    Ruang Lingkup', 0),
-            ('2    Acuan Normatif', 0),
-            ('3    Istilah dan Definisi', 0),
-            ('4    ...', 0),
-            ('5    ...', 0),
-            ('Lampiran A (informatif)', 0),
-            ('Bibliografi', 0),
-        ]
-
-    # ── Header tetap ──
-    fixed_top = [
-        ('Kata Pendahuluan', 0),
-        ('Daftar Isi', 0),
-        ('Pendahuluan', 0),
-    ]
-
-    all_entries = fixed_top + heading_entries
-
+    # ── Halaman Daftar Isi dibiarkan KOSONG (sesuai contoh ID_ip.docx) ──
+    # heading_entries tidak lagi diisikan sebagai entry; hanya judul
+    # "Daftar Isi" + baris kosong, identik dengan referensi.
     xmls = (
         [title_p(), empty_p(), empty_p(), empty_p()]
-        + [entry_p(text, level) for text, level in all_entries]
         + [sect_p()]
     )
     return xmls
