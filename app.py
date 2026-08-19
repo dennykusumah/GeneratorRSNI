@@ -1879,7 +1879,7 @@ st.markdown(
     f"<br>"
     f"<span style='font-size:0.8rem;color:#ffffff;'>© 2026 Generator RSNI · ISO to RSNI Converter · All rights reserved.</span>"
     f"<br>"
-    f"<span style='font-size:0.72rem;opacity:0.8;color:#ffffff;'>Developed by Denny Kusuma H. & Ahmad Habibi</span>"
+    f"<span style='font-size:0.72rem;opacity:0.8;color:#ffffff;'>Developed by Denny Kusuma H.</span>"
     f"</div>",
     unsafe_allow_html=True
 )
