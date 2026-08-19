@@ -37,6 +37,11 @@ _R    = f'{{{_NS_R}}}'
 
 _RE_PURE_NUMBER = re.compile(r'^[\d\s\.\,\:\;\-\(\)\[\]\/\\\+\=\*\%\&\^\$\#\@\!\"\'`~<>{}|_]+$')
 _RE_COPYRIGHT = re.compile(r'©|BSN\s*\d{4}', re.IGNORECASE)
+# Paragraf pendek berupa nama/singkatan resmi yang berdiri sendiri
+# (mis. baris "BSN" saja pada kotak hak cipta) — tidak perlu, dan tidak
+# boleh, dikirim ke Google Translate. Dicocokkan hanya jika SELURUH isi
+# paragraf persis salah satu token ini (bukan sekadar mengandungnya).
+_RE_STANDALONE_ACRONYM = re.compile(r'^(BSN|SNI|ISO|IEC)$', re.IGNORECASE)
 
 _SKIP_STYLES = {
     'caption', 'header', 'footer',
@@ -351,6 +356,7 @@ def _skip_text(text: str) -> bool:
     if len(t) < 3: return True
     if _RE_PURE_NUMBER.fullmatch(t): return True
     if _RE_COPYRIGHT.search(t): return True
+    if _RE_STANDALONE_ACRONYM.fullmatch(t): return True
     return False
 
 def _skip_paragraph(para, past_bibliography: bool = False) -> bool:
@@ -928,6 +934,35 @@ def _notify(cb, pct: int, msg: str) -> None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# PROTEKSI: DETEKSI HASIL "TERJEMAHAN" YANG SEBENARNYA HALAMAN ERROR
+# ─────────────────────────────────────────────────────────────────────────────
+# deep_translator (Google Translate gratis) kadang TIDAK melempar exception
+# saat diblokir/limit rate — ia malah mengembalikan teks halaman error mentah
+# (mis. "500. That's an error. ... That's all we know.") seolah itu hasil
+# terjemahan valid. Tanpa validasi, teks sampah ini langsung menimpa isi
+# dokumen. Fungsi ini mendeteksi pola tersebut agar hasil semacam itu
+# DIBUANG dan teks asli dipertahankan, bukan diganti dengan sampah.
+_RE_ERROR_RESPONSE = re.compile(
+    r"that'?s an error|that'?s all we know|server error|"
+    r"unusual traffic|please try again later|"
+    r"<html|<!doctype|\b50[0-9]\b.{0,15}error|\berror\b.{0,15}\b50[0-9]\b",
+    re.IGNORECASE
+)
+
+def _looks_like_error_response(original: str, translated: str) -> bool:
+    if not translated:
+        return False
+    if _RE_ERROR_RESPONSE.search(translated):
+        return True
+    # Hasil "terjemahan" yang tiba-tiba jauh lebih panjang dari teks aslinya
+    # (mis. paragraf 3 kata jadi ratusan karakter) juga mencurigakan —
+    # kemungkinan besar itu bukan terjemahan, tapi halaman/pesan lain.
+    if len(original) <= 20 and len(translated) > 150:
+        return True
+    return False
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # TRANSLATOR WRAPPER
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -950,12 +985,12 @@ class _Translator:
         final_italic_map = italic_map or {}
         try:
             result = self._cls(source=self.source, target=self.target).translate(t)
-            if not result: result = t
+            if not result or _looks_like_error_response(t, result): result = t
         except Exception:
             time.sleep(0.8)
             try:
                 result = self._cls(source=self.source, target=self.target).translate(t)
-                if not result: result = t
+                if not result or _looks_like_error_response(t, result): result = t
             except Exception: result = t
         if token_map: result = self.custom_dict._apply_post(result, token_map)
         italic_terms_found = []
