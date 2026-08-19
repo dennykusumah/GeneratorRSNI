@@ -129,6 +129,18 @@ def make_border_top(sz_eighth_pts=12):
     return f'<w:pBdr><w:top w:val="single" w:sz="{sz_eighth_pts}" w:space="1" w:color="000000"/></w:pBdr>'
 
 
+def extract_sni_year(sni_number):
+    """
+    Ekstrak 4 digit tahun terakhir dari nomor SNI, yaitu angka setelah ':'.
+    Contoh: 'SNI ISO 9828-1:2025' -> '2025'
+    Mengembalikan string kosong jika tidak ditemukan.
+    """
+    if not sni_number:
+        return ""
+    m = re.search(r':\s*(\d{4})', sni_number)
+    return m.group(1) if m else ""
+
+
 # ──────────────────────────────────────────────────────────
 # HEADER / FOOTER XML BUILDERS
 # ──────────────────────────────────────────────────────────
@@ -770,9 +782,13 @@ class CoverPageEngine:
             cover_content = build_cover_body_xml(title_id, title_en, ref_standard)
 
             # ── Build halaman hak cipta (page 2 dari section cover)
+            # "© ISO XXXX" -> XXXX = 4 digit terakhir nomor SNI setelah ':'
+            # (mis. "SNI ISO 9828-1:2025" -> "2025"). Fallback ke iso_year
+            # param / bsn_year hanya jika nomor SNI tidak mengandung tahun.
+            sni_year = extract_sni_year(sni_number)
             copyright_content = build_copyright_body_xml(
                 bsn_year=bsn_year,
-                iso_year=iso_year if iso_year else bsn_year,
+                iso_year=sni_year if sni_year else (iso_year if iso_year else bsn_year),
                 city=copyright_city
             )
 
