@@ -482,6 +482,112 @@ def _extract_source_italic_map(text_runs, para_style_italic: bool) -> tuple[str,
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# PROTEKSI PANGKAT (SUPERSCRIPT) & INDEKS (SUBSCRIPT)
+# ─────────────────────────────────────────────────────────────────────────────
+# Dokumen ISO sering memuat notasi teknis dengan pangkat/indeks, misalnya
+# "kWm⁻²" atau rumus kimia semacam "CO₂". Sebelumnya _translate_para
+# menggabungkan seluruh run paragraf menjadi satu string polos sebelum
+# dikirim ke mesin terjemahan, sehingga informasi w:vertAlign (superscript/
+# subscript) per-run ikut hilang dan hasil akhirnya tampil rata (tidak lagi
+# berupa pangkat/indeks) — baik pada dokumen hasil format (Inggris) maupun
+# hasil terjemahan (Indonesia). Fungsi-fungsi berikut melindungi teks yang
+# berformat superscript/subscript dengan mekanisme token yang sama seperti
+# proteksi miring di atas, agar formatnya bisa dikembalikan persis setelah
+# proses terjemahan selesai.
+
+def _run_vertalign(run) -> str | None:
+    """Kembalikan 'superscript', 'subscript', atau None sesuai format run."""
+    try:
+        if run.font.superscript:
+            return 'superscript'
+        if run.font.subscript:
+            return 'subscript'
+    except Exception:
+        pass
+    # Fallback baca langsung XML — beberapa run tidak selalu terbaca lewat
+    # properti python-docx bila nilai w:vertAlign bukan True/False sederhana.
+    rPr = run._element.find(f'{_W}rPr')
+    if rPr is not None:
+        va_el = rPr.find(f'{_W}vertAlign')
+        if va_el is not None:
+            val = va_el.get(f'{_W}val', '')
+            if val == 'superscript': return 'superscript'
+            if val == 'subscript': return 'subscript'
+    return None
+
+
+def _extract_source_format_map(text_runs, para_style_italic: bool) -> tuple[str, dict]:
+    """
+    Versi gabungan dari _extract_source_italic_map yang JUGA melindungi
+    superscript/subscript. Menggabungkan run menjadi satu teks, tapi:
+      - Segmen superscript/subscript SELALU dilindungi token (berapa pun
+        panjangnya — bisa cuma 1 karakter seperti pangkat "2"), supaya
+        teks & formatnya persis sama setelah diterjemahkan.
+      - Segmen miring (tanpa superscript/subscript) tetap memakai aturan
+        lama (istilah/judul asing yang sudah miring di sumber).
+    token_map: token -> {'text': teks asli, 'italic': bool, 'vtype': str|None}
+    """
+    segments = []
+    for _, r in text_runs:
+        is_ital = _run_effective_italic(r, para_style_italic)
+        vtype = _run_vertalign(r)
+        key = (is_ital, vtype)
+        t = r.text or ''
+        if segments and segments[-1][1] == key:
+            segments[-1][0] += t
+        else:
+            segments.append([t, key])
+
+    token_map = {}
+    out_parts = []
+    for seg_text, (is_ital, vtype) in segments:
+        stripped = seg_text.strip()
+        if not stripped:
+            out_parts.append(seg_text)
+            continue
+        protect = False
+        if vtype is not None:
+            protect = True
+        elif is_ital and len(stripped) >= 3 and not _RE_PURE_NUMBER.fullmatch(stripped):
+            protect = True
+        if protect:
+            token = f'@@SRC_{uuid.uuid4().hex[:8].upper()}@@'
+            token_map[token] = {'text': seg_text, 'italic': is_ital, 'vtype': vtype}
+            out_parts.append(token)
+        else:
+            out_parts.append(seg_text)
+    return ''.join(out_parts), token_map
+
+
+def _detokenize_with_formatting(text: str, token_map: dict) -> tuple[str, list]:
+    """
+    Kembalikan token @@SRC_...@@ pada `text` menjadi teks aslinya (verbatim),
+    sekaligus catat posisi (start, end, italic, vtype) di teks HASIL agar
+    formatnya (miring/superscript/subscript) bisa diterapkan secara presisi
+    saat membangun ulang run — tanpa perlu mencari-cari substring lagi.
+    """
+    if not token_map:
+        return text, []
+    pattern = re.compile('|'.join(re.escape(t) for t in token_map.keys()))
+    spans = []
+    chunks = []
+    cur_len = 0
+    last_end = 0
+    for m in pattern.finditer(text):
+        plain = text[last_end:m.start()]
+        chunks.append(plain)
+        cur_len += len(plain)
+        info = token_map[m.group(0)]
+        orig_text = info['text']
+        spans.append((cur_len, cur_len + len(orig_text), info.get('italic', False), info.get('vtype')))
+        chunks.append(orig_text)
+        cur_len += len(orig_text)
+        last_end = m.end()
+    chunks.append(text[last_end:])
+    return ''.join(chunks), spans
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # LINK HANDLING (FIXED - AMAN, TIDAK MERUSAK XML)
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -542,70 +648,90 @@ def _translate_hyperlinks_in_para(para, tr) -> None:
 # ITALIC FORMATTING
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _apply_mixed_formatting_to_para(para, text: str, italic_terms: list[str], 
-                                     font_name: str = None, font_size: int = None) -> None:
-    """Terapkan formatting: kata di italic_terms jadi MIRING."""
-    if not italic_terms:
-        if para.runs:
-            para.runs[0].text = text
-            for r in para.runs[1:]: r.text = ''
-        else:
-            para.add_run(text)
-        return
-    
-    italic_positions = []
-    for term in italic_terms:
-        start = 0
-        term_lower = term.lower()
+def _apply_mixed_formatting_to_para(para, text: str, italic_terms: list[str],
+                                     font_name: str = None, font_size: int = None,
+                                     format_spans: list = None) -> None:
+    """
+    Terapkan formatting ke paragraf hasil terjemahan:
+      - `format_spans`: posisi PRESISI (start, end, italic, vtype) hasil
+        dari _detokenize_with_formatting — dipakai untuk mengembalikan
+        superscript/subscript (dan miring sumber) persis seperti aslinya.
+      - `italic_terms`: daftar istilah (dari Kamus Istilah Asing) yang perlu
+        dicari lagi posisinya di teks (pendekatan lama, best-effort, hanya
+        untuk MIRING, tidak pernah untuk superscript/subscript).
+    """
+    format_spans = format_spans or []
+
+    # Posisi yang sudah dipakai oleh format_spans (presisi) — istilah kamus
+    # tidak boleh menimpa area ini.
+    covered = [(s, e) for s, e, _, _ in format_spans]
+
+    def _overlaps_covered(s, e):
+        for cs, ce in covered:
+            if s < ce and e > cs:
+                return True
+        return False
+
+    dict_positions = []
+    if italic_terms:
         text_lower = text.lower()
-        while True:
-            idx = text_lower.find(term_lower, start)
-            if idx == -1: break
-            italic_positions.append((idx, idx + len(term)))
-            start = idx + 1
-    
-    italic_positions.sort(key=lambda x: x[0])
-    
-    filtered_positions = []
-    last_end = -1
-    for start, end in italic_positions:
-        if start >= last_end:
-            filtered_positions.append((start, end))
-            last_end = end
-    
-    if not filtered_positions:
+        for term in italic_terms:
+            term_lower = term.lower()
+            start = 0
+            while True:
+                idx = text_lower.find(term_lower, start)
+                if idx == -1: break
+                dict_positions.append((idx, idx + len(term)))
+                start = idx + 1
+        dict_positions.sort(key=lambda x: x[0])
+        filtered_dict = []
+        last_end = -1
+        for start, end in dict_positions:
+            if start >= last_end and not _overlaps_covered(start, end):
+                filtered_dict.append((start, end, True, None))
+                last_end = end
+        dict_positions = filtered_dict
+
+    all_spans = sorted(list(format_spans) + dict_positions, key=lambda x: x[0])
+
+    if not all_spans:
         if para.runs:
             para.runs[0].text = text
             for r in para.runs[1:]: r.text = ''
         else:
             para.add_run(text)
         return
-    
+
     segments = []
     last_pos = 0
-    
-    for start, end in filtered_positions:
+    for start, end, is_italic, vtype in all_spans:
+        if start < last_pos:
+            continue  # lewati span yang tumpang tindih (seharusnya sudah difilter)
         if start > last_pos:
-            segments.append((text[last_pos:start], False))
-        segments.append((text[start:end], True))
+            segments.append((text[last_pos:start], False, None))
+        segments.append((text[start:end], is_italic, vtype))
         last_pos = end
-    
+
     if last_pos < len(text):
-        segments.append((text[last_pos:], False))
-    
+        segments.append((text[last_pos:], False, None))
+
     for run in list(para.runs):
         run._element.getparent().remove(run._element)
-    
-    for seg_text, is_italic in segments:
+
+    for seg_text, is_italic, vtype in segments:
         if not seg_text: continue
-        
+
         run = para.add_run(seg_text)
         run.font.name = font_name or 'Arial'
         if font_size:
             run.font.size = Pt(font_size)
-        
+
         if is_italic:
             run.italic = True
+        if vtype == 'superscript':
+            run.font.superscript = True
+        elif vtype == 'subscript':
+            run.font.subscript = True
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1052,29 +1178,39 @@ def _translate_para(para, tr, past_bibliography: bool = False) -> list[str]:
     original_for_case = combined
 
     # Proteksi 1: istilah/judul asing yang SUDAH miring di dokumen sumber
-    # (mis. judul standar acuan pada klausul "Acuan normatif"). Bagian ini
-    # tidak diterjemahkan dan akan dicetak miring kembali di hasil.
+    # (mis. judul standar acuan pada klausul "Acuan normatif"), SERTA
+    # seluruh teks berformat superscript/subscript (pangkat/indeks) —
+    # keduanya tidak diterjemahkan dan formatnya dikembalikan persis
+    # seperti sumber setelah proses terjemahan selesai.
     para_style_italic = _get_para_style_italic(para)
-    combined_with_src_tokens, italic_map = _extract_source_italic_map(text_runs, para_style_italic)
+    combined_with_src_tokens, format_token_map = _extract_source_format_map(text_runs, para_style_italic)
     combined = combined_with_src_tokens.strip()
 
     # Proteksi 2: kamus istilah asing dari spreadsheet ("Kamus Istilah Asing")
     if tr.italic_dict and len(tr.italic_dict) > 0:
         combined, dict_italic_map = tr.italic_dict._apply_pre(combined)
-        italic_map.update(dict_italic_map)
-    
-    # Terjemahkan
-    translated, italic_terms_found = tr.translate_one(combined, italic_map)
+    else:
+        dict_italic_map = {}
+
+    # Terjemahkan (token @@SRC_...@@ dari proteksi superscript/subscript
+    # ikut terkirim dan diharapkan lolos utuh dari mesin terjemahan, sama
+    # seperti token proteksi miring lain yang sudah terbukti aman).
+    translated, italic_terms_found = tr.translate_one(combined, dict_italic_map)
     time.sleep(_TRANSLATE_DELAY)
     if not translated or translated == combined: 
         if has_hl:
             _translate_hyperlinks_in_para(para, tr)
         return []
     translated = _match_capitalization(original_for_case, translated)
-    
+
+    # Kembalikan token superscript/subscript/miring-sumber menjadi teks asli,
+    # sekaligus dapatkan posisi presisi untuk membangun ulang run.
+    translated, format_spans = _detokenize_with_formatting(translated, format_token_map)
+
     # Apply formatting ke teks normal
-    if italic_terms_found:
-        _apply_mixed_formatting_to_para(para, translated, italic_terms_found, font_name, font_size)
+    if italic_terms_found or format_spans:
+        _apply_mixed_formatting_to_para(para, translated, italic_terms_found, font_name, font_size,
+                                         format_spans=format_spans)
     else:
         if para.runs:
             para.runs[0].text = translated
