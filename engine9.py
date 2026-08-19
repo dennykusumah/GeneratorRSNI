@@ -606,11 +606,15 @@ def _apply_mixed_formatting_to_para(para, text: str, italic_terms: list[str],
 # FITUR 1: REKONSTRUKSI ANNEX
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _fix_annex_style_para(para, annex_letter: str = None) -> None:
+def _fix_annex_style_para(para, annex_letter: str = None) -> str:
+    """Rekonstruksi paragraf judul Annex/Lampiran menjadi 'Lampiran X'.
+    Mengembalikan huruf Lampiran (mis. 'A', 'B', 'C') yang benar-benar dipakai,
+    supaya pemanggil bisa menyinkronkan penomoran sub-pasal (a2/a3) di bawahnya
+    dengan huruf yang sama persis (lihat _fix_annex_sub_para)."""
     sid = _get_para_style_id(para)
-    if sid not in _ANNEX_STYLE_IDS: return
+    if sid not in _ANNEX_STYLE_IDS: return annex_letter
     full_text = ''.join(r.text for r in para.runs if r.text is not None).strip()
-    if not full_text: return
+    if not full_text: return annex_letter
     tag_norm = None; title_part = full_text
     for t in ['(informatif)', '(normatif)', '(informative)', '(normative)', '(informasi)']:
         idx = full_text.lower().find(t)
@@ -619,12 +623,15 @@ def _fix_annex_style_para(para, annex_letter: str = None) -> None:
             title_part = full_text[:idx] + " " + full_text[idx + len(t):]
             break
     annex_label = None
+    resolved_letter = annex_letter
     m_annex = re.match(r'^(?:Annex|Lampiran)\s+([A-Z0-9\.]+)\s*', title_part, flags=re.IGNORECASE)
     if m_annex:
-        annex_label = f'Lampiran {m_annex.group(1).upper()}'
+        resolved_letter = m_annex.group(1).upper()
+        annex_label = f'Lampiran {resolved_letter}'
         title_part = title_part[m_annex.end():].strip()
     elif annex_letter:
-        annex_label = f'Lampiran {annex_letter.upper()}'
+        resolved_letter = annex_letter.upper()
+        annex_label = f'Lampiran {resolved_letter}'
         title_part = re.sub(r'^(?:Annex|Lampiran)\s*\S*\s*', '', title_part, flags=re.IGNORECASE).strip()
     else:
         title_part = re.sub(r'^(?:Annex|Lampiran)\s*\S*\s*', '', title_part, flags=re.IGNORECASE).strip()
@@ -646,6 +653,55 @@ def _fix_annex_style_para(para, annex_letter: str = None) -> None:
     if tag_norm: new_runs.append(mk(tag_norm, True))
     if title_part: new_runs.extend([etree.fromstring(f'<w:r xmlns:w="{_NS_W}"><w:br/></w:r>'), mk(title_part, True)])
     for run_el in new_runs: para._element.append(run_el)
+    return resolved_letter
+
+
+def _fix_annex_sub_para(para, number_prefix: str) -> None:
+    """Sisipkan nomor pasal literal (mis. 'B.1    ') di depan judul sub-pasal
+    Annex/Lampiran (style 'a2'/'a3') dan matikan numPr bawaan Word di paragraf
+    tsb.
+
+    BUG YANG DIPERBAIKI: paragraf judul Annex (style ANNEX) sengaja dimatikan
+    penomoran otomatisnya oleh _fix_annex_style_para (numId di-set ke 0) agar
+    teks 'Lampiran A/B/C' bisa ditulis manual. Tapi ini membuat counter level-0
+    dari daftar bertingkat (multilevel list) milik style 'a2'/'a3' TIDAK PERNAH
+    di-restart ketika masuk Lampiran baru -- akibatnya nomor pasal di Lampiran
+    B, C, dst tetap numeric lanjut dari Lampiran A namun hurufnya nyangkut di
+    'A' (mis. 'A.6', 'A.7' ... padahal seharusnya 'B.1', 'B.2', ...). Solusinya
+    sama seperti judul Annex: matikan numPr paragraf ini dan tulis nomor pasal
+    (huruf Lampiran + nomor urut yang di-reset di python) sebagai teks literal.
+    """
+    pPr = para._element.find(f'{_W}pPr')
+    if pPr is None:
+        pPr = etree.SubElement(para._element, f'{_W}pPr')
+        para._element.insert(0, pPr)
+    old_numPr = pPr.find(f'{_W}numPr')
+    if old_numPr is not None: pPr.remove(old_numPr)
+    pPr.insert(0, etree.fromstring(f'<w:numPr xmlns:w="{_NS_W}"><w:ilvl w:val="0"/><w:numId w:val="0"/></w:numPr>'))
+
+    # Jangan tambah dobel kalau paragraf ini sudah pernah diberi prefix (idempoten).
+    first_run = None
+    for r in para._element.findall(f'{_W}r'):
+        t = r.find(f'{_W}t')
+        if t is not None and t.text:
+            first_run = r; break
+    if first_run is not None:
+        t_el = first_run.find(f'{_W}t')
+        if t_el is not None and t_el.text and re.match(r'^[A-Z]\.\d+(\.\d+)?\s{2,}', t_el.text):
+            return
+
+    font_name = 'Arial'; sz_val = '22'
+    for run in para.runs:
+        if run.text and run.text.strip():
+            if run.font.name: font_name = run.font.name
+            if run.font.size: sz_val = str(int(run.font.size.pt * 2))
+            break
+    esc = number_prefix.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+    new_run = etree.fromstring(
+        f'<w:r xmlns:w="{_NS_W}"><w:rPr><w:rFonts w:ascii="{font_name}" w:hAnsi="{font_name}"/>'
+        f'<w:sz w:val="{sz_val}"/><w:szCs w:val="{sz_val}"/></w:rPr>'
+        f'<w:t xml:space="preserve">{esc}</w:t></w:r>')
+    pPr.addnext(new_run)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1143,6 +1199,12 @@ class DocxFinalTranslatorEngine:
 
             total = len(items); done = 0; past_bibliography = False
             annex_counter = 0; italic_count = 0; link_count = 0
+            # Huruf Lampiran aktif (A/B/C/...) + counter nomor pasal a2/a3,
+            # di-reset setiap kali memasuki Lampiran baru. Dipakai untuk
+            # menuliskan nomor pasal literal ('B.1', 'B.2', ...) di judul
+            # sub-pasal Lampiran, lihat _fix_annex_sub_para.
+            current_annex_letter = None
+            annex_sub2 = 0; annex_sub3 = 0
             # Statistik detail untuk callback
             _stat_trans = 0; _stat_skip = 0; _stat_tbl = 0
             _stat_cover = 0; _stat_annex = 0
@@ -1151,7 +1213,10 @@ class DocxFinalTranslatorEngine:
                 done += 1; pct = 5 + int(done / max(total, 1) * 60)
                 if kind == 'para':
                     para = obj; is_bib = _is_biblio_title_para(para)
-                    is_annex = _get_para_style_id(para) in _ANNEX_STYLE_IDS
+                    para_sid = _get_para_style_id(para)
+                    is_annex = para_sid in _ANNEX_STYLE_IDS
+                    is_annex_sub2 = para_sid == 'a2'
+                    is_annex_sub3 = para_sid == 'a3'
                     hl_cnt = 1 if _has_hyperlinks(para) else 0
                     para_text = para.text.strip()
                     preview = (para_text[:55] + "…") if len(para_text) > 55 else para_text
@@ -1168,11 +1233,24 @@ class DocxFinalTranslatorEngine:
                             f"[bibliografi] translate\t{done}/{total}\t{_stat_trans}\t{_stat_skip}\t{_stat_tbl}\t{preview}")
                     elif is_annex and not past_bibliography:
                         _translate_para(para, tr)
-                        _fix_annex_style_para(para, chr(ord('A') + annex_counter))
+                        current_annex_letter = _fix_annex_style_para(para, chr(ord('A') + annex_counter))
                         annex_counter += 1
+                        annex_sub2 = 0; annex_sub3 = 0
                         _stat_annex += 1
                         _notify(progress_callback, pct,
                             f"[annex] translate\t{done}/{total}\t{_stat_trans}\t{_stat_skip}\t{_stat_tbl}\t{preview}")
+                    elif (is_annex_sub2 or is_annex_sub3) and current_annex_letter and not past_bibliography:
+                        _translate_para(para, tr)
+                        if is_annex_sub2:
+                            annex_sub2 += 1; annex_sub3 = 0
+                            prefix = f"{current_annex_letter}.{annex_sub2}    "
+                        else:
+                            annex_sub3 += 1
+                            prefix = f"{current_annex_letter}.{annex_sub2}.{annex_sub3}    "
+                        _fix_annex_sub_para(para, prefix)
+                        _stat_annex += 1
+                        _notify(progress_callback, pct,
+                            f"[annex-sub {prefix.strip()}] translate\t{done}/{total}\t{_stat_trans}\t{_stat_skip}\t{_stat_tbl}\t{preview}")
                     elif _skip_paragraph(para, past_bibliography):
                         _stat_skip += 1
                         style_name = (para.style.name or "").lower()
