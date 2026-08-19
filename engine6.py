@@ -34,31 +34,17 @@ def _esc(t: str) -> str:
 
 
 def _rpr(bold=False, italic=False, size_pt=11, color=None) -> str:
-    """Return <w:rPr> — selalu menyertakan <w:noProof/>.
-
-    PENTING: urutan child element di dalam <w:rPr> WAJIB mengikuti urutan
-    skema resmi OOXML (ECMA-376 CT_RPr), yaitu:
-    rFonts -> b -> bCs -> i -> iCs -> ... -> noProof -> ... -> color -> ...
-    -> sz -> szCs -> ...
-    Sebelumnya <w:noProof/> diletakkan PALING AKHIR (setelah w:sz/w:szCs),
-    yang melanggar urutan skema tsb. Meski sering "dimaafkan" oleh Word,
-    urutan yang salah berisiko membuat properti run (termasuk <w:i/> /
-    italic) diabaikan atau dibuang saat dokumen dibuka/disimpan ulang oleh
-    aplikasi yang lebih ketat terhadap validasi skema. Urutan di bawah ini
-    memastikan formatting (termasuk italic) selalu tampil sempurna &
-    konsisten di semua versi Word.
-    """
+    """Return <w:rPr> — selalu menyertakan <w:noproof/>."""
     b  = '<w:b/>'  if bold   else ''
-    i  = '<w:i/><w:iCs/>' if italic else ''
+    i  = '<w:i/>'  if italic else ''
     sz = int(size_pt * 2)
     cl = f'<w:color w:val="{color}"/>' if color else ''
     return (
         f'<w:rPr>'
         f'<w:rFonts w:ascii="Arial" w:eastAsia="Arial" w:hAnsi="Arial" w:cs="Arial"/>'
-        f'{b}{i}'
-        f'<w:noProof/>'
-        f'{cl}'
+        f'{b}{i}{cl}'
         f'<w:sz w:val="{sz}"/><w:szCs w:val="{sz}"/>'
+        f'<w:noproof/>'
         f'</w:rPr>'
     )
 
@@ -334,14 +320,12 @@ def _build_prakata(sni_number, title_id, title_en, ref_standard, bsn_year, num_i
     xmls.append(_para(p_runs, align='both', pstyle=NT))
     xmls.append(_empty(pstyle=NT))
     
-    rgb_runs = (
-        _run('Untuk menghindari kesalahan dalam penggunaan Standar ini, disarankan bagi pengguna '
-             'standar menggunakan dokumen SNI yang dicetak dengan tinta berwarna (dapat mencantumkan '
-             'kode tingkat warna ')
-        + _run('Red Green Blue', italic=True)
-        + _run(' (RGB) jika diperlukan untuk cetak gambar dengan warna yang lebih akurat).')
-    )
-    xmls.append(_para(rgb_runs, align='both', pstyle=NT))
+    xmls.append(_para(_run(
+        'Untuk menghindari kesalahan dalam penggunaan Standar ini, disarankan bagi pengguna '
+        'standar menggunakan dokumen SNI yang dicetak dengan tinta berwarna (dapat mencantumkan '
+        'kode tingkat warna Red Green Blue (RGB) jika diperlukan untuk cetak gambar dengan '
+        'warna yang lebih akurat).'
+    ), align='both', pstyle=NT))
     xmls.append(_empty(pstyle=NT))
 
     xmls.append(_para(_run(
