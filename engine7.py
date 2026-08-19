@@ -465,4 +465,3 @@ class InfoPendukungEngine:
         except Exception as e:
             import traceback
             return False, f'InfoPendukungEngine Error: {str(e)}\n{traceback.format_exc()}'
-    
