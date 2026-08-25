@@ -10,6 +10,10 @@ import uuid
 import importlib.util
 import csv
 import io
+import shutil
+import subprocess
+import tempfile
+from pathlib import Path
 from io import BytesIO
 from urllib.request import Request, urlopen
 
@@ -71,6 +75,161 @@ if 'bg_cleanup_started' not in st.session_state:
 
 # Daftarkan cleanup saat proses Python berhenti (atexit)
 atexit.register(_cleanup_temp_files, max_age_minutes=0, silent=False)
+
+
+def _convert_legacy_doc_to_docx(input_doc: str, output_docx: str) -> str:
+    """Konversi Word 97--2003 ``.doc`` menjadi OOXML ``.docx``.
+
+    Microsoft Word diprioritaskan pada Windows karena Engine 9 juga memakai
+    Word. LibreOffice/soffice menjadi fallback untuk server Linux. Hasil wajib
+    dapat dibuka python-docx sebelum diteruskan ke Engine 1.
+    """
+    input_abs = os.path.abspath(input_doc)
+    output_abs = os.path.abspath(output_docx)
+    errors = []
+    if os.path.isfile(output_abs):
+        os.remove(output_abs)
+
+    if os.name == 'nt':
+        word = document = None
+        pythoncom = None
+        try:
+            import pythoncom as _pythoncom
+            import win32com.client
+
+            pythoncom = _pythoncom
+            pythoncom.CoInitialize()
+            word = win32com.client.DispatchEx('Word.Application')
+            word.Visible = False
+            word.DisplayAlerts = 0
+            document = word.Documents.Open(
+                input_abs, ConfirmConversions=False, ReadOnly=True,
+                AddToRecentFiles=False, Visible=False,
+            )
+            # 16 = wdFormatDocumentDefault (.docx)
+            document.SaveAs2(output_abs, FileFormat=16)
+        except Exception as exc:
+            errors.append(f'Microsoft Word: {exc}')
+        finally:
+            if document is not None:
+                try:
+                    document.Close(SaveChanges=False)
+                except Exception:
+                    pass
+            if word is not None:
+                try:
+                    word.Quit(SaveChanges=False)
+                except Exception:
+                    pass
+            if pythoncom is not None:
+                pythoncom.CoUninitialize()
+
+    # Fallback Windows tanpa pywin32/pythoncom. PowerShell dapat mengakses
+    # Microsoft Word COM secara langsung dan tersedia bawaan pada Windows.
+    if os.name == 'nt' and not os.path.isfile(output_abs):
+        powershell = shutil.which('powershell') or shutil.which('pwsh')
+        if powershell:
+            ps_script = r"""
+$ErrorActionPreference = 'Stop'
+$word = $null
+$document = $null
+try {
+    $word = New-Object -ComObject Word.Application
+    $word.Visible = $false
+    $word.DisplayAlerts = 0
+    $document = $word.Documents.Open(
+        $env:RSNI_DOC_INPUT, $false, $true, $false
+    )
+    $document.SaveAs2($env:RSNI_DOC_OUTPUT, 16)
+}
+finally {
+    if ($null -ne $document) {
+        $document.Close($false)
+        [void][Runtime.InteropServices.Marshal]::ReleaseComObject($document)
+    }
+    if ($null -ne $word) {
+        $word.Quit($false)
+        [void][Runtime.InteropServices.Marshal]::ReleaseComObject($word)
+    }
+    [GC]::Collect()
+    [GC]::WaitForPendingFinalizers()
+}
+"""
+            ps_env = os.environ.copy()
+            ps_env['RSNI_DOC_INPUT'] = input_abs
+            ps_env['RSNI_DOC_OUTPUT'] = output_abs
+            try:
+                completed = subprocess.run(
+                    [
+                        powershell, '-NoLogo', '-NoProfile', '-NonInteractive',
+                        '-ExecutionPolicy', 'Bypass', '-Command', ps_script,
+                    ],
+                    capture_output=True, text=True, timeout=180, check=False,
+                    env=ps_env,
+                )
+                if completed.returncode != 0 or not os.path.isfile(output_abs):
+                    detail = (completed.stderr or completed.stdout or '').strip()
+                    errors.append(
+                        f'PowerShell Microsoft Word (kode '
+                        f'{completed.returncode}): '
+                        f'{detail or "hasil konversi tidak ditemukan"}'
+                    )
+            except Exception as exc:
+                errors.append(f'PowerShell Microsoft Word: {exc}')
+        else:
+            errors.append('Windows PowerShell tidak tersedia')
+
+    if not os.path.isfile(output_abs):
+        office = shutil.which('soffice') or shutil.which('libreoffice')
+        if office:
+            conversion_dir = tempfile.mkdtemp(prefix='doc_conversion_')
+            try:
+                office_profile = os.path.join(conversion_dir, 'office_profile')
+                os.makedirs(office_profile, exist_ok=True)
+                completed = subprocess.run(
+                    [
+                        office,
+                        f'-env:UserInstallation={Path(office_profile).as_uri()}',
+                        '--headless', '--convert-to', 'docx',
+                        '--outdir', conversion_dir, input_abs,
+                    ],
+                    capture_output=True, text=True, timeout=180, check=False,
+                )
+                generated = os.path.join(
+                    conversion_dir,
+                    os.path.splitext(os.path.basename(input_abs))[0] + '.docx',
+                )
+                if completed.returncode == 0 and os.path.isfile(generated):
+                    shutil.move(generated, output_abs)
+                else:
+                    detail = (completed.stderr or completed.stdout or '').strip()
+                    errors.append(
+                        f'LibreOffice (kode {completed.returncode}): '
+                        f'{detail or "hasil konversi tidak ditemukan"}'
+                    )
+            except Exception as exc:
+                errors.append(f'LibreOffice: {exc}')
+            finally:
+                shutil.rmtree(conversion_dir, ignore_errors=True)
+        else:
+            errors.append('LibreOffice/soffice tidak tersedia')
+
+    if not os.path.isfile(output_abs):
+        raise RuntimeError(
+            'File .doc tidak dapat dikonversi ke .docx. '
+            + ' | '.join(errors)
+        )
+
+    try:
+        from docx import Document as _ValidateDocument
+        _ValidateDocument(output_abs)
+    except Exception as exc:
+        try:
+            os.remove(output_abs)
+        except OSError:
+            pass
+        raise RuntimeError(f'Hasil konversi .doc tidak valid: {exc}') from exc
+    return output_abs
 
 # --- IMPORT ENGINE ---
 from engine1 import IntroductionContentTrimmerEngine
@@ -904,7 +1063,7 @@ _FOOTER_HTML = """
 <div class='footer'>
   <a class='fast-translation-button'
      href='https://generator-sni.streamlit.app/'
-     target='_blank' rel='noopener noreferrer'>Klik Untuk Mode Terjemahan Cepat</a><br>
+     target='_self'>Klik Untuk Mode Terjemahan Cepat</a><br>
   <span style='font-size:0.85rem;'>
     <a href='https://docs.google.com/spreadsheets/d/1BBPCMPwvbBk5LPdoDQwnjQzcPHv7_RDKENqeMsklF-8/edit?usp=sharing' target='_blank' style='color:#ffffff;text-decoration:none;'>📖 Glosarium SNI</a>
     &nbsp;&nbsp;·&nbsp;&nbsp;
@@ -930,7 +1089,12 @@ _tahun = str(datetime.date.today().year)
 
 # --- FORM INPUT ---
 st.markdown('<div class="section-label">📂 Upload Dokumen ISO</div>', unsafe_allow_html=True)
-uploaded_file = st.file_uploader("Upload file .docx di sini atau klik Browse", type=["docx"], key="upl_main", label_visibility="collapsed")
+uploaded_file = st.file_uploader(
+    "Upload file .doc atau .docx di sini atau klik Browse",
+    type=["doc", "docx"],
+    key="upl_main",
+    label_visibility="collapsed",
+)
 
 st.markdown('<div class="section-label">⚙️ Pengaturan</div>', unsafe_allow_html=True)
 col_set1, col_set2 = st.columns([2, 3])
@@ -958,15 +1122,35 @@ if btn_process:
         # pengguna mengakses aplikasi secara bersamaan (satu proses melayani
         # banyak sesi di Streamlit Community Cloud).
         _sid = st.session_state.setdefault('_sid', uuid.uuid4().hex[:8])
-        target_file = f"temp_main_{_sid}_{uploaded_file.name}"
-        with open(target_file, "wb") as f:
+        uploaded_name = os.path.basename(uploaded_file.name)
+        uploaded_ext = os.path.splitext(uploaded_name)[1].lower()
+        uploaded_path = f"temp_main_{_sid}_{uploaded_name}"
+        with open(uploaded_path, "wb") as f:
             f.write(uploaded_file.getbuffer())
-        
-        st.session_state['_run_process'] = True
-        st.session_state['_target_file'] = target_file
-        st.session_state['_doc_title'] = doc_title
-        st.session_state['_ics_number'] = ics_number
-        st.rerun()
+
+        try:
+            if uploaded_ext == '.doc':
+                target_file = os.path.splitext(uploaded_path)[0] + '.docx'
+                _convert_legacy_doc_to_docx(uploaded_path, target_file)
+                try:
+                    os.remove(uploaded_path)
+                except OSError:
+                    pass
+            elif uploaded_ext == '.docx':
+                target_file = uploaded_path
+            else:
+                raise ValueError('Format file harus .doc atau .docx.')
+
+            st.session_state['_run_process'] = True
+            st.session_state['_target_file'] = target_file
+            st.session_state['_original_upload_name'] = uploaded_name
+            st.session_state['_doc_title'] = doc_title
+            st.session_state['_ics_number'] = ics_number
+            st.rerun()
+        except Exception as exc:
+            st.session_state['_run_process'] = False
+            st.session_state.pop('_target_file', None)
+            st.error(f'❌ Gagal membaca file unggahan: {exc}')
     else:
         st.warning("Silakan upload file terlebih dahulu.")
 
