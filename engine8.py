@@ -1,5 +1,5 @@
 """
-Engine8: Gabungan A.py + B.py
+Engine 8: Gabungan A.py + B.py
 =============================
 Perilaku yang dinonaktifkan:
   - Tidak menyisipkan konten asli berbahasa Inggris sebelum Bibliografi.
@@ -1543,7 +1543,9 @@ def _translation_targets(doc: Document) -> tuple[set, set]:
 
     Zona mengikuti kontrak keluaran Engine 5--7:
     - Cover: hanya judul Indonesia paling atas (bold, >= 16 pt, non-italic).
-    - Section 3: hanya heading dan seluruh isi Introduction.
+    - Section 3: heading dan seluruh isi Introduction jika dokumen memang
+      memilikinya. Sejumlah standar (mis. ISO/IEC 9797-2:2021) langsung
+      dimulai dengan Scope, sehingga ketiadaan Introduction bukan error.
     - Area Content asli: seluruh elemen sebelum bookmark duplikasi Engine 5,
       kecuali paragraf style ``RefNorm``.
     - Bibliography: hanya heading-nya.
@@ -1619,12 +1621,17 @@ def _translation_targets(doc: Document) -> tuple[set, set]:
 
     if not cover_title_found:
         raise ValueError('Judul atas Cover tidak ditemukan.')
-    if not any(
+    introduction_found = any(
         re.sub(r'\s+', ' ', para_map[el].text or '').strip().casefold()
         == 'introduction'
         for el in para_targets if el in para_map
-    ):
-        raise ValueError('Heading Introduction pada section 3 tidak ditemukan.')
+    )
+    # Introduction bersifat opsional. Jika tidak ada, Section 3 (Daftar Isi,
+    # Prakata, dan front matter lain) tetap di-skip, sedangkan seluruh Content
+    # asli mulai Section 4 tetap masuk target sampai Engine5DuplicateStart.
+    # Variabel dipertahankan eksplisit agar kontrak ini mudah diuji dan tidak
+    # kembali berubah menjadi validasi wajib.
+    _ = introduction_found
     if not duplicate_started:
         raise ValueError(
             'Bookmark Engine5DuplicateStart tidak ditemukan; output Engine 5 '
