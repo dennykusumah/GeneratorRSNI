@@ -228,7 +228,7 @@ def flatten_broken_ref_fields(doc, font_name='Arial', font_size=11):
     # Jaring pengaman untuk error yang sudah berubah menjadi teks literal dan
     # tidak lagi mempunyai kode field.
     error_pattern = re.compile(
-        r'Error!\s*Reference source not found\.?', re.IGNORECASE
+        r'Error\s*[:!]\s*Reference source not found\.?', re.IGNORECASE
     )
     for text_node in [node for root in roots for node in root.xpath('.//w:t')]:
         if text_node.text and error_pattern.search(text_node.text):
@@ -1617,7 +1617,23 @@ class DocxOptimizerEngine:
                 setup_headers_footers(doc, doc_title, copyright_text)
 
 
-            doc.save(output_path)
+            output_abs = os.path.abspath(output_path)
+            os.makedirs(os.path.dirname(output_abs), exist_ok=True)
+            temp_output = f"{output_abs}.engine7-{os.getpid()}.tmp"
+            try:
+                doc.save(temp_output)
+                # Validasi paket sebelum dipublikasikan ke adaptor Engine 7.
+                Document(temp_output)
+                with zipfile.ZipFile(temp_output, 'r') as archive:
+                    bad_member = archive.testzip()
+                    if bad_member is not None:
+                        raise RuntimeError(
+                            f'Paket Engine 7 rusak pada {bad_member}.'
+                        )
+                os.replace(temp_output, output_abs)
+            finally:
+                if os.path.exists(temp_output):
+                    os.unlink(temp_output)
             return True, output_path
 
         except Exception as e:
