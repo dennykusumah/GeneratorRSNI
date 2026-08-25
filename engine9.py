@@ -64,6 +64,8 @@ Deteksi batas bahasa Indonesia vs Inggris:
 import os
 import re
 import copy
+import shutil
+import subprocess
 import traceback
 from typing import Optional
 from docx import Document
@@ -205,12 +207,140 @@ def _set_update_fields_on_open(docx_path: str, enabled: bool) -> None:
     doc.save(docx_path)
 
 
+def _finalize_toc_with_powershell(docx_path: str) -> tuple[int, int]:
+    """Finalisasi TOC melalui Word COM tanpa memerlukan pywin32.
+
+    PowerShell tersedia bawaan Windows dan dapat membuat object
+    ``Word.Application`` secara langsung. Hasil dicetak dengan marker khusus
+    agar jumlah halaman kosong dan TOC dapat dikembalikan ke Engine 9.
+    """
+    powershell = shutil.which('powershell') or shutil.which('pwsh')
+    if not powershell:
+        raise RuntimeError(
+            'pywin32 tidak tersedia dan Windows PowerShell tidak ditemukan.'
+        )
+
+    script = r"""
+$ErrorActionPreference = 'Stop'
+$word = $null
+$document = $null
+try {
+    $word = New-Object -ComObject Word.Application
+    $word.Visible = $false
+    $word.DisplayAlerts = 0
+    $word.ScreenUpdating = $false
+    $document = $word.Documents.Open(
+        $env:RSNI_ENGINE9_DOCX, $false, $false, $false
+    )
+
+    $tocCount = [int]$document.TablesOfContents.Count
+    if ($tocCount -lt 1) {
+        throw 'Field Table of Contents tidak ditemukan oleh Word.'
+    }
+
+    for ($index = 1; $index -le $tocCount; $index++) {
+        $document.TablesOfContents.Item($index).Update()
+    }
+    $document.Repaginate()
+
+    $firstToc = $document.TablesOfContents.Item(1)
+    $tocEndPage = [int]$firstToc.Range.Information(3)
+    $removed = 0
+
+    for ($attempt = 0; $attempt -lt 5; $attempt++) {
+        $document.Repaginate()
+        $pageCount = [int]$document.ComputeStatistics(2)
+        $candidate = $tocEndPage + 1
+        if ($candidate -gt $pageCount) { break }
+
+        $start = [int]$document.GoTo(1, 1, $candidate).Start
+        if ($candidate -lt $pageCount) {
+            $end = [int]$document.GoTo(1, 1, ($candidate + 1)).Start
+        } else {
+            $end = [int]$document.Content.End
+        }
+        $pageRange = $document.Range($start, $end)
+        $visible = [string]$pageRange.Text
+        $visible = $visible.Replace([char]7, '').Replace([char]12, '')
+        $visible = $visible -replace '\s', ''
+        if ($visible.Length -gt 0) { break }
+
+        $changedSection = $false
+        if ($candidate -lt $pageCount) {
+            $nextPage = $document.GoTo(1, 1, ($candidate + 1))
+            if ($nextPage.Sections.Count -gt 0) {
+                $section = $nextPage.Sections.Item(1)
+                $sectionStart = [int]$section.PageSetup.SectionStart
+                if ($sectionStart -eq 3 -or $sectionStart -eq 4) {
+                    $section.PageSetup.SectionStart = 2
+                    $changedSection = $true
+                }
+            }
+        }
+
+        if (-not $changedSection) {
+            $beforeEnd = [int]$document.Content.End
+            [void]$pageRange.Delete()
+            if ([int]$document.Content.End -ge $beforeEnd) { break }
+        }
+        $removed++
+    }
+
+    $updated = 0
+    for ($index = 1; $index -le $tocCount; $index++) {
+        $document.TablesOfContents.Item($index).UpdatePageNumbers()
+        $updated++
+    }
+    $document.Repaginate()
+    $document.Save()
+    Write-Output "RSNI_ENGINE9_RESULT:$removed,$updated"
+}
+finally {
+    if ($null -ne $document) {
+        $document.Close($false)
+        [void][Runtime.InteropServices.Marshal]::ReleaseComObject($document)
+    }
+    if ($null -ne $word) {
+        $word.Quit($false)
+        [void][Runtime.InteropServices.Marshal]::ReleaseComObject($word)
+    }
+    [GC]::Collect()
+    [GC]::WaitForPendingFinalizers()
+}
+"""
+    environment = os.environ.copy()
+    environment['RSNI_ENGINE9_DOCX'] = os.path.abspath(docx_path)
+    completed = subprocess.run(
+        [
+            powershell, '-NoLogo', '-NoProfile', '-NonInteractive',
+            '-ExecutionPolicy', 'Bypass', '-Command', script,
+        ],
+        capture_output=True, text=True, timeout=300, check=False,
+        env=environment,
+    )
+    if completed.returncode != 0:
+        detail = (completed.stderr or completed.stdout or '').strip()
+        raise RuntimeError(
+            'Otomatisasi Microsoft Word melalui PowerShell gagal: '
+            + (detail or f'kode {completed.returncode}')
+        )
+    match = re.search(
+        r'RSNI_ENGINE9_RESULT:(\d+),(\d+)', completed.stdout or ''
+    )
+    if not match:
+        raise RuntimeError(
+            'PowerShell menyelesaikan proses tanpa hasil validasi Engine 9.'
+        )
+    return int(match.group(1)), int(match.group(2))
+
+
 def _finalize_toc_with_word(docx_path: str) -> tuple[int, int]:
     """Finalisasi TOC dengan Word dan pilih Update page numbers only.
 
     Returns ``(jumlah_halaman_kosong_dihapus, jumlah_toc_diperbarui)``.
-    Microsoft Word dan ``pywin32`` diperlukan karena python-docx tidak
-    mempunyai layout engine/pagination dan tidak bisa mengeksekusi field TOC.
+    Microsoft Word diperlukan karena python-docx tidak mempunyai layout
+    engine/pagination. pywin32 dipakai bila tersedia; PowerShell menjadi
+    fallback otomatis tanpa instalasi modul tambahan.
     """
     if os.name != 'nt':
         raise RuntimeError(
@@ -220,11 +350,8 @@ def _finalize_toc_with_word(docx_path: str) -> tuple[int, int]:
     try:
         import pythoncom
         import win32com.client
-    except ImportError as exc:
-        raise RuntimeError(
-            'Otomatisasi Microsoft Word memerlukan pywin32. Jalankan: '
-            'pip install pywin32'
-        ) from exc
+    except ImportError:
+        return _finalize_toc_with_powershell(docx_path)
 
     absolute_path = os.path.abspath(docx_path)
     word = None
