@@ -372,7 +372,12 @@ def _skip_paragraph(para, past_bibliography: bool = False) -> bool:
     if _get_para_style_id(para) in _NO_TRANSLATE_STYLE_IDS: return True
     for tag in [f'{_W}drawing', f'{_W}pict']:
         if para._element.find('.//' + tag) is not None: return True
-    style_name = (para.style.name or '').lower()
+    # Dokumen .doc lama yang dikonversi dapat mereferensikan style yang tidak
+    # lagi ada di styles.xml; python-docx lalu mengembalikan ``None``.
+    style_name = (
+        (para.style.name or '').lower()
+        if para.style is not None else ''
+    )
     if any(style_name.startswith(s) for s in _SKIP_STYLES): return True
     return False
 
@@ -1475,12 +1480,23 @@ def _sync_body_title(doc: Document, cover_id: str) -> bool:
     for i, p in enumerate(paras):
         if sect_idx == -1 and _has_inline_sectpr(p): sect_idx = i
         txt = p.text.strip()
-        if txt and _RE_H1.match(txt) and 'heading' in (p.style.name or '').lower(): h1_idx = i; break
+        if (
+            txt and _RE_H1.match(txt)
+            and 'heading' in (
+                (p.style.name or '').lower() if p.style is not None else ''
+            )
+        ):
+            h1_idx = i
+            break
     start = sect_idx + 1 if sect_idx != -1 else 0
     end = h1_idx if h1_idx != -1 else start + 20
     if end > len(paras): end = len(paras)
     for i in range(start, end):
-        if (paras[i].style.name or '').lower().strip() in _BODY_TITLE_STYLES and paras[i].text.strip():
+        para_style_name = (
+            (paras[i].style.name or '').lower().strip()
+            if paras[i].style is not None else ''
+        )
+        if para_style_name in _BODY_TITLE_STYLES and paras[i].text.strip():
             _replace_para_text(paras[i], cover_id); return True
     for i in range(start, end):
         txt = paras[i].text.strip()
@@ -1619,8 +1635,11 @@ def _translation_targets(doc: Document) -> tuple[set, set]:
             ):
                 table_targets.add(table_map[child]._element)
 
-    if not cover_title_found:
-        raise ValueError('Judul atas Cover tidak ditemukan.')
+    # Judul cover pada sebagian file .doc lama berupa field REF yang sudah
+    # rusak sebelum konversi. Setelah Engine 7 membersihkan teks error, cover
+    # dapat tidak memiliki judul yang aman untuk diterjemahkan. Kondisi ini
+    # tidak boleh menggagalkan penerjemahan Content; judul hanya diterjemahkan
+    # bila target valid memang ditemukan.
     introduction_found = any(
         re.sub(r'\s+', ' ', para_map[el].text or '').strip().casefold()
         == 'introduction'
