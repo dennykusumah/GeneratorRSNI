@@ -557,27 +557,16 @@ div[data-testid="stFileUploaderFile"] {
 /* ══════════════════════════════════════════
    PROGRESS
 ══════════════════════════════════════════ */
-/* Sisa progres memakai gradien merah-kuning. */
-div[data-testid="stProgress"] div[data-testid="stProgressBar"],
-div[data-testid="stProgress"] div[role="progressbar"] {
-    background: linear-gradient(90deg, #ef4444 0%, #f97316 48%, #fde047 100%) !important;
-    border: 1px solid rgba(253,224,71,0.8) !important;
+.stProgress > div {
+    background: rgba(255,255,255,0.07) !important;
     border-radius: 99px !important;
-    height: 12px !important;
-    overflow: hidden !important;
-    box-shadow: inset 0 1px 4px rgba(0,0,0,0.5),
-                0 0 8px rgba(249,115,22,0.4) !important;
+    height: 8px !important;
 }
-/* Bagian aktif dibuat biru-hijau terang agar kontras dengan track. */
-div[data-testid="stProgress"] div[role="progressbar"] > div {
-    background: linear-gradient(90deg, #00d9ff 0%, #2563eb 48%, #22e6a8 100%) !important;
-    border: none !important;
-    border-right: 3px solid #b7fff0 !important;
+.stProgress > div > div {
+    background: linear-gradient(90deg, #6366f1, #818cf8, #10b981) !important;
     border-radius: 99px !important;
-    height: 100% !important;
-    box-shadow: 0 0 12px rgba(0,217,255,0.95),
-                3px 0 10px rgba(34,230,168,1) !important;
-    transition: width 0.35s ease !important;
+    box-shadow: 0 0 10px rgba(99,102,241,0.5);
+    transition: width 0.4s ease !important;
 }
 div[data-testid="stProgressText"] {
     color: rgba(165,180,252,0.8) !important;
