@@ -326,7 +326,11 @@ class InfoPendukungEngine:
                 f'ditemukan {len(doc.sections)}.'
             )
         bibliography = next(
-            (p for p in doc.paragraphs if cls._normalize(p.text).casefold() == 'bibliography'),
+            (
+                p for p in doc.paragraphs
+                if cls._normalize(p.text).casefold() == 'bibliography'
+                and cls._section_number(p) >= 4
+            ),
             None,
         )
         marker_found = any(
@@ -335,8 +339,6 @@ class InfoPendukungEngine:
         )
         if not marker_found:
             raise ValueError('Bookmark keluaran Engine 5 tidak ditemukan.')
-        if bibliography is not None and cls._section_number(bibliography) < 4:
-            raise ValueError('Bibliography tidak ditemukan pada area Content.')
         return doc
 
     @classmethod
@@ -354,14 +356,13 @@ class InfoPendukungEngine:
         if heading is None or cls._section_number(heading) != len(doc.sections):
             raise RuntimeError('Heading informasi perumus SNI tidak berada di section terakhir.')
         bibliography = next(
-            (p for p in doc.paragraphs if cls._normalize(p.text).casefold() == 'bibliography'),
+            (
+                p for p in doc.paragraphs
+                if cls._normalize(p.text).casefold() == 'bibliography'
+                and 4 <= cls._section_number(p) < len(doc.sections)
+            ),
             None,
         )
-        if bibliography is not None and (
-            cls._section_number(bibliography) < 4
-            or cls._section_number(bibliography) >= len(doc.sections)
-        ):
-            raise RuntimeError('Posisi Bibliography pada area Content berubah.')
         return doc
 
     def build_perumus_only(
