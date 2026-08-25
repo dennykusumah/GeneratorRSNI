@@ -1408,9 +1408,15 @@ if st.session_state.get('_run_process') and st.session_state.get('_target_file')
             message = msg or ''
             # Pemulihan mempunyai counter sendiri (mis. 1/3). Deteksi tahap
             # ini SEBELUM counter translasi agar 1/3 tidak salah dipetakan ke
-            # rentang 10–95%. Rentang khusus pemulihan adalah 95–98%.
+            # rentang 10–80%. Setiap putaran pemulihan mempunyai rentang
+            # tersendiri hingga batas akhir 98%.
             recovery = re.search(
                 r'\[pemulihan\s+(\d+)\s*/\s*(\d+)\]',
+                message, re.IGNORECASE,
+            )
+            recovery_items = re.search(
+                r'\[pemulihan\s+\d+\s*/\s*\d+\]\s*'
+                r'(\d+)\s*/\s*(\d+)',
                 message, re.IGNORECASE,
             )
             translation = re.search(
@@ -1422,17 +1428,34 @@ if st.session_state.get('_run_process') and st.session_state.get('_target_file')
             if recovery and int(recovery.group(2)) > 0:
                 recovery_no = max(1, int(recovery.group(1)))
                 recovery_total = max(1, int(recovery.group(2)))
-                ratio = min(
-                    (recovery_no - 1) / max(recovery_total - 1, 1), 1.0
+                recovery_no = min(recovery_no, recovery_total)
+                if recovery_items and int(recovery_items.group(2)) > 0:
+                    item_ratio = min(
+                        int(recovery_items.group(1)) /
+                        int(recovery_items.group(2)), 1.0
+                    )
+                else:
+                    item_ratio = 0.0
+                recovery_ranges = {
+                    1: (80, 90),
+                    2: (90, 95),
+                    3: (95, 98),
+                }
+                range_start, range_end = recovery_ranges.get(
+                    min(recovery_no, 3), (95, 98)
                 )
-                calculated_pct = min(95 + int(ratio * 3), 98)
+                calculated_pct = min(
+                    range_start
+                    + int(item_ratio * (range_end - range_start)),
+                    range_end,
+                )
             elif translation and int(translation.group(2)) > 0:
-                # Progres riil xx/XXX menguasai tepat rentang 10–95%.
+                # Progres riil xx/XXX menguasai tepat rentang 10–80%.
                 ratio = min(
                     int(translation.group(1)) /
                     int(translation.group(2)), 1.0
                 )
-                calculated_pct = min(10 + int(ratio * 85), 95)
+                calculated_pct = min(10 + int(ratio * 70), 80)
             elif pct >= 90:
                 # Sinkronisasi judul dan penyimpanan Engine 8 berada setelah
                 # translasi/pemulihan, tetapi tidak boleh melewati 98% karena
