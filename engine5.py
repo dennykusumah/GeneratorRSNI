@@ -71,6 +71,23 @@ class IntroductionContentDuplicatorEngine:
         )
 
     @staticmethod
+    def _atomic_save(doc: Document, output_docx: str) -> None:
+        """Simpan DOCX secara atomik agar engine berikutnya tidak pernah
+        membaca ZIP yang baru tertulis sebagian, terutama pada dokumen besar.
+        """
+        output_abs = os.path.abspath(output_docx)
+        os.makedirs(os.path.dirname(output_abs), exist_ok=True)
+        temp_path = f"{output_abs}.engine5-{os.getpid()}.tmp"
+        try:
+            doc.save(temp_path)
+            # Paksa pembacaan ulang sebelum file dinyatakan siap.
+            Document(temp_path)
+            os.replace(temp_path, output_abs)
+        finally:
+            if os.path.exists(temp_path):
+                os.unlink(temp_path)
+
+    @staticmethod
     def _force_content_decimal(doc: Document):
         """Nomor angka berlanjut pada semua layout section Content.
 
@@ -105,7 +122,7 @@ class IntroductionContentDuplicatorEngine:
 
             if self._already_processed(doc):
                 self._force_content_decimal(doc)
-                doc.save(output_docx)
+                self._atomic_save(doc, output_docx)
                 return True, output_docx
 
             body = doc.element.body
@@ -137,33 +154,53 @@ class IntroductionContentDuplicatorEngine:
                 ),
                 None,
             )
-            if bibliography_index is None:
-                raise ValueError("Heading Bibliography tidak ditemukan di section 4.")
-
             introduction = (
                 elements[intro_index:break_indices[2]]
                 if intro_index is not None else []
             )
-            content = elements[section4_start:bibliography_index]
+            # Bibliography tidak wajib ada pada semua publikasi ISO/IEC,
+            # terutama amendment dan beberapa dokumen besar. Jika heading
+            # tersebut tidak tersedia, gunakan w:sectPr penutup body sebagai
+            # jangkar sehingga salinan tetap ditempatkan setelah Content asli
+            # dan tidak membuat section tambahan buatan.
+            body_sectpr_index = next(
+                (
+                    index for index, element in enumerate(elements[section4_start:], section4_start)
+                    if element.tag == qn("w:sectPr")
+                ),
+                len(elements),
+            )
+            if body_sectpr_index >= len(elements):
+                raise ValueError("Properti section penutup dokumen tidak ditemukan.")
+            content_end_index = (
+                bibliography_index
+                if bibliography_index is not None
+                else body_sectpr_index
+            )
+            content = elements[section4_start:content_end_index]
             if not content:
                 raise ValueError("Blok Content kosong.")
 
-            bibliography = elements[bibliography_index]
+            insertion_anchor = (
+                elements[bibliography_index]
+                if bibliography_index is not None
+                else elements[body_sectpr_index]
+            )
             used_ids = self._bookmark_ids(doc)
             marker_id = max(used_ids, default=0) + 1
 
             # Setiap addprevious mempertahankan urutan bila dilakukan berurutan.
-            bibliography.addprevious(self._marker_paragraph(marker_id))
+            insertion_anchor.addprevious(self._marker_paragraph(marker_id))
             for element in introduction:
-                bibliography.addprevious(deepcopy(element))
+                insertion_anchor.addprevious(deepcopy(element))
             # Marker sudah mengandung page break. Page break kedua hanya
             # diperlukan untuk memisahkan Introduction dari Content. Pada
             # standar tanpa Introduction, dua break berurutan membuat satu
             # halaman kosong dengan header/footer.
             if introduction:
-                bibliography.addprevious(self._page_break_paragraph())
+                insertion_anchor.addprevious(self._page_break_paragraph())
             for element in content:
-                bibliography.addprevious(deepcopy(element))
+                insertion_anchor.addprevious(deepcopy(element))
 
             copied_section_breaks = sum(
                 1 for element in introduction + content
@@ -171,9 +208,7 @@ class IntroductionContentDuplicatorEngine:
             )
             expected_section_count = input_section_count + copied_section_breaks
             self._force_content_decimal(doc)
-            out_dir = os.path.dirname(os.path.abspath(output_docx))
-            os.makedirs(out_dir, exist_ok=True)
-            doc.save(output_docx)
+            self._atomic_save(doc, output_docx)
 
             check = Document(output_docx)
             if len(check.sections) != expected_section_count:
@@ -197,7 +232,8 @@ class IntroductionContentDuplicatorEngine:
             True,
             result,
             "Salinan Content berbahasa Inggris beserta Introduction jika "
-            "tersedia berhasil disisipkan tepat sebelum Bibliography. "
+            "tersedia berhasil disisipkan sebelum Bibliography atau pada "
+            "akhir dokumen jika Bibliography tidak tersedia. "
             "Penomoran seluruh layout section Content menggunakan angka desimal.",
         )
 
