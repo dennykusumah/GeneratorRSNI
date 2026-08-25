@@ -1064,7 +1064,7 @@ _FOOTER_HTML = """
   <a class='fast-translation-button'
      href='https://generator-sni.streamlit.app/'
      target='_blank'
-     rel='noopener noreferrer'>Klik Untuk Mode Terjemahan Cepat</a><br>
+     rel='noopener noreferrer'>Ganti Mode Terjemahan Cepat</a><br>
   <span style='font-size:0.85rem;'>
     <a href='https://docs.google.com/spreadsheets/d/1BBPCMPwvbBk5LPdoDQwnjQzcPHv7_RDKENqeMsklF-8/edit?usp=sharing' target='_blank' style='color:#ffffff;text-decoration:none;'>📖 Glosarium SNI</a>
     &nbsp;&nbsp;·&nbsp;&nbsp;
