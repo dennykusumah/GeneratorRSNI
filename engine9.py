@@ -301,7 +301,12 @@ finally {
         [void][Runtime.InteropServices.Marshal]::ReleaseComObject($document)
     }
     if ($null -ne $word) {
-        $word.Quit($false)
+        # Document sudah ditutup tanpa menyimpan pada blok di atas. Jangan
+        # kirim Boolean ke Quit(): pada beberapa versi Word/PowerShell,
+        # parameter COM SaveChanges dipetakan sebagai [ref] dan $false
+        # memicu NonRefArgumentToRefParameterMsg. Pemanggilan tanpa argumen
+        # aman karena tidak ada dokumen terbuka yang perlu dikonfirmasi.
+        $word.Quit()
         [void][Runtime.InteropServices.Marshal]::ReleaseComObject($word)
     }
     [GC]::Collect()
