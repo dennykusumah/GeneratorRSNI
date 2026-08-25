@@ -24,6 +24,9 @@ import threading
 import hashlib
 import json
 import sqlite3
+import html
+from urllib.parse import urlencode
+from urllib.request import Request, urlopen
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from docx import Document
@@ -1130,6 +1133,78 @@ class TranslationFailedError(RuntimeError):
     """Mencegah dokumen setengah diterjemahkan tetap disimpan."""
 
 
+def _google_cloud_api_keys() -> list[str]:
+    """Ambil maksimal dua API key, tetap kompatibel dengan nama env lama."""
+    candidates = [
+        os.getenv('GOOGLE_CLOUD_TRANSLATION_API_KEY_1', ''),
+        os.getenv('GOOGLE_CLOUD_TRANSLATION_API_KEY_2', ''),
+    ]
+    candidates.extend(
+        os.getenv('GOOGLE_CLOUD_TRANSLATION_API_KEYS', '').split(',')
+    )
+    candidates.extend([
+        os.getenv('GOOGLE_CLOUD_TRANSLATION_API_KEY', ''),
+        os.getenv('GOOGLE_TRANSLATE_API_KEY', ''),
+    ])
+    keys = []
+    for candidate in candidates:
+        key = candidate.strip()
+        if key and key not in keys:
+            keys.append(key)
+        if len(keys) == 2:
+            break
+    return keys
+
+
+class _GoogleCloudTranslationClient:
+    """Client REST resmi dengan round-robin dan failover maksimal dua key."""
+    def __init__(self, api_keys, source: str = 'en', target: str = 'id'):
+        if isinstance(api_keys, str):
+            api_keys = [api_keys]
+        self.api_keys = tuple(key for key in api_keys if key)
+        if not self.api_keys:
+            raise ValueError('Google Cloud Translation API key belum diisi.')
+        self.source = source
+        self.target = target
+        self._cursor = 0
+        self._lock = threading.Lock()
+
+    def translate(self, text: str) -> str:
+        payload = json.dumps({
+            'q': text, 'source': self.source, 'target': self.target,
+            'format': 'text',
+        }).encode('utf-8')
+        with self._lock:
+            start = self._cursor
+        last_error = None
+        for offset in range(len(self.api_keys)):
+            index = (start + offset) % len(self.api_keys)
+            key = self.api_keys[index]
+            endpoint = (
+                'https://translation.googleapis.com/language/translate/v2?'
+                + urlencode({'key': key})
+            )
+            request = Request(
+                endpoint, data=payload,
+                headers={'Content-Type': 'application/json; charset=utf-8'},
+                method='POST',
+            )
+            try:
+                with urlopen(request, timeout=45) as response:
+                    body = json.loads(response.read().decode('utf-8'))
+                translated = body['data']['translations'][0]['translatedText']
+                with self._lock:
+                    self._cursor = (index + 1) % len(self.api_keys)
+                return html.unescape(translated)
+            except Exception as exc:
+                # Jangan masukkan URL/API key ke pesan error.
+                last_error = exc
+        raise RuntimeError(
+            f'Seluruh {len(self.api_keys)} Google Cloud API key gagal '
+            f'({type(last_error).__name__}).'
+        ) from last_error
+
+
 class _AdaptiveRateLimiter:
     """Backoff bersama: empat worker melambat serempak saat provider menolak."""
     def __init__(self):
@@ -1222,14 +1297,26 @@ class _Translator:
     def __init__(self, source: str = 'auto', target: str = 'id', 
                  custom_dict: CustomDictionary | None = None,
                  italic_dict: ItalicDictionary | None = None,
-                 rate_limiter: _AdaptiveRateLimiter | None = None):
+                 rate_limiter: _AdaptiveRateLimiter | None = None,
+                 provider: str = 'web'):
         try: from deep_translator import GoogleTranslator
         except ImportError: raise ImportError("Jalankan: pip install deep-translator")
         self._cls = GoogleTranslator
         self.source = source; self.target = target
         self.custom_dict = custom_dict; self.italic_dict = italic_dict
         self.rate_limiter = rate_limiter
-        self._client = self._cls(source=self.source, target=self.target)
+        self.provider = provider
+        cloud_keys = _google_cloud_api_keys()
+        if provider == 'cloud' and cloud_keys:
+            self._client = _GoogleCloudTranslationClient(
+                cloud_keys, source='en', target=self.target
+            )
+            self.provider = f'google-cloud-{len(cloud_keys)}key'
+        else:
+            self._client = self._cls(
+                source=self.source, target=self.target
+            )
+            self.provider = 'web'
         self.failed_texts: list[str] = []
         # Cache hanya untuk masukan polos tanpa token format dinamis. Hasilnya
         # identik dengan request pertama dan tidak mengubah akurasi/kamus.
@@ -1382,6 +1469,57 @@ class _Translator:
                 result, tuple(italic_terms_found)
             )
         return result, italic_terms_found
+
+
+def _translate_for_recovery(tr: _Translator, text: str, italic_map: dict,
+                            allow_split: bool) -> tuple[str, list[str], bool]:
+    """Terjemahkan ulang; bila perlu pecah kalimat/klausa secara tervalidasi."""
+    before = len(tr.failed_texts)
+    translated, italic_terms = tr.translate_one(text, italic_map)
+    if len(tr.failed_texts) == before:
+        return translated, italic_terms, False
+    if not allow_split:
+        return translated, italic_terms, True
+
+    # Hapus catatan kegagalan request utuh karena hasil split yang sukses akan
+    # menggantikannya. Delimiter disimpan persis dan tidak dikirim ke provider.
+    del tr.failed_texts[before:]
+    parts = re.split(
+        r'((?<=[.!?;:])\s+(?=[A-Z0-9])|\s*[—–]\s*|(?:\r?\n)+)',
+        text,
+    )
+    meaningful = [
+        part for part in parts
+        if part and not re.fullmatch(r'\s*|\s*[—–]\s*', part)
+    ]
+    if len(meaningful) < 2:
+        # Fallback untuk kalimat panjang: pecah di koma, tetapi hanya bila ada
+        # sedikitnya dua klausa yang bermakna.
+        parts = re.split(r'(,\s+)', text)
+        meaningful = [
+            part for part in parts
+            if part and not re.fullmatch(r',\s+|\s*', part)
+        ]
+    if len(meaningful) < 2:
+        tr.failed_texts.append(re.sub(r'\s+', ' ', text).strip()[:100])
+        return text, [], True
+
+    output_parts = []
+    all_italic_terms = []
+    split_failed = False
+    for part in parts:
+        if not part:
+            continue
+        if re.fullmatch(r'\s*|\s*[—–]\s*|,\s+', part):
+            output_parts.append(part)
+            continue
+        part_before = len(tr.failed_texts)
+        part_result, part_italic = tr.translate_one(part, italic_map)
+        if len(tr.failed_texts) > part_before:
+            split_failed = True
+        output_parts.append(part_result)
+        all_italic_terms.extend(part_italic)
+    return ''.join(output_parts), all_italic_terms, split_failed
 
 def _match_capitalization(original: str, translated: str) -> str:
     orig = original.strip(); tran = translated.strip()
@@ -2027,18 +2165,34 @@ class DocxFinalTranslatorEngine:
                 if not failed_indexes:
                     break
                 recovery_total = len(failed_indexes)
-                recovery_worker_count = min(
-                    {1: 4, 2: 2, 3: 1}[recovery_round], recovery_total
-                )
+                recovery_worker_count = {1: 4, 2: 2, 3: 1}[recovery_round]
+                cooldown = max(0.0, float(os.getenv(
+                    f'RSNI_RECOVERY_{recovery_round}_COOLDOWN',
+                    {1: '5', 2: '30', 3: '60'}[recovery_round],
+                )))
+                cooldown_end = time.monotonic() + cooldown
+                while True:
+                    remaining_cooldown = cooldown_end - time.monotonic()
+                    if remaining_cooldown <= 0:
+                        break
+                    _notify(
+                        progress_callback, 81 + recovery_round,
+                        f"[pemulihan {recovery_round}/3] 0/{recovery_total} | "
+                        f"cooldown={int(remaining_cooldown + 0.999)} detik | "
+                        f"worker={recovery_worker_count}",
+                    )
+                    time.sleep(min(1.0, remaining_cooldown))
                 _notify(
                     progress_callback, 81 + recovery_round,
                     f"[pemulihan {recovery_round}/3] 0/{recovery_total} | "
                     f"worker={recovery_worker_count} | "
-                    f"mengulang {recovery_total} bagian secara aman",
+                    "probe koneksi sebelum memulai",
                 )
-                time.sleep(1.5 * recovery_round)
 
                 recovery_state = threading.local()
+                requested_provider = (
+                    'cloud' if recovery_round == 3 else 'web'
+                )
 
                 def recover_index(index):
                     recovery_tr = getattr(
@@ -2046,65 +2200,92 @@ class DocxFinalTranslatorEngine:
                     )
                     if recovery_tr is None:
                         recovery_tr = _Translator(
-                            self.source_lang, self.target_lang,
+                            'en', self.target_lang,
                             self.custom_dict, self.italic_dict,
                             rate_limiter=rate_limiter,
+                            provider=requested_provider,
                         )
                         recovery_state.translator = recovery_tr
                         with worker_lock:
                             worker_translators.append(recovery_tr)
                     task = prepared_tasks[index]
-                    before = len(recovery_tr.failed_texts)
-                    translated, italic_terms = recovery_tr.translate_one(
-                        task['combined'], task['dict_italic_map']
+                    translated, italic_terms, failed = (
+                        _translate_for_recovery(
+                            recovery_tr,
+                            task['combined'], task['dict_italic_map'],
+                            allow_split=recovery_round >= 2,
+                        )
                     )
-                    failed = len(recovery_tr.failed_texts) > before
-                    return index, translated, italic_terms, failed
+                    return (
+                        index, translated, italic_terms, failed,
+                        recovery_tr.provider,
+                    )
 
                 still_failed = []
                 recovered_this_round = 0
-                with ThreadPoolExecutor(
-                    max_workers=recovery_worker_count,
-                    thread_name_prefix=f'rsni-recovery-{recovery_round}',
-                ) as recovery_pool:
-                    recovery_futures = {
-                        recovery_pool.submit(recover_index, index): index
-                        for index in failed_indexes
-                    }
-                    try:
-                        for recovery_done, future in enumerate(
-                            as_completed(recovery_futures), 1
-                        ):
-                            index, translated, italic_terms, failed = (
-                                future.result()
-                            )
-                            results[index] = (
-                                translated, italic_terms, failed
-                            )
-                            if failed:
-                                still_failed.append(index)
-                            else:
-                                recovered_this_round += 1
-                                task = prepared_tasks[index]
-                                key = persistent_cache.make_key(
-                                    task['combined'],
-                                    task['dict_italic_map'],
+
+                def accept_recovery_result(recovery_result, recovery_done):
+                    nonlocal recovered_this_round
+                    index, translated, italic_terms, failed, provider_used = (
+                        recovery_result
+                    )
+                    results[index] = (translated, italic_terms, failed)
+                    if failed:
+                        still_failed.append(index)
+                    else:
+                        recovered_this_round += 1
+                        task = prepared_tasks[index]
+                        key = persistent_cache.make_key(
+                            task['combined'], task['dict_italic_map'],
+                        )
+                        persistent_cache.put(key, translated, italic_terms)
+                    _notify(
+                        progress_callback, 81 + recovery_round,
+                        f"[pemulihan {recovery_round}/3] "
+                        f"{recovery_done}/{recovery_total} | "
+                        f"worker={recovery_worker_count} | "
+                        f"provider={provider_used} | "
+                        f"berhasil={recovered_this_round} | "
+                        f"tersisa={recovery_total - recovery_done}",
+                    )
+
+                # Probe satu request lebih dahulu. Ini memastikan koneksi baru
+                # benar-benar diuji sebelum sisa antrean dikirim ke worker.
+                probe_index = failed_indexes[0]
+                probe_result = recover_index(probe_index)
+                accept_recovery_result(probe_result, 1)
+                remaining_indexes = failed_indexes[1:]
+                if probe_result[3] and remaining_indexes:
+                    # Circuit breaker: probe gagal berarti provider belum
+                    # sehat. Beri jeda tambahan sebelum membuka antrean.
+                    probe_cooldown = min(max(cooldown, 5.0), 30.0)
+                    _notify(
+                        progress_callback, 81 + recovery_round,
+                        f"[pemulihan {recovery_round}/3] 1/{recovery_total} | "
+                        f"probe gagal; circuit breaker "
+                        f"{int(probe_cooldown)} detik",
+                    )
+                    time.sleep(probe_cooldown)
+                if remaining_indexes:
+                    with ThreadPoolExecutor(
+                        max_workers=recovery_worker_count,
+                        thread_name_prefix=f'rsni-recovery-{recovery_round}',
+                    ) as recovery_pool:
+                        recovery_futures = {
+                            recovery_pool.submit(recover_index, index): index
+                            for index in remaining_indexes
+                        }
+                        try:
+                            for recovery_done, future in enumerate(
+                                as_completed(recovery_futures), 2
+                            ):
+                                accept_recovery_result(
+                                    future.result(), recovery_done
                                 )
-                                persistent_cache.put(
-                                    key, translated, italic_terms
-                                )
-                            _notify(
-                                progress_callback, 81 + recovery_round,
-                                f"[pemulihan {recovery_round}/3] "
-                                f"{recovery_done}/{recovery_total} | "
-                                f"worker={recovery_worker_count} | "
-                                f"berhasil={recovered_this_round} | "
-                                f"tersisa={recovery_total - recovery_done}",
-                            )
-                    except Exception:
-                        for pending in recovery_futures:
-                            pending.cancel()
-                        raise
+                        except Exception:
+                            for pending in recovery_futures:
+                                pending.cancel()
+                            raise
                 failed_indexes = sorted(still_failed)
 
             italic_count = 0
