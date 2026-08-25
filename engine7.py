@@ -638,11 +638,15 @@ class DocxOptimizerEngine:
             )
             if toc_index is None:
                 raise ValueError('Heading Daftar isi tidak ditemukan.')
-            if bibliography_index is None:
-                raise ValueError('Heading Bibliography tidak ditemukan.')
             if perumus_index is None:
                 raise ValueError('Heading informasi perumus SNI tidak ditemukan.')
-            if not (toc_index < bibliography_index < perumus_index):
+            if not (toc_index < perumus_index):
+                raise ValueError(
+                    'Urutan dokumen harus Daftar isi → informasi perumus SNI.'
+                )
+            if bibliography_index is not None and not (
+                toc_index < bibliography_index < perumus_index
+            ):
                 raise ValueError(
                     'Urutan dokumen harus Daftar isi → Bibliography → informasi perumus SNI.'
                 )
@@ -1560,16 +1564,16 @@ class DocxOptimizerEngine:
             # Bibliography: semua entri spacing after 0 pt, single spacing,
             # dan tepat satu paragraf kosong di antara dua entri.
             current_paragraphs = list(doc.paragraphs)
-            bibliography_start = next(
+            bibliography_start = next((
                 i for i, paragraph in enumerate(current_paragraphs)
                 if (paragraph.text or '').strip().casefold() == 'bibliography'
-            )
+            ), None)
             bibliography_end = next(
                 i for i, paragraph in enumerate(current_paragraphs)
                 if (paragraph.text or '').strip().casefold()
                 == 'informasi pendukung terkait perumus standar'
             )
-            bibliography_entries = [
+            bibliography_entries = [] if bibliography_start is None else [
                 paragraph
                 for paragraph in current_paragraphs[
                     bibliography_start + 1:bibliography_end
