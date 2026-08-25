@@ -298,6 +298,7 @@ class InfoPendukungEngine:
     """
 
     HEADING = 'Informasi pendukung terkait perumus standar'
+    DUPLICATE_MARKER = 'Engine5DuplicateStart'
 
     @staticmethod
     def _normalize(text: str) -> str:
@@ -328,7 +329,13 @@ class InfoPendukungEngine:
             (p for p in doc.paragraphs if cls._normalize(p.text).casefold() == 'bibliography'),
             None,
         )
-        if bibliography is None or cls._section_number(bibliography) < 4:
+        marker_found = any(
+            item.get(qn('w:name')) == cls.DUPLICATE_MARKER
+            for item in doc.element.xpath('.//w:bookmarkStart')
+        )
+        if not marker_found:
+            raise ValueError('Bookmark keluaran Engine 5 tidak ditemukan.')
+        if bibliography is not None and cls._section_number(bibliography) < 4:
             raise ValueError('Bibliography tidak ditemukan pada area Content.')
         return doc
 
@@ -350,9 +357,8 @@ class InfoPendukungEngine:
             (p for p in doc.paragraphs if cls._normalize(p.text).casefold() == 'bibliography'),
             None,
         )
-        if (
-            bibliography is None
-            or cls._section_number(bibliography) < 4
+        if bibliography is not None and (
+            cls._section_number(bibliography) < 4
             or cls._section_number(bibliography) >= len(doc.sections)
         ):
             raise RuntimeError('Posisi Bibliography pada area Content berubah.')
@@ -677,8 +683,8 @@ class InfoPendukungEngine:
         return (
             True,
             result,
-            'Informasi perumus SNI berhasil disisipkan setelah Bibliography '
-            'sebagai section terakhir.',
+            'Informasi perumus SNI berhasil disisipkan setelah Content atau '
+            'Bibliography sebagai section terakhir.',
         )
 
 
