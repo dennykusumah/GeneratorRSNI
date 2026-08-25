@@ -27,7 +27,7 @@ import sqlite3
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from docx import Document
-from docx.shared import Pt
+from docx.shared import Pt, RGBColor
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.oxml.ns import qn
 from docx.oxml import OxmlElement
@@ -1489,6 +1489,14 @@ def _apply_para_translation(task, translated: str,
     return italic_terms_found
 
 
+def _mark_failed_translation_red(task) -> None:
+    """Pertahankan teks sumber dan tandai merah untuk keputusan pengguna."""
+    para = task['para']
+    for run in para.runs:
+        if run.text:
+            run.font.color.rgb = RGBColor(255, 0, 0)
+
+
 def _translate_para(para, tr, past_bibliography: bool = False) -> list[str]:
     """Jalur kompatibilitas serial untuk header/footer dan sinkronisasi."""
     task = _prepare_para_translation(para, tr, past_bibliography)
@@ -1807,6 +1815,8 @@ class DocxFinalTranslatorEngine:
         self.italic_dict = italic_dict
         self._custom_dict_provided = custom_dict is not None
         self._italic_dict_provided = italic_dict is not None
+        self.needs_review = False
+        self.failed_count = 0
 
     def set_dictionary(self, d: CustomDictionary) -> None:
         self.custom_dict = d
@@ -1824,6 +1834,8 @@ class DocxFinalTranslatorEngine:
     def translate(self, input_docx: str, output_docx: str, progress_callback=None, 
                   translate_headers: bool = False) -> tuple[bool, str]:
         try:
+            self.needs_review = False
+            self.failed_count = 0
             # app.py membuat engine tanpa parameter kamus. Karena itu Engine 8
             # wajib mengambil kedua spreadsheet sendiri pada setiap proses,
             # sehingga perubahan Google Sheet langsung dipakai dan bukan hanya
@@ -2095,25 +2107,21 @@ class DocxFinalTranslatorEngine:
                         raise
                 failed_indexes = sorted(still_failed)
 
-            if failed_indexes:
-                previews = [
-                    re.sub(r'\s+', ' ', translation_queue[i].text or '').strip()[:80]
-                    for i in failed_indexes[:5]
-                ]
-                raise TranslationFailedError(
-                    f'{len(failed_indexes)} dari {total} bagian gagal '
-                    'diterjemahkan setelah seluruh retry; output dibatalkan '
-                    'agar tidak ada teks yang terlewat. Contoh: '
-                    + ' | '.join(previews)
-                )
-
             italic_count = 0
-            for task, result in zip(prepared_tasks, results):
-                translated, italic_terms, _ = result
+            failed_set = set(failed_indexes)
+            for index, (task, result) in enumerate(
+                zip(prepared_tasks, results)
+            ):
+                translated, italic_terms, failed = result
+                if failed or index in failed_set:
+                    _mark_failed_translation_red(task)
+                    continue
                 italic_count += len(
                     _apply_para_translation(task, translated, italic_terms)
                 )
-            translated_count = total
+            translated_count = total - len(failed_indexes)
+            self.needs_review = bool(failed_indexes)
+            self.failed_count = len(failed_indexes)
             tr.cache_hits += sum(w.cache_hits for w in worker_translators)
             tr.cache_hits += persistent_hits + duplicate_hits
 
@@ -2143,6 +2151,12 @@ class DocxFinalTranslatorEngine:
                 f"unit diperiksa: {inspected_count}; "
                 f"zona/unit di-skip pra-scan: {skipped_count}."
             )
+            if self.needs_review:
+                summary += (
+                    f" PERLU KEPUTUSAN: {self.failed_count} bagian gagal "
+                    "setelah Pemulihan 3, dipertahankan dalam bahasa Inggris "
+                    "dan ditandai dengan font merah."
+                )
             if tr.failed_texts:
                 summary += (
                     f" Peringatan: {len(tr.failed_texts)} bagian dipertahankan "
@@ -2178,5 +2192,10 @@ class SelectiveTranslationEngine(DocxFinalTranslatorEngine):
             translate_headers=translate_headers,
         )
         if success:
+            if self.needs_review:
+                return (
+                    True, result,
+                    f"TRANSLATION_REVIEW_REQUIRED:{self.failed_count}",
+                )
             return True, result, "Penerjemahan selektif selesai."
         return False, output_docx, result
