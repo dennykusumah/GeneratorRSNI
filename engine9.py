@@ -138,33 +138,51 @@ def _word_page_range(word_doc, page_number: int):
 
 def _word_page_is_blank(page_range) -> bool:
     """True bila halaman tidak mempunyai isi utama yang terlihat."""
+    # Jangan menghapus halaman yang berisi tabel/gambar meskipun Range.Text
+    # kosong (teks di shape tidak selalu dikembalikan Word sebagai Range.Text).
+    try:
+        if page_range.Tables.Count or page_range.InlineShapes.Count:
+            return False
+    except Exception:
+        pass
     text = page_range.Text or ''
     # \r = paragraph mark, \x07 = end-of-cell, \x0c = page/section break.
-    visible = re.sub(r'[\s\r\n\t\x07\x0c]+', '', text)
+    # NBSP/zero-width/BOM juga bukan isi halaman yang terlihat.
+    visible = re.sub(
+        r'[\s\r\n\t\x07\x0b\x0c\u00a0\u200b\u200c\u200d\ufeff]+',
+        '', text,
+    )
     return not visible
 
 
-def _remove_blank_pages_after_toc(word_doc, toc, max_pages: int = 5) -> int:
-    """Hapus halaman kosong berurutan tepat setelah halaman terakhir TOC.
+def _remove_blank_pages_after_toc(word_doc, toc, max_removals: int = 20) -> int:
+    """Hapus semua halaman kosong setelah TOC, bukan hanya yang berurutan.
 
     Pagination hanya dapat diketahui secara benar oleh layout engine Word.
     Halaman virtual akibat section ``Odd Page``/``Even Page`` dihilangkan
-    dengan mengubah section berikutnya menjadi ``New Page``; halaman kosong
-    biasa dihapus melalui Range.Delete().
+    dengan mengubah section berikutnya menjadi ``New Page``. Halaman kosong
+    akibat break/paragraf kosong dihapus melalui Range.Delete(). Setelah suatu
+    halaman berisi teks ditemukan, pemindaian tetap dilanjutkan sampai akhir;
+    versi lama berhenti di titik itu sehingga blank page di tengah/akhir lolos.
     """
     removed = 0
     word_doc.Repaginate()
     toc_end_page = int(toc.Range.Information(_WD_ACTIVE_END_PAGE_NUMBER))
+    candidate = toc_end_page + 1
+    safety = 0
 
-    for _ in range(max_pages):
+    while removed < max_removals:
+        safety += 1
+        if safety > 500:
+            raise RuntimeError('Pemindaian halaman kosong melebihi batas aman.')
         word_doc.Repaginate()
         page_count = int(word_doc.ComputeStatistics(_WD_STATISTIC_PAGES))
-        candidate = toc_end_page + 1
         if candidate > page_count:
             break
         page_range = _word_page_range(word_doc, candidate)
         if not _word_page_is_blank(page_range):
-            break
+            candidate += 1
+            continue
 
         changed_section = False
         if candidate < page_count:
@@ -187,9 +205,29 @@ def _remove_blank_pages_after_toc(word_doc, toc, max_pages: int = 5) -> int:
             before_end = int(word_doc.Content.End)
             page_range.Delete()
             if int(word_doc.Content.End) >= before_end:
-                # Hindari loop tanpa akhir bila Word menolak penghapusan.
-                break
+                # Blank page dapat dibentuk oleh PageBreakBefore pada paragraf
+                # pertama halaman berikutnya. Range halaman kosong sendiri
+                # saat itu tidak mempunyai karakter yang dapat dihapus.
+                try:
+                    next_page = word_doc.GoTo(
+                        What=_WD_GOTO_PAGE, Which=_WD_GOTO_ABSOLUTE,
+                        Count=min(candidate + 1, page_count),
+                    )
+                    first_para = next_page.Paragraphs.Item(1)
+                    if int(first_para.Format.PageBreakBefore) != 0:
+                        first_para.Format.PageBreakBefore = 0
+                    else:
+                        raise RuntimeError(
+                            f'Word menolak menghapus halaman kosong {candidate}.'
+                        )
+                except Exception as exc:
+                    raise RuntimeError(
+                        f'Halaman kosong {candidate} terdeteksi tetapi tidak '
+                        f'dapat dihapus: {exc}'
+                    ) from exc
         removed += 1
+        # Tetap periksa nomor halaman yang sama karena halaman berikutnya
+        # bergeser ke posisi candidate setelah penghapusan.
 
     word_doc.Repaginate()
     return removed
@@ -246,11 +284,16 @@ try {
     $firstToc = $document.TablesOfContents.Item(1)
     $tocEndPage = [int]$firstToc.Range.Information(3)
     $removed = 0
+    $candidate = $tocEndPage + 1
+    $safety = 0
 
-    for ($attempt = 0; $attempt -lt 5; $attempt++) {
+    while ($removed -lt 20) {
+        $safety++
+        if ($safety -gt 500) {
+            throw 'Pemindaian halaman kosong melebihi batas aman.'
+        }
         $document.Repaginate()
         $pageCount = [int]$document.ComputeStatistics(2)
-        $candidate = $tocEndPage + 1
         if ($candidate -gt $pageCount) { break }
 
         $start = [int]$document.GoTo(1, 1, $candidate).Start
@@ -260,10 +303,18 @@ try {
             $end = [int]$document.Content.End
         }
         $pageRange = $document.Range($start, $end)
+        if ($pageRange.Tables.Count -gt 0 -or
+            $pageRange.InlineShapes.Count -gt 0) {
+            $candidate++
+            continue
+        }
         $visible = [string]$pageRange.Text
         $visible = $visible.Replace([char]7, '').Replace([char]12, '')
-        $visible = $visible -replace '\s', ''
-        if ($visible.Length -gt 0) { break }
+        $visible = $visible -replace '[\s\u000B\u00A0\u200B\u200C\u200D\uFEFF]', ''
+        if ($visible.Length -gt 0) {
+            $candidate++
+            continue
+        }
 
         $changedSection = $false
         if ($candidate -lt $pageCount) {
@@ -281,7 +332,19 @@ try {
         if (-not $changedSection) {
             $beforeEnd = [int]$document.Content.End
             [void]$pageRange.Delete()
-            if ([int]$document.Content.End -ge $beforeEnd) { break }
+            if ([int]$document.Content.End -ge $beforeEnd) {
+                if ($candidate -lt $pageCount) {
+                    $nextPage = $document.GoTo(1, 1, ($candidate + 1))
+                    $firstParagraph = $nextPage.Paragraphs.Item(1)
+                    if ([int]$firstParagraph.Format.PageBreakBefore -ne 0) {
+                        $firstParagraph.Format.PageBreakBefore = 0
+                    } else {
+                        throw "Word menolak menghapus halaman kosong $candidate."
+                    }
+                } else {
+                    throw "Word menolak menghapus halaman kosong terakhir $candidate."
+                }
+            }
         }
         $removed++
     }
@@ -292,6 +355,54 @@ try {
         $updated++
     }
     $document.Repaginate()
+
+    # UpdatePageNumbers dapat mengubah lebar/line-wrap entri TOC dan memicu
+    # pagination baru. Jalankan audit blank page sekali lagi, lalu perbarui
+    # nomor halaman kembali bila ada halaman yang baru saja dihapus.
+    $removedAfterUpdate = 0
+    $firstToc = $document.TablesOfContents.Item(1)
+    $tocEndPage = [int]$firstToc.Range.Information(3)
+    $candidate = $tocEndPage + 1
+    $safety = 0
+    while ($removedAfterUpdate -lt 20) {
+        $safety++
+        if ($safety -gt 500) { throw 'Audit final blank page melebihi batas aman.' }
+        $document.Repaginate()
+        $pageCount = [int]$document.ComputeStatistics(2)
+        if ($candidate -gt $pageCount) { break }
+        $start = [int]$document.GoTo(1, 1, $candidate).Start
+        if ($candidate -lt $pageCount) {
+            $end = [int]$document.GoTo(1, 1, ($candidate + 1)).Start
+        } else { $end = [int]$document.Content.End }
+        $pageRange = $document.Range($start, $end)
+        $visible = [string]$pageRange.Text
+        $visible = $visible.Replace([char]7, '').Replace([char]12, '')
+        $visible = $visible -replace '[\s\u000B\u00A0\u200B\u200C\u200D\uFEFF]', ''
+        if ($pageRange.Tables.Count -gt 0 -or
+            $pageRange.InlineShapes.Count -gt 0 -or $visible.Length -gt 0) {
+            $candidate++
+            continue
+        }
+        $beforeEnd = [int]$document.Content.End
+        [void]$pageRange.Delete()
+        if ([int]$document.Content.End -ge $beforeEnd) {
+            if ($candidate -lt $pageCount) {
+                $nextPage = $document.GoTo(1, 1, ($candidate + 1))
+                $firstParagraph = $nextPage.Paragraphs.Item(1)
+                if ([int]$firstParagraph.Format.PageBreakBefore -ne 0) {
+                    $firstParagraph.Format.PageBreakBefore = 0
+                } else { throw "Word menolak audit halaman kosong $candidate." }
+            } else { throw "Word menolak audit halaman kosong terakhir $candidate." }
+        }
+        $removedAfterUpdate++
+    }
+    if ($removedAfterUpdate -gt 0) {
+        $removed += $removedAfterUpdate
+        for ($index = 1; $index -le $tocCount; $index++) {
+            $document.TablesOfContents.Item($index).UpdatePageNumbers()
+        }
+        $document.Repaginate()
+    }
     $document.Save()
     Write-Output "RSNI_ENGINE9_RESULT:$removed,$updated"
 }
@@ -391,6 +502,15 @@ def _finalize_toc_with_word(docx_path: str) -> tuple[int, int]:
             word_doc.TablesOfContents.Item(index).UpdatePageNumbers()
             updated += 1
         word_doc.Repaginate()
+
+        removed_after_update = _remove_blank_pages_after_toc(
+            word_doc, word_doc.TablesOfContents.Item(1)
+        )
+        if removed_after_update:
+            removed += removed_after_update
+            for index in range(1, word_doc.TablesOfContents.Count + 1):
+                word_doc.TablesOfContents.Item(index).UpdatePageNumbers()
+            word_doc.Repaginate()
         word_doc.Save()
         return removed, updated
     finally:
