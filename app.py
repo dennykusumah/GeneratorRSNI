@@ -49,7 +49,10 @@ def _cleanup_temp_files(max_age_minutes: int = _MAX_AGE_MINUTES, silent: bool = 
 
 def _cleanup_session_files(session_state):
     """Hapus file milik sesi saat ini segera."""
-    keys = ['_target_file', '_final_opt_file', '_final_tr_file']
+    keys = [
+        '_target_file', '_final_opt_file', '_final_tr_file',
+        '_engine8_partial_file', '_pending_engine9_out',
+    ]
     for k in keys:
         fpath = session_state.get(k)
         if fpath and os.path.isfile(fpath):
@@ -1085,6 +1088,50 @@ def _render_footer_once():
     st.markdown(_FOOTER_HTML, unsafe_allow_html=True)
     _footer_rendered_this_run = True
 
+
+# Engine 8 berhenti di sini bila setelah Pemulihan 3 masih ada bagian gagal.
+# Panel ditempatkan sebelum footer sehingga tombol Kembali/Lanjutkan muncul
+# tepat di atas tombol "Ganti Mode Terjemahan Cepat".
+if st.session_state.get('_translation_review_pending'):
+    _failed_count = int(st.session_state.get('_translation_failed_count', 0))
+    if st.session_state.get('_engine9_continue_error'):
+        st.error(st.session_state['_engine9_continue_error'])
+    st.warning(
+        f"⚠️ {_failed_count} bagian belum berhasil diterjemahkan setelah "
+        "Pemulihan 3. Bagian tersebut tetap berbahasa Inggris dan ditandai "
+        "dengan font merah."
+    )
+    _back_col, _continue_col = st.columns(2)
+    with _back_col:
+        if st.button("⬅️ Kembali", key="translation_review_back",
+                     use_container_width=True):
+            # File proses sesi dibersihkan, tetapi cache terjemahan SQLite
+            # sengaja tidak disentuh agar tetap dapat digunakan berikutnya.
+            _cleanup_session_files(st.session_state)
+            for _key in [
+                '_translation_review_pending', '_translation_failed_count',
+                '_engine9_continue_error',
+                '_completed_with_translation_warning',
+                '_continue_engine9', '_engine8_partial_file',
+                '_pending_engine9_out', '_run_process', '_show_results',
+                '_final_opt_file', '_final_tr_file', '_final_time',
+                '_doc_text', '_chat_history', '_doc_sections', '_target_file',
+                '_original_upload_name', '_doc_title', '_ics_number',
+                '_sid', 'upl_main',
+            ]:
+                st.session_state.pop(_key, None)
+            st.rerun()
+    with _continue_col:
+        if st.button("Lanjutkan ➡️", key="translation_review_continue",
+                     type="primary", use_container_width=True):
+            st.session_state.pop('_engine9_continue_error', None)
+            st.session_state['_translation_review_pending'] = False
+            st.session_state['_continue_engine9'] = True
+            st.session_state['_run_process'] = True
+            st.rerun()
+    _render_footer_once()
+    st.stop()
+
 import datetime
 _tahun = str(datetime.date.today().year)
 
@@ -1311,6 +1358,61 @@ if st.session_state.get('_run_process') and st.session_state.get('_target_file')
 
         return final_file
 
+    # Rerun khusus setelah pengguna memilih "Lanjutkan". Engine 1–8 tidak
+    # dijalankan ulang; dokumen parsial Engine 8 langsung diteruskan ke Engine 9.
+    if st.session_state.get('_continue_engine9'):
+        partial_file = st.session_state.get('_engine8_partial_file')
+        engine9_out = st.session_state.get('_pending_engine9_out')
+        if (not partial_file or not os.path.isfile(partial_file)
+                or not engine9_out):
+            st.session_state['_engine9_continue_error'] = (
+                'Dokumen parsial Engine 8 tidak ditemukan. Silakan kembali '
+                'dan proses ulang dokumen.'
+            )
+            st.session_state['_translation_review_pending'] = True
+            st.session_state['_continue_engine9'] = False
+            st.session_state['_run_process'] = False
+            st.rerun()
+        try:
+            update_ui(
+                98,
+                "Melanjutkan dengan bagian gagal berwarna merah...\n"
+                "Menjalankan Engine 9 dan memperbarui daftar isi.",
+            )
+            ok_e9, _path_e9, msg_e9 = engine9.process(
+                input_docx=partial_file,
+                output_docx=engine9_out,
+            )
+            if not ok_e9:
+                raise Exception(f"Engine 9: {msg_e9}")
+            update_ui(99, f"Menyimpan dokumen final...\n{msg_e9}")
+            final_elapsed = get_elapsed_str(start_time)
+            update_ui(100, "✅ Engine 9 selesai dengan peringatan translasi!")
+            time_placeholder.markdown(
+                f'<div class="timer-text">⏱ {final_elapsed}</div>',
+                unsafe_allow_html=True,
+            )
+            st.session_state['_final_opt_file'] = engine9_out
+            st.session_state.pop('_final_tr_file', None)
+            st.session_state['_final_time'] = final_elapsed
+            st.session_state['_show_results'] = True
+            st.session_state['_completed_with_translation_warning'] = True
+            st.session_state['_doc_sections'] = _parse_doc_structure(
+                engine9_out
+            )
+            st.session_state['_run_process'] = False
+            st.session_state['_continue_engine9'] = False
+            st.session_state['_translation_review_pending'] = False
+            st.rerun()
+        except Exception as exc:
+            st.session_state['_engine9_continue_error'] = (
+                f'Gagal melanjutkan ke Engine 9: {exc}'
+            )
+            st.session_state['_translation_review_pending'] = True
+            st.session_state['_continue_engine9'] = False
+            st.session_state['_run_process'] = False
+            st.rerun()
+
     try:
         # MODE ENGINE 1 → ENGINE 2 → ENGINE 3 → ENGINE 4 → ENGINE 5 →
         # ENGINE 6 → ENGINE 7 → ENGINE 8 → ENGINE 9.
@@ -1483,9 +1585,33 @@ if st.session_state.get('_run_process') and st.session_state.get('_target_file')
         if not ok_e8:
             raise Exception(f"Engine 8: {msg_e8}")
 
+        engine9_out = f"engine9_{_sid}_{original_name}"
+        review_required = (
+            bool(getattr(engine8, 'needs_review', False))
+            or str(msg_e8).startswith('TRANSLATION_REVIEW_REQUIRED:')
+        )
+        if review_required:
+            failed_count = int(getattr(engine8, 'failed_count', 0) or 0)
+            if not failed_count:
+                marker = re.search(r':(\d+)', str(msg_e8))
+                failed_count = int(marker.group(1)) if marker else 0
+            st.session_state['_engine8_partial_file'] = engine8_out
+            st.session_state['_pending_engine9_out'] = engine9_out
+            st.session_state['_translation_failed_count'] = failed_count
+            st.session_state['_translation_review_pending'] = True
+            st.session_state['_continue_engine9'] = False
+            st.session_state['_run_process'] = False
+            st.session_state['_show_results'] = False
+            update_ui(
+                98,
+                "Pemulihan selesai dengan bagian gagal.\n"
+                f"{failed_count} bagian dipertahankan dalam bahasa Inggris "
+                "dan diberi warna merah.",
+            )
+            st.rerun()
+
         update_ui(98, f"Penerjemahan selesai ✓\n{msg_e8}")
 
-        engine9_out = f"engine9_{_sid}_{original_name}"
         update_ui(98, "Menerapkan style final dan daftar isi...")
         ok_e9, _path_e9, msg_e9 = engine9.process(
             input_docx=engine8_out,
@@ -1505,6 +1631,7 @@ if st.session_state.get('_run_process') and st.session_state.get('_target_file')
         st.session_state.pop('_final_tr_file', None)
         st.session_state['_final_time'] = final_elapsed
         st.session_state['_show_results'] = True
+        st.session_state['_completed_with_translation_warning'] = False
         st.session_state['_doc_sections'] = _parse_doc_structure(engine9_out)
 
     except Exception as e:
@@ -1531,6 +1658,11 @@ if st.session_state.get('_show_results'):
         </div>""",
         unsafe_allow_html=True
     )
+    if st.session_state.get('_completed_with_translation_warning'):
+        st.warning(
+            "Dokumen dilanjutkan atas pilihan pengguna. Bagian yang gagal "
+            "diterjemahkan tetap berbahasa Inggris dan berwarna merah."
+        )
 
     opt_file = st.session_state.get('_final_opt_file')
     if opt_file and os.path.exists(opt_file):
@@ -1547,7 +1679,11 @@ if st.session_state.get('_show_results'):
         # Hapus file sesi ini segera sebelum reset
         _cleanup_session_files(st.session_state)
         for k in ['_show_results', '_final_opt_file', '_final_tr_file', '_final_time', '_run_process',
-                  '_doc_text', '_chat_history', '_doc_sections', '_target_file']:
+                  '_doc_text', '_chat_history', '_doc_sections', '_target_file',
+                  '_translation_review_pending', '_translation_failed_count',
+                  '_continue_engine9', '_engine8_partial_file',
+                  '_pending_engine9_out', '_engine9_continue_error',
+                  '_completed_with_translation_warning']:
             if k in st.session_state: del st.session_state[k]
         st.rerun()
 
