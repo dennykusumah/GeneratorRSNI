@@ -1091,7 +1091,7 @@ _tahun = str(datetime.date.today().year)
 # --- FORM INPUT ---
 st.markdown('<div class="section-label">📂 Upload Dokumen ISO</div>', unsafe_allow_html=True)
 uploaded_file = st.file_uploader(
-    "Upload file .docx di sini atau klik Browse",
+    "Upload file .doc atau .docx di sini atau klik Browse",
     type=["doc", "docx"],
     key="upl_main",
     label_visibility="collapsed",
@@ -1405,20 +1405,52 @@ if st.session_state.get('_run_process') and st.session_state.get('_target_file')
         _engine8_progress_state = {'pct': 10}
 
         def _engine8_progress(pct, msg):
-            # Utamakan progres riil xx/yyy dari callback Engine 8. Jika pesan
-            # belum memiliki counter (pemuatan kamus/inisialisasi), gunakan
-            # persentase internal sebagai fallback.
-            match = re.search(r'(?<!\d)(\d+)\s*/\s*(\d+)(?!\d)', msg or '')
-            if match and int(match.group(2)) > 0:
-                ratio = min(int(match.group(1)) / int(match.group(2)), 1.0)
+            message = msg or ''
+            # Pemulihan mempunyai counter sendiri (mis. 1/3). Deteksi tahap
+            # ini SEBELUM counter translasi agar 1/3 tidak salah dipetakan ke
+            # rentang 10–95%. Rentang khusus pemulihan adalah 95–98%.
+            recovery = re.search(
+                r'\[pemulihan\s+(\d+)\s*/\s*(\d+)\]',
+                message, re.IGNORECASE,
+            )
+            translation = re.search(
+                r'\[(?:translate(?:\s+paralel)?|pra-scan)\][^\n]*?'
+                r'(?<!\d)(\d+)\s*/\s*(\d+)(?!\d)',
+                message, re.IGNORECASE,
+            )
+
+            if recovery and int(recovery.group(2)) > 0:
+                recovery_no = max(1, int(recovery.group(1)))
+                recovery_total = max(1, int(recovery.group(2)))
+                ratio = min(
+                    (recovery_no - 1) / max(recovery_total - 1, 1), 1.0
+                )
+                calculated_pct = min(95 + int(ratio * 3), 98)
+            elif translation and int(translation.group(2)) > 0:
+                # Progres riil xx/XXX menguasai tepat rentang 10–95%.
+                ratio = min(
+                    int(translation.group(1)) /
+                    int(translation.group(2)), 1.0
+                )
+                calculated_pct = min(10 + int(ratio * 85), 95)
+            elif pct >= 90:
+                # Sinkronisasi judul dan penyimpanan Engine 8 berada setelah
+                # translasi/pemulihan, tetapi tidak boleh melewati 98% karena
+                # 98–100% disediakan untuk Engine 9 dan finalisasi aplikasi.
+                calculated_pct = 98
             else:
-                ratio = max(0, min(pct, 100)) / 100.0
-            calculated_pct = min(10 + int(ratio * 88), 98)
-            # Jangan biarkan fase sinkronisasi/penyimpanan setelah 100% antrean
-            # membuat progress bar mundur karena pesannya tidak punya xx/yyy.
+                # Pemuatan kamus/inisialisasi tetap di titik awal 10%.
+                calculated_pct = 10
+
+            # Callback paralel dapat selesai tidak berurutan; progress UI harus
+            # monoton dan tidak boleh mundur.
             mapped_pct = max(_engine8_progress_state['pct'], calculated_pct)
             _engine8_progress_state['pct'] = mapped_pct
-            update_ui(mapped_pct, f"Menerjemahkan dokumen...\n{msg}")
+            phase = (
+                "Memulihkan bagian terjemahan..."
+                if recovery else "Menerjemahkan dokumen..."
+            )
+            update_ui(mapped_pct, f"{phase}\n{message}")
 
         ok_e8, _path_e8, msg_e8 = engine8.process(
             input_docx=engine7_out,
