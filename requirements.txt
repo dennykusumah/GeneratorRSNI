@@ -1,0 +1,16 @@
+# Antarmuka aplikasi
+streamlit>=1.40
+
+# Pemrosesan dokumen DOCX dan XML WordprocessingML
+python-docx>=1.1.2
+lxml>=5.3
+
+# Layanan terjemahan Engine 8
+deep-translator>=1.11.4
+
+# Dukungan pembacaan kamus Excel lokal pada Engine 8
+pandas>=2.2
+openpyxl>=3.1.5
+
+# Otomatisasi Microsoft Word oleh Engine 9 (hanya dipasang di Windows)
+pywin32>=308; sys_platform == "win32"
