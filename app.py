@@ -1091,7 +1091,7 @@ _tahun = str(datetime.date.today().year)
 # --- FORM INPUT ---
 st.markdown('<div class="section-label">📂 Upload Dokumen ISO</div>', unsafe_allow_html=True)
 uploaded_file = st.file_uploader(
-    "Upload file .doc atau .docx di sini atau klik Browse",
+    "Upload file .docx di sini atau klik Browse",
     type=["doc", "docx"],
     key="upl_main",
     label_visibility="collapsed",
