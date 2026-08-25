@@ -20,6 +20,11 @@ import uuid
 import traceback
 import csv
 import os
+import threading
+import hashlib
+import json
+import sqlite3
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from docx import Document
 from docx.shared import Pt
@@ -66,6 +71,9 @@ _HEADING_STYLES_WITH_NUM = {
 # Tidak diperlukan jeda setelah request yang berhasil. Retry backoff tetap
 # dipertahankan khusus saat layanan gagal agar reliabilitas tidak berkurang.
 _TRANSLATE_DELAY = 0.0
+# Jumlah koneksi simultan sengaja dibatasi. Nilai 4 memberi percepatan nyata
+# tanpa membanjiri layanan gratis Google Translate dan memicu rate-limit.
+_TRANSLATION_WORKERS = max(1, min(8, int(os.getenv('RSNI_TRANSLATION_WORKERS', '4'))))
 _EM_DASH = '—'
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1122,15 +1130,105 @@ class TranslationFailedError(RuntimeError):
     """Mencegah dokumen setengah diterjemahkan tetap disimpan."""
 
 
+class _AdaptiveRateLimiter:
+    """Backoff bersama: empat worker melambat serempak saat provider menolak."""
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._next_allowed = 0.0
+        self._penalty = 0.0
+        self._minimum_interval = max(
+            0.05, float(os.getenv('RSNI_REQUEST_INTERVAL', '0.18'))
+        )
+
+    def wait(self) -> None:
+        # Reservasi slot dilakukan di dalam lock agar empat worker tidak lolos
+        # pada milidetik yang sama. Tidur dilakukan di luar lock.
+        with self._lock:
+            now = time.monotonic()
+            slot = max(now, self._next_allowed)
+            self._next_allowed = slot + self._minimum_interval + self._penalty
+        delay = slot - now
+        if delay > 0:
+            time.sleep(delay)
+
+    def report_success(self) -> None:
+        with self._lock:
+            self._penalty = max(0.0, self._penalty * 0.65 - 0.05)
+
+    def report_failure(self) -> None:
+        with self._lock:
+            self._penalty = min(1.5, max(0.20, self._penalty * 1.5))
+            self._next_allowed = max(
+                self._next_allowed, time.monotonic() + self._penalty
+            )
+
+
+class _PersistentTranslationCache:
+    """Cache SQLite opsional; kegagalan cache tidak menggagalkan translasi."""
+    def __init__(self, namespace: str):
+        default_path = os.path.join(
+            os.path.expanduser('~'), '.generator_rsni_translation_cache.sqlite3'
+        )
+        self.path = os.getenv('RSNI_TRANSLATION_CACHE', default_path)
+        self.namespace = namespace
+        self.enabled = True
+        try:
+            with sqlite3.connect(self.path, timeout=10) as db:
+                db.execute(
+                    'CREATE TABLE IF NOT EXISTS translations ('
+                    'cache_key TEXT PRIMARY KEY, translated TEXT NOT NULL, '
+                    'italic_terms TEXT NOT NULL, created_at REAL NOT NULL)'
+                )
+        except Exception:
+            self.enabled = False
+
+    def make_key(self, text: str, italic_map: dict) -> str | None:
+        # Token format memakai UUID per paragraf. Jangan cache input bertoken:
+        # pemulihan token harus selalu mengikuti konteks paragraf saat ini.
+        if _RE_PROTECTION_TOKEN.search(text) or italic_map:
+            return None
+        raw = self.namespace + '\0' + text
+        return hashlib.sha256(raw.encode('utf-8')).hexdigest()
+
+    def get(self, key: str | None):
+        if not self.enabled or key is None:
+            return None
+        try:
+            with sqlite3.connect(self.path, timeout=10) as db:
+                row = db.execute(
+                    'SELECT translated, italic_terms FROM translations '
+                    'WHERE cache_key=?', (key,)
+                ).fetchone()
+            return (row[0], json.loads(row[1])) if row else None
+        except Exception:
+            return None
+
+    def put(self, key: str | None, translated: str,
+            italic_terms: list[str]) -> None:
+        if not self.enabled or key is None:
+            return
+        try:
+            with sqlite3.connect(self.path, timeout=10) as db:
+                db.execute(
+                    'INSERT OR REPLACE INTO translations VALUES (?, ?, ?, ?)',
+                    (key, translated, json.dumps(italic_terms, ensure_ascii=False),
+                     time.time()),
+                )
+        except Exception:
+            pass
+
+
 class _Translator:
     def __init__(self, source: str = 'auto', target: str = 'id', 
                  custom_dict: CustomDictionary | None = None,
-                 italic_dict: ItalicDictionary | None = None):
+                 italic_dict: ItalicDictionary | None = None,
+                 rate_limiter: _AdaptiveRateLimiter | None = None):
         try: from deep_translator import GoogleTranslator
         except ImportError: raise ImportError("Jalankan: pip install deep-translator")
         self._cls = GoogleTranslator
         self.source = source; self.target = target
         self.custom_dict = custom_dict; self.italic_dict = italic_dict
+        self.rate_limiter = rate_limiter
         self._client = self._cls(source=self.source, target=self.target)
         self.failed_texts: list[str] = []
         # Cache hanya untuk masukan polos tanpa token format dinamis. Hasilnya
@@ -1180,6 +1278,8 @@ class _Translator:
         last_error = None
         for attempt in range(1, 5):
             try:
+                if self.rate_limiter:
+                    self.rate_limiter.wait()
                 candidate = self._client.translate(t)
                 if not candidate or _looks_like_error_response(t, candidate):
                     raise ValueError('respons layanan terjemahan tidak valid')
@@ -1199,9 +1299,13 @@ class _Translator:
                 ):
                     raise ValueError('teks dikembalikan tanpa diterjemahkan')
                 result = candidate
+                if self.rate_limiter:
+                    self.rate_limiter.report_success()
                 break
             except Exception as exc:
                 last_error = exc
+                if self.rate_limiter:
+                    self.rate_limiter.report_failure()
                 if attempt < 4:
                     time.sleep(0.8 * attempt)
 
@@ -1290,25 +1394,25 @@ def _match_capitalization(original: str, translated: str) -> str:
     return tran
 
 
-def _translate_para(para, tr, past_bibliography: bool = False) -> list[str]:
+def _prepare_para_translation(para, tr, past_bibliography: bool = False):
     """
     Terjemahkan paragraf biasa. Paragraf yang memiliki hyperlink sengaja
     dipertahankan utuh supaya teks, urutan run, relationship, dan URL asli
     tidak terhapus atau berubah.
     """
-    if _skip_paragraph(para, past_bibliography): return []
+    if _skip_paragraph(para, past_bibliography): return None
 
     if _has_hyperlinks(para):
-        return []
+        return None
     
     # 2. Proses TEKS NORMAL (bukan hyperlink)
     text_runs = [(i, r) for i, r in enumerate(para.runs) if r.text and r.text.strip()]
     
-    if not text_runs: return []
+    if not text_runs: return None
     
     combined_raw = ''.join(r.text for _, r in text_runs)
     combined = combined_raw.strip()
-    if _skip_text(combined): return []
+    if _skip_text(combined): return None
     
     # Get font
     font_name = 'Arial'; font_size = None
@@ -1339,22 +1443,34 @@ def _translate_para(para, tr, past_bibliography: bool = False) -> list[str]:
     else:
         dict_italic_map = {}
 
-    # Terjemahkan (token @@SRC_...@@ dari proteksi superscript/subscript
-    # ikut terkirim dan diharapkan lolos utuh dari mesin terjemahan, sama
-    # seperti token proteksi miring lain yang sudah terbukti aman).
-    translated, italic_terms_found = tr.translate_one(combined, dict_italic_map)
-    if _TRANSLATE_DELAY > 0:
-        time.sleep(_TRANSLATE_DELAY)
-    if not translated or translated == combined: return []
-    translated = _match_capitalization(original_for_case, translated)
+    return {
+        'para': para,
+        'combined': combined,
+        'dict_italic_map': dict_italic_map,
+        'format_token_map': format_token_map,
+        'font_name': font_name,
+        'font_size': font_size,
+        'original_for_case': original_for_case,
+        'source_note_upper': source_note_upper,
+    }
+
+
+def _apply_para_translation(task, translated: str,
+                            italic_terms_found: list[str]) -> list[str]:
+    """Terapkan hasil pada DOCX hanya dari thread utama."""
+    para = task['para']
+    translated = _match_capitalization(task['original_for_case'], translated)
 
     # Kembalikan token superscript/subscript/miring-sumber menjadi teks asli,
     # sekaligus dapatkan posisi presisi untuk membangun ulang run.
-    translated, format_spans = _detokenize_with_formatting(translated, format_token_map)
+    translated, format_spans = _detokenize_with_formatting(
+        translated, task['format_token_map']
+    )
 
     # Apply formatting ke teks normal
     if italic_terms_found or format_spans:
-        _apply_mixed_formatting_to_para(para, translated, italic_terms_found, font_name, font_size,
+        _apply_mixed_formatting_to_para(para, translated, italic_terms_found,
+                                         task['font_name'], task['font_size'],
                                          format_spans=format_spans)
     else:
         if para.runs:
@@ -1363,14 +1479,27 @@ def _translate_para(para, tr, past_bibliography: bool = False) -> list[str]:
         else:
             para.add_run(translated)
 
-    _normalize_initial_clause_heading(para, original_for_case)
-    if source_note_upper or re.match(
+    _normalize_initial_clause_heading(para, task['original_for_case'])
+    if task['source_note_upper'] or re.match(
         r'^(?:NOTE|Note|note|CATATAN|Catatan|catatan)(?:\s|\t|:)',
         para.text.strip(),
     ):
-        _fix_note_para(para, force_upper=source_note_upper)
+        _fix_note_para(para, force_upper=task['source_note_upper'])
     
     return italic_terms_found
+
+
+def _translate_para(para, tr, past_bibliography: bool = False) -> list[str]:
+    """Jalur kompatibilitas serial untuk header/footer dan sinkronisasi."""
+    task = _prepare_para_translation(para, tr, past_bibliography)
+    if task is None:
+        return []
+    translated, italic_terms = tr.translate_one(
+        task['combined'], task['dict_italic_map']
+    )
+    if not translated or translated == task['combined']:
+        return []
+    return _apply_para_translation(task, translated, italic_terms)
 
 
 def _translate_table(table, tr) -> None:
@@ -1741,7 +1870,20 @@ class DocxFinalTranslatorEngine:
             )
             
             _notify(progress_callback, 5, "Init translator...")
-            tr = _Translator(self.source_lang, self.target_lang, self.custom_dict, self.italic_dict)
+            rate_limiter = _AdaptiveRateLimiter()
+            tr = _Translator(
+                self.source_lang, self.target_lang,
+                self.custom_dict, self.italic_dict,
+                rate_limiter=rate_limiter,
+            )
+            glossary_state = repr(sorted(self.custom_dict._entries.items())) + repr(
+                sorted(self.italic_dict._entries.items())
+            )
+            cache_namespace = hashlib.sha256(
+                ('engine8-cache-v2|' + self.source_lang + '|' + self.target_lang
+                 + '|' + glossary_state).encode('utf-8')
+            ).hexdigest()
+            persistent_cache = _PersistentTranslationCache(cache_namespace)
             doc = Document(input_docx)
 
             scan_started = time.perf_counter()
@@ -1763,24 +1905,165 @@ class DocxFinalTranslatorEngine:
                 f"({scan_seconds:.2f} detik) | antrean terjemahan=0/{total}",
             )
 
-            done = translated_count = 0
-            italic_count = 0
+            # Seluruh pembacaan XML dan pembuatan token dilakukan dahulu pada
+            # thread utama. Worker hanya mengirim string ke layanan translasi;
+            # hasil baru ditulis kembali ke DOCX secara berurutan setelah
+            # SEMUA request sukses. Dengan desain ini tidak ada race condition
+            # pada python-docx dan dokumen setengah diterjemahkan tidak disimpan.
+            prepared_tasks = [
+                _prepare_para_translation(para, tr)
+                for para in translation_queue
+            ]
+            if any(task is None for task in prepared_tasks):
+                raise RuntimeError(
+                    'Antrean translasi berubah setelah pra-pemindaian.'
+                )
 
-            for para in translation_queue:
-                done += 1
-                pct = 5 + int(done / max(total, 1) * 75)
-                para_text = re.sub(r'\s+', ' ', para.text or '').strip()
-                preview = (
-                    para_text[:55] + '…'
-                    if len(para_text) > 55 else para_text
+            thread_state = threading.local()
+            worker_translators = []
+            worker_lock = threading.Lock()
+
+            def translate_task(index_and_task):
+                index, task = index_and_task
+                worker_tr = getattr(thread_state, 'translator', None)
+                if worker_tr is None:
+                    worker_tr = _Translator(
+                        self.source_lang, self.target_lang,
+                        self.custom_dict, self.italic_dict,
+                        rate_limiter=rate_limiter,
+                    )
+                    thread_state.translator = worker_tr
+                    with worker_lock:
+                        worker_translators.append(worker_tr)
+                failed_before = len(worker_tr.failed_texts)
+                translated, italic_terms = worker_tr.translate_one(
+                    task['combined'], task['dict_italic_map']
                 )
-                italic_count += len(_translate_para(para, tr))
-                translated_count += 1
+                failed = len(worker_tr.failed_texts) > failed_before
+                return index, translated, italic_terms, failed
+
+            results = [None] * total
+            completed = persistent_hits = duplicate_hits = 0
+            jobs = []
+            job_by_key = {}
+            for index, task in enumerate(prepared_tasks):
+                key = persistent_cache.make_key(
+                    task['combined'], task['dict_italic_map']
+                )
+                cached = persistent_cache.get(key)
+                if cached is not None:
+                    results[index] = (cached[0], cached[1], False)
+                    persistent_hits += 1
+                    completed += 1
+                    continue
+                if key is not None and key in job_by_key:
+                    jobs[job_by_key[key]]['indexes'].append(index)
+                    duplicate_hits += 1
+                    continue
+                job_by_key[key] = len(jobs) if key is not None else -1
+                jobs.append({
+                    'index': index, 'task': task, 'key': key,
+                    'indexes': [index],
+                })
+            worker_count = min(_TRANSLATION_WORKERS, max(total, 1))
+            _notify(
+                progress_callback, 6,
+                f"[translate paralel] worker={worker_count} | "
+                f"cache={persistent_hits} | {completed}/{total}",
+            )
+            with ThreadPoolExecutor(max_workers=worker_count,
+                                    thread_name_prefix='rsni-translate') as pool:
+                futures = {
+                    pool.submit(
+                        translate_task, (job['index'], job['task'])
+                    ): job
+                    for job in jobs
+                }
+                try:
+                    for future in as_completed(futures):
+                        index, translated, italic_terms, failed = future.result()
+                        job = futures[future]
+                        for target_index in job['indexes']:
+                            results[target_index] = (
+                                translated, list(italic_terms), failed
+                            )
+                        if not failed:
+                            persistent_cache.put(
+                                job['key'], translated, italic_terms
+                            )
+                        completed += len(job['indexes'])
+                        pct = 5 + int(completed / max(total, 1) * 75)
+                        _notify(
+                            progress_callback, pct,
+                            f"[translate paralel] {completed}/{total} | "
+                            f"worker={worker_count} | skip={skipped_count}",
+                        )
+                except Exception:
+                    for pending in futures:
+                        pending.cancel()
+                    raise
+
+            failed_indexes = [
+                i for i, result in enumerate(results)
+                if result is None or result[2]
+            ]
+            # Gelombang paralel dapat terkena rate-limit sementara. Pulihkan
+            # hanya bagian gagal secara serial memakai klien baru. Setiap
+            # putaran tetap memiliki retry internal dan validasi token penuh.
+            for recovery_round in range(1, 4):
+                if not failed_indexes:
+                    break
                 _notify(
-                    progress_callback, pct,
-                    f"[translate] {done}/{total} | "
-                    f"skip pra-scan={skipped_count} | {preview}",
+                    progress_callback, 81 + recovery_round,
+                    f"[pemulihan {recovery_round}/3] "
+                    f"mengulang {len(failed_indexes)} bagian secara aman",
                 )
+                time.sleep(1.5 * recovery_round)
+                recovery_tr = _Translator(
+                    self.source_lang, self.target_lang,
+                    self.custom_dict, self.italic_dict,
+                    rate_limiter=rate_limiter,
+                )
+                still_failed = []
+                for index in failed_indexes:
+                    task = prepared_tasks[index]
+                    before = len(recovery_tr.failed_texts)
+                    translated, italic_terms = recovery_tr.translate_one(
+                        task['combined'], task['dict_italic_map']
+                    )
+                    failed = len(recovery_tr.failed_texts) > before
+                    results[index] = (translated, italic_terms, failed)
+                    if failed:
+                        still_failed.append(index)
+                    else:
+                        key = persistent_cache.make_key(
+                            task['combined'], task['dict_italic_map']
+                        )
+                        persistent_cache.put(key, translated, italic_terms)
+                worker_translators.append(recovery_tr)
+                failed_indexes = still_failed
+
+            if failed_indexes:
+                previews = [
+                    re.sub(r'\s+', ' ', translation_queue[i].text or '').strip()[:80]
+                    for i in failed_indexes[:5]
+                ]
+                raise TranslationFailedError(
+                    f'{len(failed_indexes)} dari {total} bagian gagal '
+                    'diterjemahkan setelah seluruh retry; output dibatalkan '
+                    'agar tidak ada teks yang terlewat. Contoh: '
+                    + ' | '.join(previews)
+                )
+
+            italic_count = 0
+            for task, result in zip(prepared_tasks, results):
+                translated, italic_terms, _ = result
+                italic_count += len(
+                    _apply_para_translation(task, translated, italic_terms)
+                )
+            translated_count = total
+            tr.cache_hits += sum(w.cache_hits for w in worker_translators)
+            tr.cache_hits += persistent_hits + duplicate_hits
 
             # Tidak menjalankan formatting global di sini. Dengan demikian
             # Copyright, Daftar isi, salinan Engine 5, Bibliography entries,
