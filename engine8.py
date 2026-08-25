@@ -2008,40 +2008,92 @@ class DocxFinalTranslatorEngine:
                 if result is None or result[2]
             ]
             # Gelombang paralel dapat terkena rate-limit sementara. Pulihkan
-            # hanya bagian gagal secara serial memakai klien baru. Setiap
-            # putaran tetap memiliki retry internal dan validasi token penuh.
+            # hanya bagian yang gagal dengan jumlah worker menurun pada setiap
+            # putaran: 4 -> 2 -> 1. Setiap worker mempunyai client tersendiri,
+            # sedangkan rate limiter/backoff tetap dipakai bersama.
             for recovery_round in range(1, 4):
                 if not failed_indexes:
                     break
+                recovery_total = len(failed_indexes)
+                recovery_worker_count = min(
+                    {1: 4, 2: 2, 3: 1}[recovery_round], recovery_total
+                )
                 _notify(
                     progress_callback, 81 + recovery_round,
-                    f"[pemulihan {recovery_round}/3] "
-                    f"mengulang {len(failed_indexes)} bagian secara aman",
+                    f"[pemulihan {recovery_round}/3] 0/{recovery_total} | "
+                    f"worker={recovery_worker_count} | "
+                    f"mengulang {recovery_total} bagian secara aman",
                 )
                 time.sleep(1.5 * recovery_round)
-                recovery_tr = _Translator(
-                    self.source_lang, self.target_lang,
-                    self.custom_dict, self.italic_dict,
-                    rate_limiter=rate_limiter,
-                )
-                still_failed = []
-                for index in failed_indexes:
+
+                recovery_state = threading.local()
+
+                def recover_index(index):
+                    recovery_tr = getattr(
+                        recovery_state, 'translator', None
+                    )
+                    if recovery_tr is None:
+                        recovery_tr = _Translator(
+                            self.source_lang, self.target_lang,
+                            self.custom_dict, self.italic_dict,
+                            rate_limiter=rate_limiter,
+                        )
+                        recovery_state.translator = recovery_tr
+                        with worker_lock:
+                            worker_translators.append(recovery_tr)
                     task = prepared_tasks[index]
                     before = len(recovery_tr.failed_texts)
                     translated, italic_terms = recovery_tr.translate_one(
                         task['combined'], task['dict_italic_map']
                     )
                     failed = len(recovery_tr.failed_texts) > before
-                    results[index] = (translated, italic_terms, failed)
-                    if failed:
-                        still_failed.append(index)
-                    else:
-                        key = persistent_cache.make_key(
-                            task['combined'], task['dict_italic_map']
-                        )
-                        persistent_cache.put(key, translated, italic_terms)
-                worker_translators.append(recovery_tr)
-                failed_indexes = still_failed
+                    return index, translated, italic_terms, failed
+
+                still_failed = []
+                recovered_this_round = 0
+                with ThreadPoolExecutor(
+                    max_workers=recovery_worker_count,
+                    thread_name_prefix=f'rsni-recovery-{recovery_round}',
+                ) as recovery_pool:
+                    recovery_futures = {
+                        recovery_pool.submit(recover_index, index): index
+                        for index in failed_indexes
+                    }
+                    try:
+                        for recovery_done, future in enumerate(
+                            as_completed(recovery_futures), 1
+                        ):
+                            index, translated, italic_terms, failed = (
+                                future.result()
+                            )
+                            results[index] = (
+                                translated, italic_terms, failed
+                            )
+                            if failed:
+                                still_failed.append(index)
+                            else:
+                                recovered_this_round += 1
+                                task = prepared_tasks[index]
+                                key = persistent_cache.make_key(
+                                    task['combined'],
+                                    task['dict_italic_map'],
+                                )
+                                persistent_cache.put(
+                                    key, translated, italic_terms
+                                )
+                            _notify(
+                                progress_callback, 81 + recovery_round,
+                                f"[pemulihan {recovery_round}/3] "
+                                f"{recovery_done}/{recovery_total} | "
+                                f"worker={recovery_worker_count} | "
+                                f"berhasil={recovered_this_round} | "
+                                f"tersisa={recovery_total - recovery_done}",
+                            )
+                    except Exception:
+                        for pending in recovery_futures:
+                            pending.cancel()
+                        raise
+                failed_indexes = sorted(still_failed)
 
             if failed_indexes:
                 previews = [
