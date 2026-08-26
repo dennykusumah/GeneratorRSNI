@@ -30,6 +30,10 @@ from urllib.request import Request, urlopen
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from docx import Document
+
+ENGINE8_RECOVERY_TOTAL = 1
+ENGINE8_RECOVERY_WORKERS = 2
+ENGINE8_RECOVERY_PROFILE = "single-recovery-v1"
 from docx.shared import Pt, RGBColor
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.oxml.ns import qn
@@ -2019,6 +2023,12 @@ class DocxFinalTranslatorEngine:
                 f"Kamus siap: SNI={sni_count}, istilah asing={italic_count_loaded}"
             )
             
+            # Penanda runtime agar mudah memastikan Engine 8 yang aktif adalah
+            # versi recovery tunggal. Jika log bukan 1/1, berarti file lain yang ter-load.
+            _notify(
+                progress_callback, 5,
+                "[engine8-runtime] recovery=1/1 | worker=2 | profile=single-recovery-v1",
+            )
             _notify(progress_callback, 5, "Init translator...")
             rate_limiter = _AdaptiveRateLimiter()
             tr = _Translator(
