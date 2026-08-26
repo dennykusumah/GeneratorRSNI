@@ -13,6 +13,7 @@ import io
 import shutil
 import subprocess
 import tempfile
+import zipfile
 from pathlib import Path
 from io import BytesIO
 from urllib.request import Request, urlopen
@@ -51,7 +52,7 @@ def _cleanup_session_files(session_state):
     """Hapus file milik sesi saat ini segera."""
     keys = [
         '_target_file', '_final_opt_file', '_final_tr_file',
-        '_engine8_partial_file', '_pending_engine9_out',
+        '_engine8_partial_file', '_engine8_partial_bytes', '_pending_engine9_out',
     ]
     for k in keys:
         fpath = session_state.get(k)
@@ -60,6 +61,99 @@ def _cleanup_session_files(session_state):
                 os.remove(fpath)
             except Exception:
                 pass
+
+def _store_engine8_checkpoint(engine8_path: str, engine9_path: str, session_state) -> str:
+    """Simpan checkpoint Engine 8 secara tahan-rerun.
+
+    Selain path absolut, bytes DOCX disimpan di session_state. Jika file fisik
+    hilang saat Streamlit rerun/cleanup, tombol Lanjutkan dapat memulihkannya
+    tanpa menjalankan ulang Engine 1-8.
+    """
+    engine8_abs = os.path.abspath(engine8_path)
+    engine9_abs = os.path.abspath(engine9_path)
+    if not os.path.isfile(engine8_abs):
+        raise FileNotFoundError(f'Output Engine 8 tidak ditemukan: {engine8_abs}')
+    with open(engine8_abs, 'rb') as fh:
+        payload = fh.read()
+    if not payload:
+        raise ValueError('Output Engine 8 kosong dan tidak dapat dijadikan checkpoint.')
+    session_state['_engine8_partial_file'] = engine8_abs
+    session_state['_engine8_partial_bytes'] = payload
+    session_state['_pending_engine9_out'] = engine9_abs
+    return engine8_abs
+
+
+def _restore_engine8_checkpoint(session_state) -> tuple[str | None, str | None]:
+    """Pastikan checkpoint Engine 8 tersedia di disk sebelum Engine 9."""
+    partial_file = session_state.get('_engine8_partial_file')
+    engine9_out = session_state.get('_pending_engine9_out')
+    if engine9_out:
+        engine9_out = os.path.abspath(engine9_out)
+        session_state['_pending_engine9_out'] = engine9_out
+
+    if partial_file:
+        partial_file = os.path.abspath(partial_file)
+        session_state['_engine8_partial_file'] = partial_file
+    if partial_file and os.path.isfile(partial_file) and os.path.getsize(partial_file) > 0:
+        return partial_file, engine9_out
+
+    payload = session_state.get('_engine8_partial_bytes')
+    if payload:
+        sid = session_state.get('_sid', 'session')
+        partial_file = os.path.abspath(f'engine8_checkpoint_{sid}.docx')
+        with open(partial_file, 'wb') as fh:
+            fh.write(payload)
+        session_state['_engine8_partial_file'] = partial_file
+        return partial_file, engine9_out
+    return None, engine9_out
+
+
+def _is_valid_docx(path: str | None) -> bool:
+    if not path:
+        return False
+    path = os.path.abspath(path)
+    return (
+        os.path.isfile(path)
+        and os.path.getsize(path) > 0
+        and zipfile.is_zipfile(path)
+    )
+
+
+def _run_engine9_verified(engine9_obj, input_docx: str, output_docx: str):
+    """Jalankan Engine 9 dan wajibkan output DOCX valid.
+
+    Dua percobaan dipakai untuk mengatasi kegagalan otomasi Word yang bersifat
+    sementara. Percobaan kedua selalu dimulai dari checkpoint Engine 8 yang
+    sama, bukan dari output Engine 9 yang mungkin setengah jadi.
+    """
+    errors = []
+    output_docx = os.path.abspath(output_docx)
+    for attempt in (1, 2):
+        try:
+            if os.path.exists(output_docx):
+                try:
+                    os.remove(output_docx)
+                except OSError:
+                    pass
+            ok, path_result, message = engine9_obj.process(
+                input_docx=os.path.abspath(input_docx),
+                output_docx=output_docx,
+            )
+            candidate = os.path.abspath(path_result or output_docx)
+            if ok and _is_valid_docx(candidate):
+                if candidate != output_docx:
+                    shutil.copy2(candidate, output_docx)
+                if _is_valid_docx(output_docx):
+                    return True, output_docx, message
+            errors.append(
+                f'percobaan {attempt}: {message or "output DOCX tidak valid"}'
+            )
+        except Exception as exc:
+            errors.append(f'percobaan {attempt}: {exc}')
+        if attempt == 1:
+            time.sleep(1.0)
+    return False, output_docx, '; '.join(errors)
+
 
 def _start_background_cleanup():
     """Jalankan cleanup berkala di background thread (tiap 15 menit)."""
@@ -1127,7 +1221,7 @@ if st.session_state.get('_process_error_pending'):
     _render_footer_once()
     st.stop()
 
-# Engine 8 berhenti di sini bila setelah Pemulihan 3 masih ada bagian gagal.
+# Engine 8 berhenti di sini bila setelah Pemulihan 1 masih ada bagian gagal.
 # Panel ditempatkan sebelum footer sehingga tombol Kembali/Lanjutkan muncul
 # tepat di atas tombol "Ganti Mode Terjemahan Cepat".
 if st.session_state.get('_translation_review_pending'):
@@ -1136,7 +1230,7 @@ if st.session_state.get('_translation_review_pending'):
         st.error(st.session_state['_engine9_continue_error'])
     st.warning(
         f"⚠️ {_failed_count} bagian belum berhasil diterjemahkan setelah "
-        "Pemulihan 3. Bagian tersebut tetap berbahasa Inggris dan ditandai "
+        "Pemulihan 1. Bagian tersebut tetap berbahasa Inggris dan ditandai "
         "dengan font merah."
     )
     _back_col, _continue_col = st.columns(2)
@@ -1151,7 +1245,7 @@ if st.session_state.get('_translation_review_pending'):
                 '_engine9_continue_error',
                 '_completed_with_translation_warning',
                 '_continue_engine9', '_engine8_partial_file',
-                '_pending_engine9_out', '_run_process', '_show_results',
+                '_engine8_partial_bytes', '_pending_engine9_out', '_run_process', '_show_results',
                 '_final_opt_file', '_final_tr_file', '_final_time',
                 '_doc_text', '_chat_history', '_doc_sections', '_target_file',
                 '_original_upload_name', '_doc_title', '_ics_number',
@@ -1399,13 +1493,12 @@ if st.session_state.get('_run_process') and st.session_state.get('_target_file')
     # Rerun khusus setelah pengguna memilih "Lanjutkan". Engine 1–8 tidak
     # dijalankan ulang; dokumen parsial Engine 8 langsung diteruskan ke Engine 9.
     if st.session_state.get('_continue_engine9'):
-        partial_file = st.session_state.get('_engine8_partial_file')
-        engine9_out = st.session_state.get('_pending_engine9_out')
+        partial_file, engine9_out = _restore_engine8_checkpoint(st.session_state)
         if (not partial_file or not os.path.isfile(partial_file)
                 or not engine9_out):
             st.session_state['_engine9_continue_error'] = (
-                'Dokumen parsial Engine 8 tidak ditemukan. Silakan kembali '
-                'dan proses ulang dokumen.'
+                'Checkpoint Engine 8 tidak tersedia dan tidak dapat dipulihkan. '
+                'Gunakan Kembali hanya jika ingin memulai dokumen baru.'
             )
             st.session_state['_translation_review_pending'] = True
             st.session_state['_continue_engine9'] = False
@@ -1417,9 +1510,8 @@ if st.session_state.get('_run_process') and st.session_state.get('_target_file')
                 "Melanjutkan dengan bagian gagal berwarna merah...\n"
                 "Menjalankan Engine 9 dan memperbarui daftar isi.",
             )
-            ok_e9, _path_e9, msg_e9 = engine9.process(
-                input_docx=partial_file,
-                output_docx=engine9_out,
+            ok_e9, _path_e9, msg_e9 = _run_engine9_verified(
+                engine9, partial_file, engine9_out
             )
             if not ok_e9:
                 raise Exception(f"Engine 9: {msg_e9}")
@@ -1540,13 +1632,13 @@ if st.session_state.get('_run_process') and st.session_state.get('_target_file')
 
         update_ui(10, f"Format dasar selesai ✓\n{msg_e7}")
 
-        engine8_out = f"engine8_{_sid}_{original_name}"
+        engine8_out = os.path.abspath(f"engine8_{_sid}_{original_name}")
         update_ui(10, "Memulai penerjemahan dokumen...")
         _engine8_progress_state = {'pct': 10}
 
         def _engine8_progress(pct, msg):
             message = msg or ''
-            # Pemulihan mempunyai counter sendiri (mis. 1/3). Deteksi tahap
+            # Pemulihan mempunyai counter sendiri (1/1). Deteksi tahap
             # ini SEBELUM counter translasi agar 1/3 tidak salah dipetakan ke
             # rentang 10–80%. Setiap putaran pemulihan mempunyai rentang
             # tersendiri hingga batas akhir 98%.
@@ -1576,14 +1668,8 @@ if st.session_state.get('_run_process') and st.session_state.get('_target_file')
                     )
                 else:
                     item_ratio = 0.0
-                recovery_ranges = {
-                    1: (80, 90),
-                    2: (90, 95),
-                    3: (95, 98),
-                }
-                range_start, range_end = recovery_ranges.get(
-                    min(recovery_no, 3), (95, 98)
-                )
+                recovery_ranges = {1: (80, 98)}
+                range_start, range_end = recovery_ranges.get(1, (80, 98))
                 calculated_pct = min(
                     range_start
                     + int(item_ratio * (range_end - range_start)),
@@ -1623,7 +1709,7 @@ if st.session_state.get('_run_process') and st.session_state.get('_target_file')
         if not ok_e8:
             raise Exception(f"Engine 8: {msg_e8}")
 
-        engine9_out = f"engine9_{_sid}_{original_name}"
+        engine9_out = os.path.abspath(f"engine9_{_sid}_{original_name}")
         review_required = (
             bool(getattr(engine8, 'needs_review', False))
             or str(msg_e8).startswith('TRANSLATION_REVIEW_REQUIRED:')
@@ -1633,8 +1719,7 @@ if st.session_state.get('_run_process') and st.session_state.get('_target_file')
             if not failed_count:
                 marker = re.search(r':(\d+)', str(msg_e8))
                 failed_count = int(marker.group(1)) if marker else 0
-            st.session_state['_engine8_partial_file'] = engine8_out
-            st.session_state['_pending_engine9_out'] = engine9_out
+            _store_engine8_checkpoint(engine8_out, engine9_out, st.session_state)
             st.session_state['_translation_failed_count'] = failed_count
             st.session_state['_translation_review_pending'] = True
             st.session_state['_continue_engine9'] = False
@@ -1652,17 +1737,15 @@ if st.session_state.get('_run_process') and st.session_state.get('_target_file')
 
         update_ui(98, "Menerapkan style final dan daftar isi...")
         try:
-            ok_e9, _path_e9, msg_e9 = engine9.process(
-                input_docx=engine8_out,
-                output_docx=engine9_out,
+            ok_e9, _path_e9, msg_e9 = _run_engine9_verified(
+                engine9, engine8_out, engine9_out
             )
             if not ok_e9:
                 raise Exception(f"Engine 9: {msg_e9}")
         except Exception as _engine9_exc:
             # Simpan checkpoint Engine 8 agar tombol Lanjutkan benar-benar
             # meneruskan ke Engine 9 tanpa mengulang Engine 1-8.
-            st.session_state['_engine8_partial_file'] = engine8_out
-            st.session_state['_pending_engine9_out'] = engine9_out
+            _store_engine8_checkpoint(engine8_out, engine9_out, st.session_state)
             st.session_state['_process_error_stage'] = 'engine9'
             st.session_state['_process_error_message'] = (
                 f"Gagal melanjutkan ke Engine 9: {_engine9_exc}"
@@ -1739,7 +1822,7 @@ if st.session_state.get('_show_results'):
                   '_doc_text', '_chat_history', '_doc_sections', '_target_file',
                   '_translation_review_pending', '_translation_failed_count',
                   '_continue_engine9', '_engine8_partial_file',
-                  '_pending_engine9_out', '_engine9_continue_error',
+                  '_engine8_partial_bytes', '_pending_engine9_out', '_engine9_continue_error',
                   '_process_error_pending', '_process_error_message',
                   '_process_error_stage', '_completed_with_translation_warning']:
             if k in st.session_state: del st.session_state[k]
