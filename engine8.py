@@ -2157,18 +2157,15 @@ class DocxFinalTranslatorEngine:
                 i for i, result in enumerate(results)
                 if result is None or result[2]
             ]
-            # Gelombang paralel dapat terkena rate-limit sementara. Pulihkan
-            # hanya bagian yang gagal dengan jumlah worker menurun pada setiap
-            # putaran: 4 -> 2 -> 1. Setiap worker mempunyai client tersendiri,
-            # sedangkan rate limiter/backoff tetap dipakai bersama.
-            for recovery_round in range(1, 4):
-                if not failed_indexes:
-                    break
+            # Satu tahap pemulihan saja. Sesuai konfigurasi aplikasi, semua
+            # unit yang gagal pada gelombang utama dicoba ulang dengan 2 worker.
+            # Provider dibuat per-thread agar request paralel tidak berbagi
+            # client yang sama, sedangkan rate limiter/backoff tetap bersama.
+            if failed_indexes:
                 recovery_total = len(failed_indexes)
-                recovery_worker_count = {1: 4, 2: 2, 3: 1}[recovery_round]
+                recovery_worker_count = 2
                 cooldown = max(0.0, float(os.getenv(
-                    f'RSNI_RECOVERY_{recovery_round}_COOLDOWN',
-                    {1: '5', 2: '30', 3: '60'}[recovery_round],
+                    'RSNI_RECOVERY_1_COOLDOWN', '5'
                 )))
                 cooldown_end = time.monotonic() + cooldown
                 while True:
@@ -2176,116 +2173,69 @@ class DocxFinalTranslatorEngine:
                     if remaining_cooldown <= 0:
                         break
                     _notify(
-                        progress_callback, 81 + recovery_round,
-                        f"[pemulihan {recovery_round}/3] 0/{recovery_total} | "
+                        progress_callback, 82,
+                        f"[pemulihan 1/1] 0/{recovery_total} | "
                         f"cooldown={int(remaining_cooldown + 0.999)} detik | "
                         f"worker={recovery_worker_count}",
                     )
                     time.sleep(min(1.0, remaining_cooldown))
-                _notify(
-                    progress_callback, 81 + recovery_round,
-                    f"[pemulihan {recovery_round}/3] 0/{recovery_total} | "
-                    f"worker={recovery_worker_count} | "
-                    "probe koneksi sebelum memulai",
-                )
 
                 recovery_state = threading.local()
-                requested_provider = (
-                    'cloud' if recovery_round == 3 else 'web'
-                )
 
                 def recover_index(index):
-                    recovery_tr = getattr(
-                        recovery_state, 'translator', None
-                    )
+                    recovery_tr = getattr(recovery_state, 'translator', None)
                     if recovery_tr is None:
                         recovery_tr = _Translator(
                             'en', self.target_lang,
                             self.custom_dict, self.italic_dict,
-                            rate_limiter=rate_limiter,
-                            provider=requested_provider,
+                            rate_limiter=rate_limiter, provider='web',
                         )
                         recovery_state.translator = recovery_tr
                         with worker_lock:
                             worker_translators.append(recovery_tr)
                     task = prepared_tasks[index]
-                    translated, italic_terms, failed = (
-                        _translate_for_recovery(
-                            recovery_tr,
-                            task['combined'], task['dict_italic_map'],
-                            allow_split=recovery_round >= 2,
-                        )
+                    translated, italic_terms, failed = _translate_for_recovery(
+                        recovery_tr, task['combined'],
+                        task['dict_italic_map'], allow_split=True,
                     )
-                    return (
-                        index, translated, italic_terms, failed,
-                        recovery_tr.provider,
-                    )
+                    return index, translated, italic_terms, failed, recovery_tr.provider
 
                 still_failed = []
-                recovered_this_round = 0
-
-                def accept_recovery_result(recovery_result, recovery_done):
-                    nonlocal recovered_this_round
-                    index, translated, italic_terms, failed, provider_used = (
-                        recovery_result
-                    )
-                    results[index] = (translated, italic_terms, failed)
-                    if failed:
-                        still_failed.append(index)
-                    else:
-                        recovered_this_round += 1
-                        task = prepared_tasks[index]
-                        key = persistent_cache.make_key(
-                            task['combined'], task['dict_italic_map'],
-                        )
-                        persistent_cache.put(key, translated, italic_terms)
-                    _notify(
-                        progress_callback, 81 + recovery_round,
-                        f"[pemulihan {recovery_round}/3] "
-                        f"{recovery_done}/{recovery_total} | "
-                        f"worker={recovery_worker_count} | "
-                        f"provider={provider_used} | "
-                        f"berhasil={recovered_this_round} | "
-                        f"tersisa={recovery_total - recovery_done}",
-                    )
-
-                # Probe satu request lebih dahulu. Ini memastikan koneksi baru
-                # benar-benar diuji sebelum sisa antrean dikirim ke worker.
-                probe_index = failed_indexes[0]
-                probe_result = recover_index(probe_index)
-                accept_recovery_result(probe_result, 1)
-                remaining_indexes = failed_indexes[1:]
-                if probe_result[3] and remaining_indexes:
-                    # Circuit breaker: probe gagal berarti provider belum
-                    # sehat. Beri jeda tambahan sebelum membuka antrean.
-                    probe_cooldown = min(max(cooldown, 5.0), 30.0)
-                    _notify(
-                        progress_callback, 81 + recovery_round,
-                        f"[pemulihan {recovery_round}/3] 1/{recovery_total} | "
-                        f"probe gagal; circuit breaker "
-                        f"{int(probe_cooldown)} detik",
-                    )
-                    time.sleep(probe_cooldown)
-                if remaining_indexes:
-                    with ThreadPoolExecutor(
-                        max_workers=recovery_worker_count,
-                        thread_name_prefix=f'rsni-recovery-{recovery_round}',
-                    ) as recovery_pool:
-                        recovery_futures = {
-                            recovery_pool.submit(recover_index, index): index
-                            for index in remaining_indexes
-                        }
-                        try:
-                            for recovery_done, future in enumerate(
-                                as_completed(recovery_futures), 2
-                            ):
-                                accept_recovery_result(
-                                    future.result(), recovery_done
+                recovered = 0
+                with ThreadPoolExecutor(
+                    max_workers=recovery_worker_count,
+                    thread_name_prefix='rsni-recovery-1',
+                ) as recovery_pool:
+                    recovery_futures = {
+                        recovery_pool.submit(recover_index, index): index
+                        for index in failed_indexes
+                    }
+                    try:
+                        for recovery_done, future in enumerate(
+                            as_completed(recovery_futures), 1
+                        ):
+                            index, translated, italic_terms, failed, provider_used = future.result()
+                            results[index] = (translated, italic_terms, failed)
+                            if failed:
+                                still_failed.append(index)
+                            else:
+                                recovered += 1
+                                task = prepared_tasks[index]
+                                key = persistent_cache.make_key(
+                                    task['combined'], task['dict_italic_map'],
                                 )
-                        except Exception:
-                            for pending in recovery_futures:
-                                pending.cancel()
-                            raise
+                                persistent_cache.put(key, translated, italic_terms)
+                            _notify(
+                                progress_callback, 82,
+                                f"[pemulihan 1/1] {recovery_done}/{recovery_total} | "
+                                f"worker=2 | provider={provider_used} | "
+                                f"berhasil={recovered} | "
+                                f"tersisa={recovery_total - recovery_done}",
+                            )
+                    except Exception:
+                        for pending in recovery_futures:
+                            pending.cancel()
+                        raise
                 failed_indexes = sorted(still_failed)
 
             italic_count = 0
@@ -2335,7 +2285,7 @@ class DocxFinalTranslatorEngine:
             if self.needs_review:
                 summary += (
                     f" PERLU KEPUTUSAN: {self.failed_count} bagian gagal "
-                    "setelah Pemulihan 3, dipertahankan dalam bahasa Inggris "
+                    "setelah Pemulihan 1, dipertahankan dalam bahasa Inggris "
                     "dan ditandai dengan font merah."
                 )
             if tr.failed_texts:
