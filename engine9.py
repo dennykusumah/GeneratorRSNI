@@ -1,5 +1,5 @@
 """
-Engine 9: StyleFinalizerEngine
+Engine10: StyleFinalizerEngine
 =================================
 Engine untuk menambahkan style custom "Judul" dan "Pasal" (sesuai spesifikasi
 Modify Style yang dibuat manual di Word oleh pengguna) ke dalam dokumen, lalu
@@ -64,8 +64,6 @@ Deteksi batas bahasa Indonesia vs Inggris:
 import os
 import re
 import copy
-import shutil
-import subprocess
 import traceback
 from typing import Optional
 from docx import Document
@@ -97,16 +95,6 @@ _TOC_STYLE_NAME = 'TOC 1'
 _TOC_FIELD_INSTR = ' TOC \\h \\z \\t "Judul;1;Pasal;1" '
 _TOC_MARK_BOOKMARK = 'Engine9TocField'
 
-# Microsoft Word Object Model constants (ditulis literal agar tidak bergantung
-# pada generated constants pywin32/makepy).
-_WD_GOTO_PAGE = 1
-_WD_GOTO_ABSOLUTE = 1
-_WD_ACTIVE_END_PAGE_NUMBER = 3
-_WD_STATISTIC_PAGES = 2
-_WD_SECTION_NEW_PAGE = 2
-_WD_SECTION_EVEN_PAGE = 3
-_WD_SECTION_ODD_PAGE = 4
-
 
 def _norm(text: str) -> str:
     """Normalisasi teks untuk dibandingkan: lower-case, trim whitespace/tab."""
@@ -118,413 +106,6 @@ def _style_name(paragraph) -> str:
         return paragraph.style.name if paragraph.style is not None else ''
     except Exception:
         return ''
-
-
-def _word_page_range(word_doc, page_number: int):
-    """Ambil Range isi utama satu halaman berdasarkan pagination Word."""
-    start = word_doc.GoTo(
-        What=_WD_GOTO_PAGE, Which=_WD_GOTO_ABSOLUTE, Count=page_number
-    ).Start
-    page_count = int(word_doc.ComputeStatistics(_WD_STATISTIC_PAGES))
-    if page_number < page_count:
-        end = word_doc.GoTo(
-            What=_WD_GOTO_PAGE, Which=_WD_GOTO_ABSOLUTE,
-            Count=page_number + 1,
-        ).Start
-    else:
-        end = word_doc.Content.End
-    return word_doc.Range(Start=start, End=end)
-
-
-def _word_page_is_blank(page_range) -> bool:
-    """True bila halaman tidak mempunyai isi utama yang terlihat."""
-    # Jangan menghapus halaman yang berisi tabel/gambar meskipun Range.Text
-    # kosong (teks di shape tidak selalu dikembalikan Word sebagai Range.Text).
-    try:
-        if page_range.Tables.Count or page_range.InlineShapes.Count:
-            return False
-    except Exception:
-        pass
-    text = page_range.Text or ''
-    # \r = paragraph mark, \x07 = end-of-cell, \x0c = page/section break.
-    # NBSP/zero-width/BOM juga bukan isi halaman yang terlihat.
-    visible = re.sub(
-        r'[\s\r\n\t\x07\x0b\x0c\u00a0\u200b\u200c\u200d\ufeff]+',
-        '', text,
-    )
-    return not visible
-
-
-def _remove_blank_pages_after_toc(word_doc, toc, max_removals: int = 20) -> int:
-    """Hapus semua halaman kosong setelah TOC, bukan hanya yang berurutan.
-
-    Pagination hanya dapat diketahui secara benar oleh layout engine Word.
-    Halaman virtual akibat section ``Odd Page``/``Even Page`` dihilangkan
-    dengan mengubah section berikutnya menjadi ``New Page``. Halaman kosong
-    akibat break/paragraf kosong dihapus melalui Range.Delete(). Setelah suatu
-    halaman berisi teks ditemukan, pemindaian tetap dilanjutkan sampai akhir;
-    versi lama berhenti di titik itu sehingga blank page di tengah/akhir lolos.
-    """
-    removed = 0
-    word_doc.Repaginate()
-    toc_end_page = int(toc.Range.Information(_WD_ACTIVE_END_PAGE_NUMBER))
-    candidate = toc_end_page + 1
-    safety = 0
-
-    while removed < max_removals:
-        safety += 1
-        if safety > 500:
-            raise RuntimeError('Pemindaian halaman kosong melebihi batas aman.')
-        word_doc.Repaginate()
-        page_count = int(word_doc.ComputeStatistics(_WD_STATISTIC_PAGES))
-        if candidate > page_count:
-            break
-        page_range = _word_page_range(word_doc, candidate)
-        if not _word_page_is_blank(page_range):
-            candidate += 1
-            continue
-
-        changed_section = False
-        if candidate < page_count:
-            next_page = word_doc.GoTo(
-                What=_WD_GOTO_PAGE, Which=_WD_GOTO_ABSOLUTE,
-                Count=candidate + 1,
-            )
-            try:
-                if next_page.Sections.Count:
-                    section = next_page.Sections.Item(1)
-                    if section.PageSetup.SectionStart in (
-                        _WD_SECTION_EVEN_PAGE, _WD_SECTION_ODD_PAGE
-                    ):
-                        section.PageSetup.SectionStart = _WD_SECTION_NEW_PAGE
-                        changed_section = True
-            except Exception:
-                changed_section = False
-
-        if not changed_section:
-            before_end = int(word_doc.Content.End)
-            page_range.Delete()
-            if int(word_doc.Content.End) >= before_end:
-                # Blank page dapat dibentuk oleh PageBreakBefore pada paragraf
-                # pertama halaman berikutnya. Range halaman kosong sendiri
-                # saat itu tidak mempunyai karakter yang dapat dihapus.
-                try:
-                    next_page = word_doc.GoTo(
-                        What=_WD_GOTO_PAGE, Which=_WD_GOTO_ABSOLUTE,
-                        Count=min(candidate + 1, page_count),
-                    )
-                    first_para = next_page.Paragraphs.Item(1)
-                    if int(first_para.Format.PageBreakBefore) != 0:
-                        first_para.Format.PageBreakBefore = 0
-                    else:
-                        raise RuntimeError(
-                            f'Word menolak menghapus halaman kosong {candidate}.'
-                        )
-                except Exception as exc:
-                    raise RuntimeError(
-                        f'Halaman kosong {candidate} terdeteksi tetapi tidak '
-                        f'dapat dihapus: {exc}'
-                    ) from exc
-        removed += 1
-        # Tetap periksa nomor halaman yang sama karena halaman berikutnya
-        # bergeser ke posisi candidate setelah penghapusan.
-
-    word_doc.Repaginate()
-    return removed
-
-
-def _set_update_fields_on_open(docx_path: str, enabled: bool) -> None:
-    """Atur w:updateFields tanpa mengubah cache TOC yang disimpan Word."""
-    doc = Document(docx_path)
-    settings = doc.settings.element
-    node = settings.find(qn('w:updateFields'))
-    if node is None:
-        node = OxmlElement('w:updateFields')
-        settings.append(node)
-    node.set(qn('w:val'), 'true' if enabled else 'false')
-    doc.save(docx_path)
-
-
-def _finalize_toc_with_powershell(docx_path: str) -> tuple[int, int]:
-    """Finalisasi TOC melalui Word COM tanpa memerlukan pywin32.
-
-    PowerShell tersedia bawaan Windows dan dapat membuat object
-    ``Word.Application`` secara langsung. Hasil dicetak dengan marker khusus
-    agar jumlah halaman kosong dan TOC dapat dikembalikan ke Engine 9.
-    """
-    powershell = shutil.which('powershell') or shutil.which('pwsh')
-    if not powershell:
-        raise RuntimeError(
-            'pywin32 tidak tersedia dan Windows PowerShell tidak ditemukan.'
-        )
-
-    script = r"""
-$ErrorActionPreference = 'Stop'
-$word = $null
-$document = $null
-try {
-    $word = New-Object -ComObject Word.Application
-    $word.Visible = $false
-    $word.DisplayAlerts = 0
-    $word.ScreenUpdating = $false
-    $document = $word.Documents.Open(
-        $env:RSNI_ENGINE9_DOCX, $false, $false, $false
-    )
-
-    $tocCount = [int]$document.TablesOfContents.Count
-    if ($tocCount -lt 1) {
-        throw 'Field Table of Contents tidak ditemukan oleh Word.'
-    }
-
-    for ($index = 1; $index -le $tocCount; $index++) {
-        $document.TablesOfContents.Item($index).Update()
-    }
-    $document.Repaginate()
-
-    $firstToc = $document.TablesOfContents.Item(1)
-    $tocEndPage = [int]$firstToc.Range.Information(3)
-    $removed = 0
-    $candidate = $tocEndPage + 1
-    $safety = 0
-
-    while ($removed -lt 20) {
-        $safety++
-        if ($safety -gt 500) {
-            throw 'Pemindaian halaman kosong melebihi batas aman.'
-        }
-        $document.Repaginate()
-        $pageCount = [int]$document.ComputeStatistics(2)
-        if ($candidate -gt $pageCount) { break }
-
-        $start = [int]$document.GoTo(1, 1, $candidate).Start
-        if ($candidate -lt $pageCount) {
-            $end = [int]$document.GoTo(1, 1, ($candidate + 1)).Start
-        } else {
-            $end = [int]$document.Content.End
-        }
-        $pageRange = $document.Range($start, $end)
-        if ($pageRange.Tables.Count -gt 0 -or
-            $pageRange.InlineShapes.Count -gt 0) {
-            $candidate++
-            continue
-        }
-        $visible = [string]$pageRange.Text
-        $visible = $visible.Replace([char]7, '').Replace([char]12, '')
-        $visible = $visible -replace '[\s\u000B\u00A0\u200B\u200C\u200D\uFEFF]', ''
-        if ($visible.Length -gt 0) {
-            $candidate++
-            continue
-        }
-
-        $changedSection = $false
-        if ($candidate -lt $pageCount) {
-            $nextPage = $document.GoTo(1, 1, ($candidate + 1))
-            if ($nextPage.Sections.Count -gt 0) {
-                $section = $nextPage.Sections.Item(1)
-                $sectionStart = [int]$section.PageSetup.SectionStart
-                if ($sectionStart -eq 3 -or $sectionStart -eq 4) {
-                    $section.PageSetup.SectionStart = 2
-                    $changedSection = $true
-                }
-            }
-        }
-
-        if (-not $changedSection) {
-            $beforeEnd = [int]$document.Content.End
-            [void]$pageRange.Delete()
-            if ([int]$document.Content.End -ge $beforeEnd) {
-                if ($candidate -lt $pageCount) {
-                    $nextPage = $document.GoTo(1, 1, ($candidate + 1))
-                    $firstParagraph = $nextPage.Paragraphs.Item(1)
-                    if ([int]$firstParagraph.Format.PageBreakBefore -ne 0) {
-                        $firstParagraph.Format.PageBreakBefore = 0
-                    } else {
-                        throw "Word menolak menghapus halaman kosong $candidate."
-                    }
-                } else {
-                    throw "Word menolak menghapus halaman kosong terakhir $candidate."
-                }
-            }
-        }
-        $removed++
-    }
-
-    $updated = 0
-    for ($index = 1; $index -le $tocCount; $index++) {
-        $document.TablesOfContents.Item($index).UpdatePageNumbers()
-        $updated++
-    }
-    $document.Repaginate()
-
-    # UpdatePageNumbers dapat mengubah lebar/line-wrap entri TOC dan memicu
-    # pagination baru. Jalankan audit blank page sekali lagi, lalu perbarui
-    # nomor halaman kembali bila ada halaman yang baru saja dihapus.
-    $removedAfterUpdate = 0
-    $firstToc = $document.TablesOfContents.Item(1)
-    $tocEndPage = [int]$firstToc.Range.Information(3)
-    $candidate = $tocEndPage + 1
-    $safety = 0
-    while ($removedAfterUpdate -lt 20) {
-        $safety++
-        if ($safety -gt 500) { throw 'Audit final blank page melebihi batas aman.' }
-        $document.Repaginate()
-        $pageCount = [int]$document.ComputeStatistics(2)
-        if ($candidate -gt $pageCount) { break }
-        $start = [int]$document.GoTo(1, 1, $candidate).Start
-        if ($candidate -lt $pageCount) {
-            $end = [int]$document.GoTo(1, 1, ($candidate + 1)).Start
-        } else { $end = [int]$document.Content.End }
-        $pageRange = $document.Range($start, $end)
-        $visible = [string]$pageRange.Text
-        $visible = $visible.Replace([char]7, '').Replace([char]12, '')
-        $visible = $visible -replace '[\s\u000B\u00A0\u200B\u200C\u200D\uFEFF]', ''
-        if ($pageRange.Tables.Count -gt 0 -or
-            $pageRange.InlineShapes.Count -gt 0 -or $visible.Length -gt 0) {
-            $candidate++
-            continue
-        }
-        $beforeEnd = [int]$document.Content.End
-        [void]$pageRange.Delete()
-        if ([int]$document.Content.End -ge $beforeEnd) {
-            if ($candidate -lt $pageCount) {
-                $nextPage = $document.GoTo(1, 1, ($candidate + 1))
-                $firstParagraph = $nextPage.Paragraphs.Item(1)
-                if ([int]$firstParagraph.Format.PageBreakBefore -ne 0) {
-                    $firstParagraph.Format.PageBreakBefore = 0
-                } else { throw "Word menolak audit halaman kosong $candidate." }
-            } else { throw "Word menolak audit halaman kosong terakhir $candidate." }
-        }
-        $removedAfterUpdate++
-    }
-    if ($removedAfterUpdate -gt 0) {
-        $removed += $removedAfterUpdate
-        for ($index = 1; $index -le $tocCount; $index++) {
-            $document.TablesOfContents.Item($index).UpdatePageNumbers()
-        }
-        $document.Repaginate()
-    }
-    $document.Save()
-    Write-Output "RSNI_ENGINE9_RESULT:$removed,$updated"
-}
-finally {
-    if ($null -ne $document) {
-        $document.Close($false)
-        [void][Runtime.InteropServices.Marshal]::ReleaseComObject($document)
-    }
-    if ($null -ne $word) {
-        # Document sudah ditutup tanpa menyimpan pada blok di atas. Jangan
-        # kirim Boolean ke Quit(): pada beberapa versi Word/PowerShell,
-        # parameter COM SaveChanges dipetakan sebagai [ref] dan $false
-        # memicu NonRefArgumentToRefParameterMsg. Pemanggilan tanpa argumen
-        # aman karena tidak ada dokumen terbuka yang perlu dikonfirmasi.
-        $word.Quit()
-        [void][Runtime.InteropServices.Marshal]::ReleaseComObject($word)
-    }
-    [GC]::Collect()
-    [GC]::WaitForPendingFinalizers()
-}
-"""
-    environment = os.environ.copy()
-    environment['RSNI_ENGINE9_DOCX'] = os.path.abspath(docx_path)
-    completed = subprocess.run(
-        [
-            powershell, '-NoLogo', '-NoProfile', '-NonInteractive',
-            '-ExecutionPolicy', 'Bypass', '-Command', script,
-        ],
-        capture_output=True, text=True, timeout=300, check=False,
-        env=environment,
-    )
-    if completed.returncode != 0:
-        detail = (completed.stderr or completed.stdout or '').strip()
-        raise RuntimeError(
-            'Otomatisasi Microsoft Word melalui PowerShell gagal: '
-            + (detail or f'kode {completed.returncode}')
-        )
-    match = re.search(
-        r'RSNI_ENGINE9_RESULT:(\d+),(\d+)', completed.stdout or ''
-    )
-    if not match:
-        raise RuntimeError(
-            'PowerShell menyelesaikan proses tanpa hasil validasi Engine 9.'
-        )
-    return int(match.group(1)), int(match.group(2))
-
-
-def _finalize_toc_with_word(docx_path: str) -> tuple[int, int]:
-    """Finalisasi TOC dengan Word dan pilih Update page numbers only.
-
-    Returns ``(jumlah_halaman_kosong_dihapus, jumlah_toc_diperbarui)``.
-    Microsoft Word diperlukan karena python-docx tidak mempunyai layout
-    engine/pagination. pywin32 dipakai bila tersedia; PowerShell menjadi
-    fallback otomatis tanpa instalasi modul tambahan.
-    """
-    if os.name != 'nt':
-        raise RuntimeError(
-            'Pemeriksaan halaman kosong dan update nomor halaman TOC '
-            'memerlukan Microsoft Word pada Windows.'
-        )
-    try:
-        import pythoncom
-        import win32com.client
-    except ImportError:
-        return _finalize_toc_with_powershell(docx_path)
-
-    absolute_path = os.path.abspath(docx_path)
-    word = None
-    word_doc = None
-    pythoncom.CoInitialize()
-    try:
-        word = win32com.client.DispatchEx('Word.Application')
-        word.Visible = False
-        word.DisplayAlerts = 0
-        word.ScreenUpdating = False
-        word_doc = word.Documents.Open(
-            absolute_path, ConfirmConversions=False, ReadOnly=False,
-            AddToRecentFiles=False, Visible=False,
-        )
-
-        if word_doc.TablesOfContents.Count < 1:
-            raise RuntimeError('Field Table of Contents tidak ditemukan oleh Word.')
-
-        # Field baru harus dibangun sekali agar Word mengetahui panjang dan
-        # halaman akhir TOC sebelum pemeriksaan halaman kosong dilakukan.
-        for index in range(1, word_doc.TablesOfContents.Count + 1):
-            word_doc.TablesOfContents.Item(index).Update()
-        word_doc.Repaginate()
-
-        first_toc = word_doc.TablesOfContents.Item(1)
-        removed = _remove_blank_pages_after_toc(word_doc, first_toc)
-
-        # Ini adalah padanan programatis pilihan dialog:
-        # "Update page numbers only" -> OK.
-        updated = 0
-        for index in range(1, word_doc.TablesOfContents.Count + 1):
-            word_doc.TablesOfContents.Item(index).UpdatePageNumbers()
-            updated += 1
-        word_doc.Repaginate()
-
-        removed_after_update = _remove_blank_pages_after_toc(
-            word_doc, word_doc.TablesOfContents.Item(1)
-        )
-        if removed_after_update:
-            removed += removed_after_update
-            for index in range(1, word_doc.TablesOfContents.Count + 1):
-                word_doc.TablesOfContents.Item(index).UpdatePageNumbers()
-            word_doc.Repaginate()
-        word_doc.Save()
-        return removed, updated
-    finally:
-        if word_doc is not None:
-            try:
-                word_doc.Close(SaveChanges=False)
-            except Exception:
-                pass
-        if word is not None:
-            try:
-                word.Quit(SaveChanges=False)
-            except Exception:
-                pass
-        pythoncom.CoUninitialize()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1128,10 +709,6 @@ def apply_custom_styles(input_docx: str, output_docx: str) -> tuple[bool, str]:
 class TableOfContentsEngine:
     """Engine 9 final: buat style Judul/Pasal lalu sisipkan TOC Word."""
 
-    def __init__(self):
-        self.blank_pages_removed = 0
-        self.toc_tables_updated = 0
-
     @staticmethod
     def _ensure_toc_style(doc: Document):
         style = None
@@ -1363,19 +940,8 @@ class TableOfContentsEngine:
         toc = self._build_toc_paragraph(doc)
         anchor = self._toc_anchor_after_three_blank_paragraphs(title)
         anchor.addnext(toc._p)
-        # Engine 9 hanya membangun field TOC dan menerapkan style final.
-        # Tidak ada lagi ketergantungan pada Microsoft Word/Windows di sini:
-        # - tidak memeriksa atau menghapus halaman kosong;
-        # - tidak menjalankan UpdatePageNumbers()/update TOC melalui Word.
-        #
-        # Field TOC tetap ditandai untuk dapat diperbarui oleh Microsoft Word
-        # ketika pengguna membuka dokumen, tetapi proses Generator RSNI sendiri
-        # tidak pernah memanggil Word. Ini membuat Engine 9 aman dijalankan di
-        # Streamlit Cloud/Linux.
         self._force_update_fields(doc)
         doc.save(output_docx)
-        self.blank_pages_removed = 0
-        self.toc_tables_updated = 0
         return output_docx
 
     def process(self, input_docx: Optional[str] = None,
@@ -1385,10 +951,7 @@ class TableOfContentsEngine:
             path = self.insert_toc(input_docx, output_docx)
             return True, path, (
                 'Engine 9 selesai: style custom Judul/Pasal diterapkan hanya '
-                'pada bagian Indonesia dan TOC dibuat dari "Judul,1,Pasal,1". '
-                'TOC dibuat sebagai field Word tanpa pemeriksaan halaman kosong '
-                'dan tanpa update nomor halaman melalui Microsoft Word. '
-                'Nomor halaman dapat diperbarui oleh Word saat dokumen dibuka.'
+                'pada bagian Indonesia dan TOC dibuat dari "Judul,1,Pasal,1".'
             )
         except Exception as exc:
             return False, None, f'Engine9 Error: {exc}\n{traceback.format_exc()}'
