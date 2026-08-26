@@ -1092,15 +1092,25 @@ def _render_footer_once():
 # Engine 8 berhenti di sini bila setelah Pemulihan 3 masih ada bagian gagal.
 # Panel ditempatkan sebelum footer sehingga tombol Kembali/Lanjutkan muncul
 # tepat di atas tombol "Ganti Mode Terjemahan Cepat".
-if st.session_state.get('_translation_review_pending'):
+if (st.session_state.get('_translation_review_pending')
+        or st.session_state.get('_engine9_force_pending')):
     _failed_count = int(st.session_state.get('_translation_failed_count', 0))
     if st.session_state.get('_engine9_continue_error'):
         st.error(st.session_state['_engine9_continue_error'])
-    st.warning(
-        f"⚠️ {_failed_count} bagian belum berhasil diterjemahkan setelah "
-        "Pemulihan 3. Bagian tersebut tetap berbahasa Inggris dan ditandai "
-        "dengan font merah."
-    )
+    if st.session_state.get('_engine9_force_pending'):
+        st.warning(
+            "⚠️ Engine 9 tidak dapat melakukan finalisasi TOC karena "
+            "Microsoft Word hanya tersedia pada Windows. Anda dapat "
+            "memilih Lanjutkan untuk memaksa proses ke tahap berikutnya. "
+            "Dokumen tetap akan dibuat, tetapi pemeriksaan halaman kosong "
+            "dan update nomor halaman TOC oleh Word dilewati."
+        )
+    elif st.session_state.get('_translation_review_pending'):
+        st.warning(
+            f"⚠️ {_failed_count} bagian belum berhasil diterjemahkan setelah "
+            "Pemulihan 3. Bagian tersebut tetap berbahasa Inggris dan ditandai "
+            "dengan font merah."
+        )
     _back_col, _continue_col = st.columns(2)
     with _back_col:
         if st.button("⬅️ Kembali", key="translation_review_back",
@@ -1110,7 +1120,7 @@ if st.session_state.get('_translation_review_pending'):
             _cleanup_session_files(st.session_state)
             for _key in [
                 '_translation_review_pending', '_translation_failed_count',
-                '_engine9_continue_error',
+                '_engine9_continue_error', '_engine9_force_pending',
                 '_completed_with_translation_warning',
                 '_continue_engine9', '_engine8_partial_file',
                 '_pending_engine9_out', '_run_process', '_show_results',
@@ -1382,6 +1392,9 @@ if st.session_state.get('_run_process') and st.session_state.get('_target_file')
             ok_e9, _path_e9, msg_e9 = engine9.process(
                 input_docx=partial_file,
                 output_docx=engine9_out,
+                force_continue=bool(
+                    st.session_state.get('_engine9_force_pending')
+                ),
             )
             if not ok_e9:
                 raise Exception(f"Engine 9: {msg_e9}")
@@ -1403,12 +1416,15 @@ if st.session_state.get('_run_process') and st.session_state.get('_target_file')
             st.session_state['_run_process'] = False
             st.session_state['_continue_engine9'] = False
             st.session_state['_translation_review_pending'] = False
+            st.session_state['_engine9_force_pending'] = False
             st.rerun()
         except Exception as exc:
             st.session_state['_engine9_continue_error'] = (
                 f'Gagal melanjutkan ke Engine 9: {exc}'
             )
-            st.session_state['_translation_review_pending'] = True
+            # Pertahankan panel yang sesuai dengan mode yang sedang dijalankan.
+            if not st.session_state.get('_engine9_force_pending'):
+                st.session_state['_translation_review_pending'] = True
             st.session_state['_continue_engine9'] = False
             st.session_state['_run_process'] = False
             st.rerun()
@@ -1618,6 +1634,32 @@ if st.session_state.get('_run_process') and st.session_state.get('_target_file')
             output_docx=engine9_out,
         )
         if not ok_e9:
+            # Jika Engine 9 gagal hanya karena finalisasi Word (misalnya
+            # aplikasi berjalan di Linux/Streamlit Cloud), jangan anggap
+            # seluruh proses gagal. Tampilkan Kembali/Lanjutkan.
+            _msg_e9_lower = str(msg_e9).lower()
+            _is_word_layout_error = (
+                'memerlukan microsoft word pada windows' in _msg_e9_lower
+                or 'microsoft word' in _msg_e9_lower
+                and 'windows' in _msg_e9_lower
+            )
+            if _is_word_layout_error and os.path.isfile(engine9_out):
+                st.session_state['_engine8_partial_file'] = engine8_out
+                st.session_state['_pending_engine9_out'] = engine9_out
+                st.session_state['_engine9_force_pending'] = True
+                st.session_state['_engine9_continue_error'] = (
+                    f'Engine 9: {msg_e9}'
+                )
+                st.session_state['_translation_review_pending'] = False
+                st.session_state['_continue_engine9'] = False
+                st.session_state['_run_process'] = False
+                st.session_state['_show_results'] = False
+                update_ui(
+                    98,
+                    "Engine 9 memerlukan Microsoft Word pada Windows. "
+                    "Pilih Lanjutkan untuk memaksa proses berikutnya.",
+                )
+                st.rerun()
             raise Exception(f"Engine 9: {msg_e9}")
 
         update_ui(99, f"Menyimpan dokumen final...\n{msg_e9}")
@@ -1683,7 +1725,7 @@ if st.session_state.get('_show_results'):
                   '_translation_review_pending', '_translation_failed_count',
                   '_continue_engine9', '_engine8_partial_file',
                   '_pending_engine9_out', '_engine9_continue_error',
-                  '_completed_with_translation_warning']:
+                  '_engine9_force_pending', '_completed_with_translation_warning']:
             if k in st.session_state: del st.session_state[k]
         st.rerun()
 
