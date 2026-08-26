@@ -1348,8 +1348,7 @@ class TableOfContentsEngine:
             blank_count += 1
         return anchor
 
-    def insert_toc(self, input_docx: str, output_docx: str,
-                   force_continue: bool = False) -> str:
+    def insert_toc(self, input_docx: str, output_docx: str) -> str:
         if not input_docx or not os.path.isfile(input_docx):
             raise FileNotFoundError(f'File input tidak ditemukan: {input_docx}')
         ok, message = StyleFinalizerEngine().apply(input_docx, output_docx)
@@ -1364,46 +1363,32 @@ class TableOfContentsEngine:
         toc = self._build_toc_paragraph(doc)
         anchor = self._toc_anchor_after_three_blank_paragraphs(title)
         anchor.addnext(toc._p)
+        # Engine 9 hanya membangun field TOC dan menerapkan style final.
+        # Tidak ada lagi ketergantungan pada Microsoft Word/Windows di sini:
+        # - tidak memeriksa atau menghapus halaman kosong;
+        # - tidak menjalankan UpdatePageNumbers()/update TOC melalui Word.
+        #
+        # Field TOC tetap ditandai untuk dapat diperbarui oleh Microsoft Word
+        # ketika pengguna membuka dokumen, tetapi proses Generator RSNI sendiri
+        # tidak pernah memanggil Word. Ini membuat Engine 9 aman dijalankan di
+        # Streamlit Cloud/Linux.
         self._force_update_fields(doc)
         doc.save(output_docx)
-
-        # Tahap layout final menggunakan Microsoft Word untuk pagination,
-        # pemeriksaan halaman kosong, dan update nomor halaman TOC.
-        #
-        # Jika force_continue=True, tahap Word dilewati. File DOCX yang sudah
-        # berhasil dibuat oleh python-docx tetap dipakai sebagai output agar
-        # proses dapat dilanjutkan meskipun aplikasi berjalan di Linux/Cloud.
-        if force_continue:
-            self.blank_pages_removed = 0
-            self.toc_tables_updated = 0
-        else:
-            self.blank_pages_removed, self.toc_tables_updated = (
-                _finalize_toc_with_word(output_docx)
-            )
-
-        # Jangan munculkan prompt update otomatis ketika hasil dibuka.
-        _set_update_fields_on_open(output_docx, enabled=False)
+        self.blank_pages_removed = 0
+        self.toc_tables_updated = 0
         return output_docx
 
     def process(self, input_docx: Optional[str] = None,
-                output_docx: Optional[str] = None,
-                force_continue: bool = False, **_kwargs):
+                output_docx: Optional[str] = None, **_kwargs):
         output_docx = output_docx or 'hasil_engine9.docx'
         try:
-            path = self.insert_toc(
-                input_docx, output_docx,
-                force_continue=force_continue,
-            )
+            path = self.insert_toc(input_docx, output_docx)
             return True, path, (
-                ('Engine 9 dilanjutkan paksa: finalisasi Word dilewati; '
-                 'TOC dibuat, tetapi pemeriksaan halaman kosong dan update '
-                 'nomor halaman TOC belum dijalankan. '
-                 if force_continue else '')
-                + 'Engine 9 selesai: style custom Judul/Pasal diterapkan hanya '
+                'Engine 9 selesai: style custom Judul/Pasal diterapkan hanya '
                 'pada bagian Indonesia dan TOC dibuat dari "Judul,1,Pasal,1". '
-                f'Halaman kosong setelah TOC dihapus: '
-                f'{self.blank_pages_removed}; TOC yang diperbarui dengan '
-                f'"Update page numbers only": {self.toc_tables_updated}.'
+                'TOC dibuat sebagai field Word tanpa pemeriksaan halaman kosong '
+                'dan tanpa update nomor halaman melalui Microsoft Word. '
+                'Nomor halaman dapat diperbarui oleh Word saat dokumen dibuka.'
             )
         except Exception as exc:
             return False, None, f'Engine9 Error: {exc}\n{traceback.format_exc()}'
