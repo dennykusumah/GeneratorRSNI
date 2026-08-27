@@ -1767,7 +1767,9 @@ class DocxFinalTranslatorEngine:
                         failed_paras.append((index, para))
                     else:
                         translated_count += 1
-                    pct = 5 + int(done / max(total, 1) * 75)
+                    # Translate normal memakai rentang 10%--90%, dihitung
+                    # murni dari counter done/total (XXX/XXX).
+                    pct = 10 + int(done / max(total, 1) * 80)
                     _notify(
                         progress_callback, pct,
                         f"[translate 4 worker] {done}/{total} | "
@@ -1796,7 +1798,9 @@ class DocxFinalTranslatorEngine:
                     recovery_success += 1
                     translated_count += 1
                     italic_count += len(found)
-                pct = 80 + int(recovery_done / max(recovery_total, 1) * 10)
+                # Pemulihan memakai rentang 90%--98%, dihitung murni dari
+                # counter recovery_done/recovery_total (YY/YY).
+                pct = 90 + int(recovery_done / max(recovery_total, 1) * 8)
                 _notify(
                     progress_callback, pct,
                     f"[pemulihan 1 worker] {recovery_done}/{recovery_total} | "
@@ -1819,7 +1823,7 @@ class DocxFinalTranslatorEngine:
             # Copyright, Daftar isi, salinan Engine 5, Bibliography entries,
             # dan informasi perumus benar-benar tidak tersentuh Engine 8.
 
-            _notify(progress_callback, 90, "Sinkronisasi judul...")
+            _notify(progress_callback, 98, "Sinkronisasi judul...")
             fid, fen = _extract_cover_titles(doc)
             if fid:
                 _sync_foreword_title(doc, fid, fen, tr=tr)
@@ -1829,7 +1833,7 @@ class DocxFinalTranslatorEngine:
             # sudah ada sehingga format Engine 7 tetap dipertahankan.
             _normalize_all_clause_heading_spacing(doc)
 
-            _notify(progress_callback, 97, "Saving...")
+            _notify(progress_callback, 98, "Saving...")
             doc.save(output_docx)
 
             if still_failed:
