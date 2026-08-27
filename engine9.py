@@ -946,7 +946,7 @@ class TableOfContentsEngine:
 
     def process(self, input_docx: Optional[str] = None,
                 output_docx: Optional[str] = None, **_kwargs):
-        output_docx = output_docx or 'hasil_engine9.docx'
+        output_docx = output_docx or 'hasil_RSNI.docx'
         try:
             path = self.insert_toc(input_docx, output_docx)
             return True, path, (
