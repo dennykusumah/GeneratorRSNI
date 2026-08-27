@@ -8,6 +8,8 @@ import atexit
 import threading
 import uuid
 import importlib.util
+import shutil
+import subprocess
 import csv
 import io
 from io import BytesIO
@@ -20,7 +22,7 @@ from urllib.request import Request, urlopen
 # Database kamus ada di https://bit.ly/kamusSNI
 
 # Pola file temporer yang dibuat oleh aplikasi
-_TEMP_PATTERNS = ["temp_main_*", "engine1_*", "engine2_*", "engine3_*", "engine4_*", "engine5_*", "engine6_*", "engine7_*", "engine8_*", "engine9_*", "opt_*", "cover_*", "di_*", "pp_*", "ip_*", "ID_*"]
+_TEMP_PATTERNS = ["temp_main_*", "converted_*", "engine1_*", "engine2_*", "engine3_*", "engine4_*", "engine5_*", "engine6_*", "engine7_*", "engine8_*", "engine9_*", "opt_*", "cover_*", "di_*", "pp_*", "ip_*", "ID_*"]
 # Hapus file lebih lama dari N menit
 _MAX_AGE_MINUTES = 30
 
@@ -69,6 +71,64 @@ def _reset_to_start() -> None:
         '_force_continue', '_forced_errors', '_forced_summary',
     ):
         st.session_state.pop(key, None)
+
+
+def _convert_legacy_doc(input_doc: str, output_docx: str) -> str:
+    """Konversi Word 97-2003 .doc menjadi .docx sebelum Engine 1."""
+    input_abs = os.path.abspath(input_doc)
+    output_abs = os.path.abspath(output_docx)
+    errors = []
+
+    # Pilihan utama pada komputer Windows pengguna: Microsoft Word COM.
+    try:
+        import pythoncom
+        import win32com.client
+        pythoncom.CoInitialize()
+        word = win32com.client.DispatchEx('Word.Application')
+        word.Visible = False
+        word.DisplayAlerts = 0
+        document = None
+        try:
+            document = word.Documents.Open(input_abs, ReadOnly=True)
+            document.SaveAs2(output_abs, FileFormat=16)  # wdFormatDocumentDefault
+        finally:
+            if document is not None:
+                document.Close(False)
+            word.Quit()
+            pythoncom.CoUninitialize()
+        if os.path.isfile(output_abs):
+            return output_abs
+    except Exception as exc:
+        errors.append(f'Microsoft Word: {exc}')
+
+    # Fallback lintas platform bila LibreOffice/soffice tersedia.
+    office = shutil.which('soffice') or shutil.which('libreoffice')
+    if office:
+        try:
+            completed = subprocess.run(
+                [office, '--headless', '--convert-to', 'docx',
+                 '--outdir', os.path.dirname(output_abs), input_abs],
+                capture_output=True, text=True, timeout=300, check=False,
+            )
+            generated = os.path.join(
+                os.path.dirname(output_abs),
+                os.path.splitext(os.path.basename(input_abs))[0] + '.docx',
+            )
+            if os.path.isfile(generated):
+                if os.path.abspath(generated) != output_abs:
+                    os.replace(generated, output_abs)
+                return output_abs
+            errors.append(
+                'LibreOffice: ' + (completed.stderr or completed.stdout or
+                                    f'exit {completed.returncode}')[:500]
+            )
+        except Exception as exc:
+            errors.append(f'LibreOffice: {exc}')
+
+    raise RuntimeError(
+        'Konversi file .doc ke .docx gagal. Pastikan Microsoft Word dan '
+        'pywin32 tersedia, atau instal LibreOffice. ' + ' | '.join(errors)
+    )
 
 def _start_background_cleanup():
     """Jalankan cleanup berkala di background thread (tiap 15 menit)."""
@@ -922,7 +982,10 @@ _tahun = str(datetime.date.today().year)
 
 # --- FORM INPUT ---
 st.markdown('<div class="section-label">📂 Upload Dokumen ISO</div>', unsafe_allow_html=True)
-uploaded_file = st.file_uploader("Upload file .docx di sini atau klik Browse", type=["docx"], key="upl_main", label_visibility="collapsed")
+uploaded_file = st.file_uploader(
+    "Upload file .doc/.docx di sini atau klik Browse",
+    type=["doc", "docx"], key="upl_main", label_visibility="collapsed"
+)
 
 st.markdown('<div class="section-label">⚙️ Pengaturan</div>', unsafe_allow_html=True)
 col_set1, col_set2 = st.columns([2, 3])
@@ -996,6 +1059,12 @@ if btn_process:
             target_file = f"temp_main_{_sid}_{uploaded_file.name}"
             with open(target_file, "wb") as f:
                 f.write(uploaded_file.getbuffer())
+
+            if uploaded_file.name.lower().endswith('.doc'):
+                converted_file = (
+                    f"converted_{_sid}_{os.path.splitext(uploaded_file.name)[0]}.docx"
+                )
+                target_file = _convert_legacy_doc(target_file, converted_file)
 
             st.session_state['_run_process'] = True
             st.session_state['_target_file'] = target_file
@@ -1472,7 +1541,7 @@ if st.session_state.get('_show_results'):
     if opt_file and os.path.exists(opt_file):
         with open(opt_file, "rb") as f:
             st.download_button(
-                label=f"📄 Download RSNI",
+                label=f"📄 Download Hasil Engine {final_engine}",
                 data=f,
                 file_name=f"Hasil_Engine{final_engine}.docx",
                 use_container_width=True
