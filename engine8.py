@@ -1,5 +1,5 @@
 """
-Engine9: Gabungan A.py + B.py
+Engine8: DocTranslator
 =============================
 Perilaku yang dinonaktifkan:
   - Tidak menyisipkan konten asli berbahasa Inggris sebelum Bibliografi.
