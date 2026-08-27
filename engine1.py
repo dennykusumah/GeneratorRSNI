@@ -20,7 +20,12 @@ from docx.shared import Pt
 
 class IntroductionContentTrimmerEngine:
     INTRO_RE = re.compile(r"^\s*introduction\s*$", re.IGNORECASE)
-    SCOPE_RE = re.compile(r"^\s*(?:\d+(?:\.0)?\s+)?scope\s*$", re.IGNORECASE)
+    # Edisi IEC lama memakai heading resmi "Scope and object". Keduanya
+    # merupakan Pasal 1 dan harus diterima sebagai awal Content.
+    SCOPE_RE = re.compile(
+        r"^\s*(?:\d+(?:\.0)?\s+)?scope(?:\s+and\s+object)?\s*$",
+        re.IGNORECASE,
+    )
     BIBLIO_RE = re.compile(r"^\s*bibliograph(?:y|ie)\s*$", re.IGNORECASE)
     NUMBER_PREFIX_RE = re.compile(
         r"^\s*(?:Annex\s+[A-Z]|[A-Z](?:\.\d+)+|\d+(?:\.\d+)*)\s+",
