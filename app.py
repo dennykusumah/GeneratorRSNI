@@ -1455,10 +1455,18 @@ if st.session_state.get('_run_process') and st.session_state.get('_target_file')
         _engine8_progress_state = {'pct': 10}
 
         def _engine8_progress(pct, msg):
-            # Utamakan progres riil xx/yyy dari callback Engine 8. Jika pesan
-            # belum memiliki counter (pemuatan kamus/inisialisasi), gunakan
-            # persentase internal sebagai fallback.
-            match = re.search(r'(?<!\d)(\d+)\s*/\s*(\d+)(?!\d)', msg or '')
+            # Engine 8 mengirim antrean gabungan terjemahan normal + pemulihan
+            # melalui tag [progres-total]. Counter fase seperti 319/352 tetap
+            # ditampilkan kepada pengguna, tetapi progress bar memakai:
+            # YYY normal + jumlah bagian yang perlu dipulihkan.
+            match = re.search(
+                r'\[progres-total\]\s*(\d+)\s*/\s*(\d+)', msg or '',
+                re.IGNORECASE,
+            )
+            if match is None:
+                match = re.search(
+                    r'(?<!\d)(\d+)\s*/\s*(\d+)(?!\d)', msg or ''
+                )
             if match and int(match.group(2)) > 0:
                 ratio = min(int(match.group(1)) / int(match.group(2)), 1.0)
             else:
@@ -1468,7 +1476,11 @@ if st.session_state.get('_run_process') and st.session_state.get('_target_file')
             # membuat progress bar mundur karena pesannya tidak punya xx/yyy.
             mapped_pct = max(_engine8_progress_state['pct'], calculated_pct)
             _engine8_progress_state['pct'] = mapped_pct
-            update_ui(mapped_pct, f"Menerjemahkan dokumen...\n{msg}")
+            display_msg = re.sub(
+                r'\s*\|\s*\[progres-total\]\s*\d+\s*/\s*\d+\s*$',
+                '', msg or '', flags=re.IGNORECASE,
+            )
+            update_ui(mapped_pct, f"Menerjemahkan dokumen...\n{display_msg}")
 
         ok_e8, _path_e8, msg_e8 = engine8.process(
             input_docx=engine7_out,
