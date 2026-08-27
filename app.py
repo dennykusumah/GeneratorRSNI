@@ -1455,25 +1455,40 @@ if st.session_state.get('_run_process') and st.session_state.get('_target_file')
         _engine8_progress_state = {'pct': 10}
 
         def _engine8_progress(pct, msg):
-            # Engine 8 mengirim antrean gabungan terjemahan normal + pemulihan
-            # melalui tag [progres-total]. Counter fase seperti 319/352 tetap
-            # ditampilkan kepada pengguna, tetapi progress bar memakai:
-            # YYY normal + jumlah bagian yang perlu dipulihkan.
-            match = re.search(
-                r'\[progres-total\]\s*(\d+)\s*/\s*(\d+)', msg or '',
-                re.IGNORECASE,
+            # Counter translate normal dan pemulihan dihitung TERPISAH:
+            #   [translate ...]  XXX/XXX -> 10% sampai 90%
+            #   [pemulihan ...]  YY/YY   -> 90% sampai 98%
+            # Pesan lain (pra-scan, sinkronisasi, saving) tidak mengubah
+            # pemetaan ini dan mempertahankan progres terakhir.
+            text = msg or ''
+            translate_match = re.search(
+                r'\[translate[^\]]*\]\s*(\d+)\s*/\s*(\d+)',
+                text, re.IGNORECASE,
             )
-            if match is None:
-                match = re.search(
-                    r'(?<!\d)(\d+)\s*/\s*(\d+)(?!\d)', msg or ''
+            recovery_match = re.search(
+                r'\[pemulihan[^\]]*\]\s*(\d+)\s*/\s*(\d+)',
+                text, re.IGNORECASE,
+            )
+
+            calculated_pct = _engine8_progress_state['pct']
+            if translate_match and int(translate_match.group(2)) > 0:
+                translate_ratio = min(
+                    int(translate_match.group(1))
+                    / int(translate_match.group(2)),
+                    1.0,
                 )
-            if match and int(match.group(2)) > 0:
-                ratio = min(int(match.group(1)) / int(match.group(2)), 1.0)
-            else:
-                ratio = max(0, min(pct, 100)) / 100.0
-            calculated_pct = min(10 + int(ratio * 88), 98)
-            # Jangan biarkan fase sinkronisasi/penyimpanan setelah 100% antrean
-            # membuat progress bar mundur karena pesannya tidak punya xx/yyy.
+                calculated_pct = 10 + int(translate_ratio * 80)
+            elif recovery_match and int(recovery_match.group(2)) > 0:
+                recovery_ratio = min(
+                    int(recovery_match.group(1))
+                    / int(recovery_match.group(2)),
+                    1.0,
+                )
+                calculated_pct = 90 + int(recovery_ratio * 8)
+
+            calculated_pct = max(10, min(calculated_pct, 98))
+            # Callback paralel dapat tiba sangat berdekatan; progres tidak
+            # boleh mundur ketika berganti fase atau saat saving.
             mapped_pct = max(_engine8_progress_state['pct'], calculated_pct)
             _engine8_progress_state['pct'] = mapped_pct
             display_msg = re.sub(
