@@ -301,7 +301,54 @@ class InfoPendukungEngine:
 
     @staticmethod
     def _normalize(text: str) -> str:
-        return re.sub(r'\s+', ' ', text or '').strip()
+        value = (text or '').replace('\xa0', ' ')
+        value = re.sub(r'[\u200b\u200c\u200d\u2060\ufeff\u00ad]', '', value)
+        return re.sub(r'\s+', ' ', value).strip()
+
+    @classmethod
+    def _is_bibliography_heading(cls, paragraph) -> bool:
+        """Deteksi Bibliography normal maupun yang menyatu running header."""
+        text = cls._normalize(paragraph.text)
+        key = re.sub(r'[\s:;,.\-–—]+$', '', text).casefold()
+        key = re.sub(r'^(?:[a-z]\.?|\d+(?:\.\d+)*)\s+', '', key)
+        if key in {
+            'bibliography', 'bibliographical references', 'daftar pustaka'
+        }:
+            return True
+
+        ppr = paragraph._p.find(qn('w:pPr'))
+        style_el = ppr.find(qn('w:pStyle')) if ppr is not None else None
+        style = (
+            style_el.get(qn('w:val'), '').casefold()
+            if style_el is not None else ''
+        )
+        heading_style = any(
+            token in style
+            for token in ('heading', 'title', 'judul', 'biblio')
+        )
+        if key == 'references' and heading_style:
+            return True
+
+        has_word = bool(re.search(
+            r'(?<![a-z])bibliography(?![a-z])', key
+        ))
+        running_header = bool(re.search(
+            r'\b(?:ISO(?:\s*/\s*IEC)?|IEC|CISPR)\b'
+            r'\s+(?:19|20)\d{2}\b'
+            r'[^A-Za-z0-9]{0,15}\bbibliography\b',
+            key,
+            flags=re.IGNORECASE,
+        ))
+        return has_word and (heading_style or running_header)
+
+    @classmethod
+    def _find_bibliography(cls, doc: Document):
+        candidates = [
+            paragraph for paragraph in doc.paragraphs
+            if cls._is_bibliography_heading(paragraph)
+            and cls._section_number(paragraph) >= 4
+        ]
+        return candidates[-1] if candidates else None
 
     @classmethod
     def _section_number(cls, paragraph) -> int:
@@ -324,12 +371,10 @@ class InfoPendukungEngine:
                 f'Output Engine 5 harus memiliki minimal 4 section; '
                 f'ditemukan {len(doc.sections)}.'
             )
-        bibliography = next(
-            (p for p in doc.paragraphs if cls._normalize(p.text).casefold() == 'bibliography'),
-            None,
-        )
-        if bibliography is None or cls._section_number(bibliography) < 4:
-            raise ValueError('Bibliography tidak ditemukan pada area Content.')
+        bibliography = cls._find_bibliography(doc)
+        # Bibliography opsional untuk amendment dan sebagian standar. Engine 5
+        # tetap memberi bookmark batas duplikasi, sehingga halaman perumus aman
+        # ditambahkan setelah seluruh Content.
         return doc
 
     @classmethod
@@ -346,13 +391,9 @@ class InfoPendukungEngine:
         )
         if heading is None or cls._section_number(heading) != len(doc.sections):
             raise RuntimeError('Heading informasi perumus SNI tidak berada di section terakhir.')
-        bibliography = next(
-            (p for p in doc.paragraphs if cls._normalize(p.text).casefold() == 'bibliography'),
-            None,
-        )
-        if (
-            bibliography is None
-            or cls._section_number(bibliography) < 4
+        bibliography = cls._find_bibliography(doc)
+        if bibliography is not None and (
+            cls._section_number(bibliography) < 4
             or cls._section_number(bibliography) >= len(doc.sections)
         ):
             raise RuntimeError('Posisi Bibliography pada area Content berubah.')
@@ -677,7 +718,7 @@ class InfoPendukungEngine:
         return (
             True,
             result,
-            'Informasi perumus SNI berhasil disisipkan setelah Bibliography '
+            'Informasi perumus SNI berhasil disisipkan setelah Content/Bibliography '
             'sebagai section terakhir.',
         )
 
