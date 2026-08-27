@@ -268,7 +268,25 @@ class IntroductionContentTrimmerEngine:
             candidates.append(start_idx)
         return candidates[-1] if candidates else None
 
-    def _format_trimmed_document(self, doc: Document) -> None:
+    @classmethod
+    def _fallback_cover_title(cls, doc: Document, content_start: int) -> str:
+        """Ambil judul Inggris dari cover jika field judul Content rusak."""
+        candidates = []
+        for index, paragraph in enumerate(doc.paragraphs[:content_start]):
+            text = cls._text(paragraph)
+            if not text or 'reference source not found' in text.casefold():
+                continue
+            style = paragraph.style.name.casefold() if paragraph.style else ''
+            if 'cover' not in style:
+                continue
+            if len(text) >= 20 and ('—' in text or '-' in text):
+                candidates.append((index, text))
+        # Cover ISO menempatkan judul Inggris sebelum judul Prancis.
+        return candidates[0][1] if candidates else ''
+
+    def _format_trimmed_document(
+        self, doc: Document, fallback_title: str = ''
+    ) -> None:
         judul, pasal = self._ensure_output_styles(doc)
 
         # Cari Scope pada dokumen yang sudah dipotong, lalu anggap semua teks
@@ -292,6 +310,11 @@ class IntroductionContentTrimmerEngine:
         if title_paragraphs:
             title_text = " ".join(self._text(p) for p in title_paragraphs)
             title_text = re.sub(r"\s+", " ", title_text).strip()
+            if (
+                'reference source not found' in title_text.casefold()
+                and fallback_title
+            ):
+                title_text = fallback_title
             first_title = title_paragraphs[0]
             self._replace_paragraph_text(first_title, title_text)
             first_title.style = judul
@@ -455,6 +478,7 @@ class IntroductionContentTrimmerEngine:
             doc = Document(input_docx)
             intro_idx, scope_idx, biblio_idx = self._find_markers(doc)
             content_start = self._content_start(doc, scope_idx)
+            fallback_title = self._fallback_cover_title(doc, content_start)
 
             # Introduction hanya sah bila berada sebelum Content. Jika tidak,
             # dokumen dianggap tidak memiliki halaman Introduction terpisah.
@@ -484,7 +508,7 @@ class IntroductionContentTrimmerEngine:
             # Hyperlink harus dibongkar sebelum formatting paragraf. Run di
             # dalam w:hyperlink tidak selalu muncul pada paragraph.runs.
             hyperlinks_removed = self._remove_all_hyperlinks(doc)
-            self._format_trimmed_document(doc)
+            self._format_trimmed_document(doc, fallback_title=fallback_title)
 
             os.makedirs(os.path.dirname(os.path.abspath(output_docx)), exist_ok=True)
             doc.save(output_docx)
