@@ -1,8 +1,9 @@
 """Engine 5 — duplikasi Introduction dan Content Inggris sebelum Bibliography.
 
 Input yang diharapkan adalah keluaran Engine 4 dengan empat section. Salinan
-Introduction dan seluruh blok Content (termasuk Annex) ditempatkan di section 4
-tepat sebelum Bibliography. Tidak ada section baru yang dibuat.
+Introduction dan seluruh blok Content (termasuk Annex) ditempatkan di area
+Content tepat sebelum Bibliography. Bibliography boleh berada di section layout
+4 atau section berikutnya. Tidak ada section baru yang dibuat.
 """
 
 from __future__ import annotations
@@ -21,11 +22,89 @@ class IntroductionContentDuplicatorEngine:
 
     @staticmethod
     def _normalize(text: str) -> str:
-        return re.sub(r"\s+", " ", text or "").strip()
+        # Word/hasil konversi PDF kadang menyisipkan NBSP, zero-width space,
+        # soft-hyphen, atau BOM ke dalam heading yang secara visual tetap
+        # terbaca "Bibliography".
+        value = (text or "").replace("\xa0", " ")
+        value = re.sub(r"[\u200b\u200c\u200d\u2060\ufeff\u00ad]", "", value)
+        return re.sub(r"\s+", " ", value).strip()
 
     @classmethod
     def _element_text(cls, element) -> str:
-        return cls._normalize("".join(element.xpath(".//w:t/text()")))
+        return cls._normalize("".join(
+            node.text or "" for node in element.iter(qn("w:t"))
+        ))
+
+    @staticmethod
+    def _paragraph_style_id(element) -> str:
+        if element.tag != qn("w:p"):
+            return ""
+        ppr = element.find(qn("w:pPr"))
+        style = ppr.find(qn("w:pStyle")) if ppr is not None else None
+        return (style.get(qn("w:val"), "") if style is not None else "")
+
+    @classmethod
+    def _is_bibliography_heading(cls, paragraph) -> bool:
+        """Kenali heading bibliografi tanpa bergantung nomor section/style."""
+        if paragraph.tag != qn("w:p"):
+            return False
+        text = cls._element_text(paragraph)
+        # Izinkan tanda baca akhir dan nomor heading yang kadang ditambahkan
+        # aplikasi sumber, tetapi jangan cocokkan kalimat yang hanya menyebut
+        # kata bibliography di tengah paragraf.
+        key = re.sub(r"[\s:;,.\-–—]+$", "", text).casefold()
+        key = re.sub(r"^(?:[a-z]\.?|\d+(?:\.\d+)*)\s+", "", key)
+        if key in {
+            "bibliography", "bibliographical references", "daftar pustaka"
+        }:
+            return True
+        # Beberapa template memakai heading "References". Terima hanya jika
+        # style-nya jelas merupakan style judul/bibliografi agar entri acuan
+        # normatif biasa tidak salah dianggap sebagai batas Content.
+        style = cls._paragraph_style_id(paragraph).casefold()
+        heading_style = any(
+            token in style
+            for token in ("heading", "title", "judul", "biblio")
+        )
+        if key == "references" and heading_style:
+            return True
+
+        # Dokumen IEC/CISPR tertentu menyimpan running header dan heading pada
+        # satu paragraf XML, misalnya:
+        # "CISPR 32:2015+AMD1:2019 CSV [glyph] IEC 2019 Bibliography".
+        # Pada kasus lain entri pertama bahkan ikut tergabung setelah kata
+        # Bibliography. Pola ini sangat spesifik pada identitas standar + tahun,
+        # sehingga tidak menangkap kalimat isi yang kebetulan menyebut daftar
+        # pustaka.
+        has_bibliography_word = bool(
+            re.search(r"(?<![a-z])bibliography(?![a-z])", key)
+        )
+        standard_running_header = bool(re.search(
+            r"\b(?:ISO(?:\s*/\s*IEC)?|IEC|CISPR)\b"
+            r"\s+(?:19|20)\d{2}\b"
+            r"[^A-Za-z0-9]{0,15}\bbibliography\b",
+            key,
+            flags=re.IGNORECASE,
+        ))
+        if has_bibliography_word and (heading_style or standard_running_header):
+            return True
+        return False
+
+    @classmethod
+    def _find_bibliography_anchor(cls, elements, start_index: int):
+        """Kembalikan indeks elemen body yang memuat heading Bibliography.
+
+        Heading normal berupa ``w:p`` langsung. Fallback descendant menangani
+        heading di dalam content control ``w:sdt`` yang umum pada DOCX tertentu.
+        """
+        for index in range(start_index, len(elements)):
+            element = elements[index]
+            if cls._is_bibliography_heading(element):
+                return index
+            for paragraph in element.iter(qn("w:p")):
+                if cls._is_bibliography_heading(paragraph):
+                    return index
+        return None
 
     @staticmethod
     def _has_section_break(element) -> bool:
@@ -129,16 +208,21 @@ class IntroductionContentDuplicatorEngine:
                 ),
                 None,
             )
-            bibliography_index = next(
-                (
-                    index for index, element in enumerate(elements[section4_start:], section4_start)
-                    if element.tag == qn("w:p")
-                    and self._element_text(element).casefold() == "bibliography"
-                ),
-                None,
+            bibliography_index = self._find_bibliography_anchor(
+                elements, section4_start
             )
             if bibliography_index is None:
-                raise ValueError("Heading Bibliography tidak ditemukan di section 4.")
+                # Bibliography tidak wajib pada amendment dan beberapa standar.
+                # Gunakan sectPr akhir sebagai anchor agar salinan Inggris tetap
+                # ditempatkan sesudah seluruh Content tanpa membuat section baru.
+                bibliography_index = next(
+                    (
+                        index for index in range(len(elements) - 1,
+                                                 section4_start - 1, -1)
+                        if elements[index].tag == qn("w:sectPr")
+                    ),
+                    len(elements) - 1,
+                )
 
             introduction = (
                 elements[intro_index:break_indices[2]]
@@ -197,7 +281,8 @@ class IntroductionContentDuplicatorEngine:
             True,
             result,
             "Salinan Content berbahasa Inggris beserta Introduction jika "
-            "tersedia berhasil disisipkan tepat sebelum Bibliography. "
+            "tersedia berhasil disisipkan di akhir Content atau tepat "
+            "sebelum Bibliography jika bagian tersebut tersedia. "
             "Penomoran seluruh layout section Content menggunakan angka desimal.",
         )
 
