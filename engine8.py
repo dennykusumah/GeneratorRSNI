@@ -1,5 +1,5 @@
 """
-Engine8: Gabungan A.py + B.py
+Engine9: Gabungan A.py + B.py
 =============================
 Perilaku yang dinonaktifkan:
   - Tidak menyisipkan konten asli berbahasa Inggris sebelum Bibliografi.
@@ -1738,7 +1738,8 @@ class DocxFinalTranslatorEngine:
             _notify(
                 progress_callback, 5,
                 f"[pra-scan] skip={skipped_count} dari {inspected_count} "
-                f"({scan_seconds:.2f} detik) | antrean terjemahan=0/{total}",
+                f"({scan_seconds:.2f} detik) | antrean terjemahan=0/{total} "
+                f"| [progres-total] 0/{total}",
             )
 
             done = translated_count = 0
@@ -1770,7 +1771,9 @@ class DocxFinalTranslatorEngine:
                     _notify(
                         progress_callback, pct,
                         f"[translate 4 worker] {done}/{total} | "
-                        f"berhasil={translated_count} | tersisa={len(failed_paras)}",
+                        f"berhasil={translated_count} | "
+                        f"tersisa={len(failed_paras)} | "
+                        f"[progres-total] {done}/{total + len(failed_paras)}",
                     )
 
             # Hanya bagian yang belum berhasil diterjemahkan yang diulang,
@@ -1798,7 +1801,9 @@ class DocxFinalTranslatorEngine:
                     progress_callback, pct,
                     f"[pemulihan 1 worker] {recovery_done}/{recovery_total} | "
                     f"berhasil={recovery_success} | "
-                    f"tersisa={recovery_total - recovery_done + len(still_failed)}",
+                    f"tersisa={recovery_total - recovery_done + len(still_failed)} "
+                    f"| [progres-total] {total + recovery_done}/"
+                    f"{total + recovery_total}",
                 )
 
             # Dipakai ringkasan dan UI peringatan. Dokumen parsial tetap
