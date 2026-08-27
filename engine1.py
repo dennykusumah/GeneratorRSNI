@@ -486,19 +486,8 @@ class IntroductionContentTrimmerEngine:
             hyperlinks_removed = self._remove_all_hyperlinks(doc)
             self._format_trimmed_document(doc)
 
-            output_abs = os.path.abspath(output_docx)
-            os.makedirs(os.path.dirname(output_abs), exist_ok=True)
-            # Dokumen hasil konversi .doc dapat sangat besar. Simpan dan
-            # validasi melalui file sementara agar Engine 2 tidak pernah
-            # membuka paket ZIP yang baru tertulis sebagian.
-            temp_output = f"{output_abs}.engine1-{os.getpid()}.tmp"
-            try:
-                doc.save(temp_output)
-                Document(temp_output)
-                os.replace(temp_output, output_abs)
-            finally:
-                if os.path.exists(temp_output):
-                    os.unlink(temp_output)
+            os.makedirs(os.path.dirname(os.path.abspath(output_docx)), exist_ok=True)
+            doc.save(output_docx)
 
             intro_msg = "Introduction + Content" if has_intro else "Content (mulai halaman 1)"
             biblio_msg = " sampai Bibliography" if biblio_idx is not None else ""
