@@ -643,8 +643,11 @@ hr {
     padding: 0.7rem 0 0.65rem;
     letter-spacing: 0.5px;
     position: static;
-    background: #0b0f1d;
-    border-top: 1px solid rgba(99,102,241,0.12);
+    /* Menyatu dengan background utama: tanpa frame/kotak footer. */
+    background: transparent !important;
+    border: none !important;
+    box-shadow: none !important;
+    outline: none !important;
 }
 .footer span { color: rgba(255,255,255,0.9); }
 
