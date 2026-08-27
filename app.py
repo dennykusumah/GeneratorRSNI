@@ -1017,7 +1017,7 @@ if st.session_state.get('_process_error'):
         if _last_path and os.path.isfile(_last_path):
             with open(_last_path, 'rb') as _last_file:
                 st.download_button(
-                    '⬇ Download', data=_last_file,
+                    '⬇ Download Hasil Engine {final_engine}', data=_last_file,
                     file_name=f'Hasil_Engine{_last_engine}.docx',
                     key='error_download', use_container_width=True,
                 )
@@ -1553,7 +1553,7 @@ if st.session_state.get('_show_results'):
     if opt_file and os.path.exists(opt_file):
         with open(opt_file, "rb") as f:
             st.download_button(
-                label=f"📄 Download Hasil Engine {final_engine}",
+                label=f"📄 Download RSNI",
                 data=f,
                 file_name=f"Hasil_Engine{final_engine}.docx",
                 use_container_width=True
