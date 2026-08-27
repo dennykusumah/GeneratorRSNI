@@ -68,9 +68,25 @@ def _reset_to_start() -> None:
         '_run_process', '_show_results', '_process_error', '_resume_engine',
         '_last_engine', '_last_output', '_target_file', '_final_opt_file',
         '_final_tr_file', '_final_time', '_final_engine', '_doc_sections',
+        '_final_download_name',
         '_force_continue', '_forced_errors', '_forced_summary',
     ):
         st.session_state.pop(key, None)
+
+
+def _engine9_download_filename(sni_number: str) -> str:
+    """Bentuk nama final dari Nomor SNI input pengguna.
+
+    Contoh: ``SNI ISO 9001-1:2015`` -> ``RSNI_ISO_9001-1_2015.docx``.
+    """
+    base = os.path.splitext(str(sni_number or '').strip())[0]
+    if not base:
+        base = 'SNI'
+    if not base.upper().startswith('R'):
+        base = f'R{base}'
+    safe_name = re.sub(r'[^\w.\-]+', '_', base, flags=re.UNICODE)
+    safe_name = re.sub(r'_+', '_', safe_name).strip('_.') or 'RSNI'
+    return f'{safe_name}.docx'
 
 
 def _convert_legacy_doc(input_doc: str, output_docx: str) -> str:
@@ -951,15 +967,6 @@ _italic_count = st.session_state.get('italic_count', 0)
 # itu footer tetap berada di layar sejak awal rerun sampai proses selesai.
 _FOOTER_HTML = """
 <div class='footer'>
-  <div style='margin-bottom:0.55rem;'>
-    <a href='https://generator-sni.streamlit.app/' target='_blank'
-       style='display:inline-block;padding:0.30rem 0.72rem;border:1px solid #6366f1;
-              border-radius:7px;background:linear-gradient(135deg,#312e81,#3730a3);
-              color:#ffffff;text-decoration:none;font-size:0.72rem;font-weight:700;
-              line-height:1.1;box-shadow:0 0 10px rgba(99,102,241,0.22);'>
-      Ganti Mode Terjemahan Cepat
-    </a>
-  </div>
   <span style='font-size:0.85rem;'>
     <a href='https://docs.google.com/spreadsheets/d/1BBPCMPwvbBk5LPdoDQwnjQzcPHv7_RDKENqeMsklF-8/edit?usp=sharing' target='_blank' style='color:#ffffff;text-decoration:none;'>📖 Kamus SNI</a>
     &nbsp;&nbsp;·&nbsp;&nbsp;
@@ -1005,8 +1012,7 @@ with col_set2:
 # --- TOMBOL PROSES ---
 btn_process = st.button("🚀 Proses", key="btn_main", use_container_width=True)
 
-# Saat error, ketiga tombol kecil tampil setelah tombol Proses dan tepat di
-# atas tombol "Ganti Mode Terjemahan Cepat" yang berada di dalam footer.
+# Saat error, ketiga tombol kecil tampil setelah tombol Proses dan sebelum footer.
 if st.session_state.get('_process_error'):
     st.error(st.session_state['_process_error'])
     _last_path = st.session_state.get('_last_output')
@@ -1100,6 +1106,8 @@ if (st.session_state.get('_run_process') and
     _resume_output = f'engine{_resume}_{_sid}_{_base_name}'
     _sni = st.session_state.get('_doc_title', 'SNI ISO XXXXX-X:XXXX')
     _ics = st.session_state.get('_ics_number', 'XX.XXX.XX')
+    if _resume == 9:
+        _resume_output = f'engine9_{_sid}_{_engine9_download_filename(_sni)}'
     try:
         if _resume == 2:
             _ok, _msg = engine2.process(
@@ -1143,6 +1151,7 @@ if (st.session_state.get('_run_process') and
         else:
             st.session_state['_final_opt_file'] = _resume_output
             st.session_state['_final_engine'] = 9
+            st.session_state['_final_download_name'] = _engine9_download_filename(_sni)
             st.session_state['_final_time'] = 'proses lanjutan'
             st.session_state['_show_results'] = True
             st.session_state['_run_process'] = False
@@ -1512,7 +1521,8 @@ if st.session_state.get('_run_process') and st.session_state.get('_target_file')
 
         update_ui(98, f"Penerjemahan selesai ✓\n{msg_e8}")
 
-        engine9_out = f"engine9_{_sid}_{original_name}"
+        engine9_download_name = _engine9_download_filename(doc_title_val)
+        engine9_out = f"engine9_{_sid}_{engine9_download_name}"
         update_ui(98, "Menerapkan style final dan daftar isi...")
         ok_e9, _path_e9, msg_e9 = engine9.process(
             input_docx=engine8_out,
@@ -1531,6 +1541,7 @@ if st.session_state.get('_run_process') and st.session_state.get('_target_file')
         )
         st.session_state['_final_opt_file'] = engine9_out
         st.session_state['_final_engine'] = 9
+        st.session_state['_final_download_name'] = engine9_download_name
         st.session_state.pop('_final_tr_file', None)
         st.session_state['_final_time'] = final_elapsed
         st.session_state['_show_results'] = True
@@ -1568,12 +1579,15 @@ if st.session_state.get('_show_results'):
 
     opt_file = st.session_state.get('_final_opt_file')
     final_engine = int(st.session_state.get('_final_engine', 9) or 9)
+    final_download_name = st.session_state.get('_final_download_name')
+    if final_engine != 9 or not final_download_name:
+        final_download_name = f"Hasil_Engine{final_engine}.docx"
     if opt_file and os.path.exists(opt_file):
         with open(opt_file, "rb") as f:
             st.download_button(
                 label=f"📄 Download RSNI",
                 data=f,
-                file_name=f"Hasil_Engine{final_engine}.docx",
+                file_name=final_download_name,
                 use_container_width=True
             )
 
@@ -1583,6 +1597,7 @@ if st.session_state.get('_show_results'):
         _cleanup_session_files(st.session_state)
         for k in ['_show_results', '_final_opt_file', '_final_tr_file', '_final_time',
                   '_final_engine', '_forced_summary', '_forced_errors', '_force_continue',
+                  '_final_download_name',
                   '_run_process', '_doc_text', '_chat_history', '_doc_sections', '_target_file']:
             if k in st.session_state: del st.session_state[k]
         st.rerun()
