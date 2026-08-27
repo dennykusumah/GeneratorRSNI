@@ -23,6 +23,39 @@ from docx.enum.text import WD_TAB_ALIGNMENT
 WNS = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
 RNS = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships'
 
+def _normalize_bibliography_text(text):
+    value = (text or '').replace('\xa0', ' ')
+    value = re.sub(r'[\u200b\u200c\u200d\u2060\ufeff\u00ad]', '', value)
+    return re.sub(r'\s+', ' ', value).strip()
+
+
+def _is_bibliography_paragraph(paragraph):
+    """Deteksi heading Bibliography, termasuk running header IEC/CISPR."""
+    text = _normalize_bibliography_text(paragraph.text)
+    key = re.sub(r'[\s:;,.\-–—]+$', '', text).casefold()
+    key = re.sub(r'^(?:[a-z]\.?|\d+(?:\.\d+)*)\s+', '', key)
+    if key in {
+        'bibliography', 'bibliographical references', 'daftar pustaka'
+    }:
+        return True
+    ppr = paragraph._p.find(qn('w:pPr'))
+    style_el = ppr.find(qn('w:pStyle')) if ppr is not None else None
+    style = style_el.get(qn('w:val'), '').casefold() if style_el is not None else ''
+    heading_style = any(
+        token in style for token in ('heading', 'title', 'judul', 'biblio')
+    )
+    if key == 'references' and heading_style:
+        return True
+    has_word = bool(re.search(r'(?<![a-z])bibliography(?![a-z])', key))
+    running_header = bool(re.search(
+        r'\b(?:ISO(?:\s*/\s*IEC)?|IEC|CISPR)\b'
+        r'\s+(?:19|20)\d{2}\b'
+        r'[^A-Za-z0-9]{0,15}\bbibliography\b',
+        key,
+        flags=re.IGNORECASE,
+    ))
+    return has_word and (heading_style or running_header)
+
 def remove_all_hyperlinks(doc):
     """
     Hapus semua hyperlink dalam dokumen dan jadikan teks biasa.
@@ -627,7 +660,7 @@ class DocxOptimizerEngine:
             )
             bibliography_index = next(
                 (i for i, p in enumerate(all_paragraphs)
-                 if re.sub(r'\s+', ' ', p.text or '').strip().casefold() == 'bibliography'),
+                 if _is_bibliography_paragraph(p)),
                 None,
             )
             perumus_index = next(
@@ -638,11 +671,15 @@ class DocxOptimizerEngine:
             )
             if toc_index is None:
                 raise ValueError('Heading Daftar isi tidak ditemukan.')
-            if bibliography_index is None:
-                raise ValueError('Heading Bibliography tidak ditemukan.')
             if perumus_index is None:
                 raise ValueError('Heading informasi perumus SNI tidak ditemukan.')
-            if not (toc_index < bibliography_index < perumus_index):
+            if not (toc_index < perumus_index):
+                raise ValueError(
+                    'Urutan dokumen harus Daftar isi → informasi perumus SNI.'
+                )
+            if bibliography_index is not None and not (
+                toc_index < bibliography_index < perumus_index
+            ):
                 raise ValueError(
                     'Urutan dokumen harus Daftar isi → Bibliography → informasi perumus SNI.'
                 )
@@ -1561,8 +1598,9 @@ class DocxOptimizerEngine:
             # dan tepat satu paragraf kosong di antara dua entri.
             current_paragraphs = list(doc.paragraphs)
             bibliography_start = next(
-                i for i, paragraph in enumerate(current_paragraphs)
-                if (paragraph.text or '').strip().casefold() == 'bibliography'
+                (i for i, paragraph in enumerate(current_paragraphs)
+                 if _is_bibliography_paragraph(paragraph)),
+                None,
             )
             bibliography_end = next(
                 i for i, paragraph in enumerate(current_paragraphs)
@@ -1571,9 +1609,10 @@ class DocxOptimizerEngine:
             )
             bibliography_entries = [
                 paragraph
-                for paragraph in current_paragraphs[
-                    bibliography_start + 1:bibliography_end
-                ]
+                for paragraph in (
+                    current_paragraphs[bibliography_start + 1:bibliography_end]
+                    if bibliography_start is not None else []
+                )
                 if re.match(r'^\[\d+\]', (paragraph.text or '').strip())
             ]
             for entry in bibliography_entries:
