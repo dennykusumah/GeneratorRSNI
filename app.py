@@ -10,11 +10,6 @@ import uuid
 import importlib.util
 import csv
 import io
-import shutil
-import subprocess
-import tempfile
-import zipfile
-from pathlib import Path
 from io import BytesIO
 from urllib.request import Request, urlopen
 
@@ -50,10 +45,7 @@ def _cleanup_temp_files(max_age_minutes: int = _MAX_AGE_MINUTES, silent: bool = 
 
 def _cleanup_session_files(session_state):
     """Hapus file milik sesi saat ini segera."""
-    keys = [
-        '_target_file', '_final_opt_file', '_final_tr_file',
-        '_engine8_partial_file', '_engine8_partial_bytes', '_pending_engine9_out',
-    ]
+    keys = ['_target_file', '_final_opt_file', '_final_tr_file']
     for k in keys:
         fpath = session_state.get(k)
         if fpath and os.path.isfile(fpath):
@@ -62,98 +54,21 @@ def _cleanup_session_files(session_state):
             except Exception:
                 pass
 
-def _store_engine8_checkpoint(engine8_path: str, engine9_path: str, session_state) -> str:
-    """Simpan checkpoint Engine 8 secara tahan-rerun.
+def _remember_engine_output(engine_no: int, path: str) -> None:
+    """Simpan output terakhir yang benar untuk recovery UI."""
+    if path and os.path.isfile(path):
+        st.session_state['_last_engine'] = engine_no
+        st.session_state['_last_output'] = path
 
-    Selain path absolut, bytes DOCX disimpan di session_state. Jika file fisik
-    hilang saat Streamlit rerun/cleanup, tombol Lanjutkan dapat memulihkannya
-    tanpa menjalankan ulang Engine 1-8.
-    """
-    engine8_abs = os.path.abspath(engine8_path)
-    engine9_abs = os.path.abspath(engine9_path)
-    if not os.path.isfile(engine8_abs):
-        raise FileNotFoundError(f'Output Engine 8 tidak ditemukan: {engine8_abs}')
-    with open(engine8_abs, 'rb') as fh:
-        payload = fh.read()
-    if not payload:
-        raise ValueError('Output Engine 8 kosong dan tidak dapat dijadikan checkpoint.')
-    session_state['_engine8_partial_file'] = engine8_abs
-    session_state['_engine8_partial_bytes'] = payload
-    session_state['_pending_engine9_out'] = engine9_abs
-    return engine8_abs
-
-
-def _restore_engine8_checkpoint(session_state) -> tuple[str | None, str | None]:
-    """Pastikan checkpoint Engine 8 tersedia di disk sebelum Engine 9."""
-    partial_file = session_state.get('_engine8_partial_file')
-    engine9_out = session_state.get('_pending_engine9_out')
-    if engine9_out:
-        engine9_out = os.path.abspath(engine9_out)
-        session_state['_pending_engine9_out'] = engine9_out
-
-    if partial_file:
-        partial_file = os.path.abspath(partial_file)
-        session_state['_engine8_partial_file'] = partial_file
-    if partial_file and os.path.isfile(partial_file) and os.path.getsize(partial_file) > 0:
-        return partial_file, engine9_out
-
-    payload = session_state.get('_engine8_partial_bytes')
-    if payload:
-        sid = session_state.get('_sid', 'session')
-        partial_file = os.path.abspath(f'engine8_checkpoint_{sid}.docx')
-        with open(partial_file, 'wb') as fh:
-            fh.write(payload)
-        session_state['_engine8_partial_file'] = partial_file
-        return partial_file, engine9_out
-    return None, engine9_out
-
-
-def _is_valid_docx(path: str | None) -> bool:
-    if not path:
-        return False
-    path = os.path.abspath(path)
-    return (
-        os.path.isfile(path)
-        and os.path.getsize(path) > 0
-        and zipfile.is_zipfile(path)
-    )
-
-
-def _run_engine9_verified(engine9_obj, input_docx: str, output_docx: str):
-    """Jalankan Engine 9 dan wajibkan output DOCX valid.
-
-    Dua percobaan dipakai untuk mengatasi kegagalan otomasi Word yang bersifat
-    sementara. Percobaan kedua selalu dimulai dari checkpoint Engine 8 yang
-    sama, bukan dari output Engine 9 yang mungkin setengah jadi.
-    """
-    errors = []
-    output_docx = os.path.abspath(output_docx)
-    for attempt in (1, 2):
-        try:
-            if os.path.exists(output_docx):
-                try:
-                    os.remove(output_docx)
-                except OSError:
-                    pass
-            ok, path_result, message = engine9_obj.process(
-                input_docx=os.path.abspath(input_docx),
-                output_docx=output_docx,
-            )
-            candidate = os.path.abspath(path_result or output_docx)
-            if ok and _is_valid_docx(candidate):
-                if candidate != output_docx:
-                    shutil.copy2(candidate, output_docx)
-                if _is_valid_docx(output_docx):
-                    return True, output_docx, message
-            errors.append(
-                f'percobaan {attempt}: {message or "output DOCX tidak valid"}'
-            )
-        except Exception as exc:
-            errors.append(f'percobaan {attempt}: {exc}')
-        if attempt == 1:
-            time.sleep(1.0)
-    return False, output_docx, '; '.join(errors)
-
+def _reset_to_start() -> None:
+    """Kembali ke form awal tanpa menghapus cache global aplikasi."""
+    for key in (
+        '_run_process', '_show_results', '_process_error', '_resume_engine',
+        '_last_engine', '_last_output', '_target_file', '_final_opt_file',
+        '_final_tr_file', '_final_time', '_final_engine', '_doc_sections',
+        '_force_continue', '_forced_errors', '_forced_summary',
+    ):
+        st.session_state.pop(key, None)
 
 def _start_background_cleanup():
     """Jalankan cleanup berkala di background thread (tiap 15 menit)."""
@@ -172,161 +87,6 @@ if 'bg_cleanup_started' not in st.session_state:
 
 # Daftarkan cleanup saat proses Python berhenti (atexit)
 atexit.register(_cleanup_temp_files, max_age_minutes=0, silent=False)
-
-
-def _convert_legacy_doc_to_docx(input_doc: str, output_docx: str) -> str:
-    """Konversi Word 97--2003 ``.doc`` menjadi OOXML ``.docx``.
-
-    Microsoft Word diprioritaskan pada Windows karena Engine 9 juga memakai
-    Word. LibreOffice/soffice menjadi fallback untuk server Linux. Hasil wajib
-    dapat dibuka python-docx sebelum diteruskan ke Engine 1.
-    """
-    input_abs = os.path.abspath(input_doc)
-    output_abs = os.path.abspath(output_docx)
-    errors = []
-    if os.path.isfile(output_abs):
-        os.remove(output_abs)
-
-    if os.name == 'nt':
-        word = document = None
-        pythoncom = None
-        try:
-            import pythoncom as _pythoncom
-            import win32com.client
-
-            pythoncom = _pythoncom
-            pythoncom.CoInitialize()
-            word = win32com.client.DispatchEx('Word.Application')
-            word.Visible = False
-            word.DisplayAlerts = 0
-            document = word.Documents.Open(
-                input_abs, ConfirmConversions=False, ReadOnly=True,
-                AddToRecentFiles=False, Visible=False,
-            )
-            # 16 = wdFormatDocumentDefault (.docx)
-            document.SaveAs2(output_abs, FileFormat=16)
-        except Exception as exc:
-            errors.append(f'Microsoft Word: {exc}')
-        finally:
-            if document is not None:
-                try:
-                    document.Close(SaveChanges=False)
-                except Exception:
-                    pass
-            if word is not None:
-                try:
-                    word.Quit(SaveChanges=False)
-                except Exception:
-                    pass
-            if pythoncom is not None:
-                pythoncom.CoUninitialize()
-
-    # Fallback Windows tanpa pywin32/pythoncom. PowerShell dapat mengakses
-    # Microsoft Word COM secara langsung dan tersedia bawaan pada Windows.
-    if os.name == 'nt' and not os.path.isfile(output_abs):
-        powershell = shutil.which('powershell') or shutil.which('pwsh')
-        if powershell:
-            ps_script = r"""
-$ErrorActionPreference = 'Stop'
-$word = $null
-$document = $null
-try {
-    $word = New-Object -ComObject Word.Application
-    $word.Visible = $false
-    $word.DisplayAlerts = 0
-    $document = $word.Documents.Open(
-        $env:RSNI_DOC_INPUT, $false, $true, $false
-    )
-    $document.SaveAs2($env:RSNI_DOC_OUTPUT, 16)
-}
-finally {
-    if ($null -ne $document) {
-        $document.Close($false)
-        [void][Runtime.InteropServices.Marshal]::ReleaseComObject($document)
-    }
-    if ($null -ne $word) {
-        $word.Quit($false)
-        [void][Runtime.InteropServices.Marshal]::ReleaseComObject($word)
-    }
-    [GC]::Collect()
-    [GC]::WaitForPendingFinalizers()
-}
-"""
-            ps_env = os.environ.copy()
-            ps_env['RSNI_DOC_INPUT'] = input_abs
-            ps_env['RSNI_DOC_OUTPUT'] = output_abs
-            try:
-                completed = subprocess.run(
-                    [
-                        powershell, '-NoLogo', '-NoProfile', '-NonInteractive',
-                        '-ExecutionPolicy', 'Bypass', '-Command', ps_script,
-                    ],
-                    capture_output=True, text=True, timeout=180, check=False,
-                    env=ps_env,
-                )
-                if completed.returncode != 0 or not os.path.isfile(output_abs):
-                    detail = (completed.stderr or completed.stdout or '').strip()
-                    errors.append(
-                        f'PowerShell Microsoft Word (kode '
-                        f'{completed.returncode}): '
-                        f'{detail or "hasil konversi tidak ditemukan"}'
-                    )
-            except Exception as exc:
-                errors.append(f'PowerShell Microsoft Word: {exc}')
-        else:
-            errors.append('Windows PowerShell tidak tersedia')
-
-    if not os.path.isfile(output_abs):
-        office = shutil.which('soffice') or shutil.which('libreoffice')
-        if office:
-            conversion_dir = tempfile.mkdtemp(prefix='doc_conversion_')
-            try:
-                office_profile = os.path.join(conversion_dir, 'office_profile')
-                os.makedirs(office_profile, exist_ok=True)
-                completed = subprocess.run(
-                    [
-                        office,
-                        f'-env:UserInstallation={Path(office_profile).as_uri()}',
-                        '--headless', '--convert-to', 'docx',
-                        '--outdir', conversion_dir, input_abs,
-                    ],
-                    capture_output=True, text=True, timeout=180, check=False,
-                )
-                generated = os.path.join(
-                    conversion_dir,
-                    os.path.splitext(os.path.basename(input_abs))[0] + '.docx',
-                )
-                if completed.returncode == 0 and os.path.isfile(generated):
-                    shutil.move(generated, output_abs)
-                else:
-                    detail = (completed.stderr or completed.stdout or '').strip()
-                    errors.append(
-                        f'LibreOffice (kode {completed.returncode}): '
-                        f'{detail or "hasil konversi tidak ditemukan"}'
-                    )
-            except Exception as exc:
-                errors.append(f'LibreOffice: {exc}')
-            finally:
-                shutil.rmtree(conversion_dir, ignore_errors=True)
-        else:
-            errors.append('LibreOffice/soffice tidak tersedia')
-
-    if not os.path.isfile(output_abs):
-        raise RuntimeError(
-            'File .doc tidak dapat dikonversi ke .docx. '
-            + ' | '.join(errors)
-        )
-
-    try:
-        from docx import Document as _ValidateDocument
-        _ValidateDocument(output_abs)
-    except Exception as exc:
-        try:
-            os.remove(output_abs)
-        except OSError:
-            pass
-        raise RuntimeError(f'Hasil konversi .doc tidak valid: {exc}') from exc
-    return output_abs
 
 # --- IMPORT ENGINE ---
 from engine1 import IntroductionContentTrimmerEngine
@@ -827,32 +587,6 @@ hr {
     border-top: 1px solid rgba(99,102,241,0.12);
 }
 .footer span { color: rgba(255,255,255,0.9); }
-.fast-translation-button {
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    width: auto;
-    min-width: 0;
-    padding: 0.32rem 0.85rem;
-    margin: 0 0 0.6rem;
-    border: 1px solid rgba(129,140,248,0.58);
-    border-radius: 7px;
-    background: linear-gradient(135deg, rgba(99,102,241,0.24), rgba(79,70,229,0.34));
-    color: #ffffff !important;
-    font-size: 0.72rem;
-    font-weight: 700;
-    line-height: 1.15;
-    letter-spacing: 0.2px;
-    text-decoration: none !important;
-    box-shadow: 0 3px 10px rgba(49,46,129,0.22);
-    transition: transform 0.16s ease, border-color 0.16s ease,
-                background 0.16s ease;
-}
-.fast-translation-button:hover {
-    transform: translateY(-1px);
-    border-color: rgba(165,180,252,0.9);
-    background: linear-gradient(135deg, rgba(99,102,241,0.42), rgba(79,70,229,0.55));
-}
 
 /* ══════════════════════════════════════════
    STATUS PILL — di dalam header
@@ -935,9 +669,6 @@ LANG_OPTIONS = {
     "ru": "🇷🇺 Rusia", "ja": "🇯🇵 Jepang", "zh-CN": "🇨🇳 Mandarin",
     "ko": "🇰🇷 Korea", "ar": "🇸🇦 Arab",
 }
-
-# TTL kamus — berapa detik sebelum reload otomatis dari Google Sheet
-_KAMUS_TTL = 1   # 1 detik
 
 _ENGINE_COUNT = 9
 _SNI_SHEET_ID = "1BBPCMPwvbBk5LPdoDQwnjQzcPHv7_RDKENqeMsklF-8"
@@ -1050,43 +781,62 @@ engine1, engine2, engine3, engine4, engine5, engine6, engine7, engine8, engine9 
 # tetap ada ketika proses berjalan maupun ketika pengguna memproses file lagi.
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _refresh_kamus_data(force: bool = False) -> None:
+    """Ambil glosarium hanya saat awal sesi/refresh manual atau tombol Proses.
+
+    Tidak ada timer/fragment berkala. Nilai terakhir yang berhasil dimuat tetap
+    dipakai jika Google Sheet sementara tidak dapat dijangkau.
+    """
+    if not force and st.session_state.get('_kamus_initialized'):
+        return
+    if force:
+        # Tombol Proses harus membaca nilai terkini, bukan cache 30 detik.
+        _count_google_sheet_data_rows.clear()
+
+    try:
+        dictionary = CustomDictionary()
+        dictionary.load_defaults()
+        if len(dictionary) > 0:
+            st.session_state['custom_dict'] = dictionary
+    except Exception:
+        pass
+    try:
+        italic_dictionary = ItalicDictionary()
+        italic_dictionary.load_defaults()
+        if len(italic_dictionary) > 0:
+            st.session_state['italic_dict'] = italic_dictionary
+    except Exception:
+        pass
+    try:
+        st.session_state['kamus_count'] = _count_google_sheet_data_rows(
+            _SNI_SHEET_ID
+        )
+    except Exception:
+        pass
+    try:
+        st.session_state['italic_count'] = _count_google_sheet_data_rows(
+            _FOREIGN_SHEET_ID
+        )
+    except Exception:
+        pass
+    st.session_state['_kamus_initialized'] = True
+    st.session_state['_kamus_loaded_at'] = time.time()
+
+
 def _render_header_with_live_kamus():
     """
     Render kotak informasi pada setiap rerun utama dan pertahankan nilai sukses
     terakhir jika Google Sheet sementara tidak dapat dijangkau.
     """
-    # Fetch langsung dari Google Sheet — tanpa cache
-    _d = CustomDictionary()
-    _d.load_defaults()
-    _i = ItalicDictionary()
-    _i.load_defaults()
-
-    # Statistik dihitung LANGSUNG dari kedua CSV sheet, bukan dari jumlah
-    # istilah yang berhasil diparsing oleh object kamus Engine 8.
-    try:
-        _n = _count_google_sheet_data_rows(_SNI_SHEET_ID)
-    except Exception:
-        _n = None
-    try:
-        _ni = _count_google_sheet_data_rows(_FOREIGN_SHEET_ID)
-    except Exception:
-        _ni = None
-
-    # Simpan ke session_state agar engine lain bisa pakai
-    st.session_state['custom_dict'] = _d
-    if _n is not None:
-        st.session_state['kamus_count'] = _n
-    if _ni is not None:
-        st.session_state['italic_count'] = _ni
-    st.session_state['italic_dict'] = _i
-    st.session_state['_kamus_loaded_at'] = time.time()
+    _refresh_kamus_data(force=False)
+    _d = st.session_state.get('custom_dict')
 
     _status_html = (
         f"""<div class="status-pill status-ready">
             <span class="status-dot"></span>
             Sistem Siap &nbsp;
         </div>"""
-        if len(_d) > 0 else
+        if _d is not None and len(_d) > 0 else
         """<div class="status-pill status-warn">
             <span class="status-dot"></span>
             Kamus Tidak Aktif
@@ -1106,12 +856,12 @@ def _render_header_with_live_kamus():
                 <div class="stat-divider"></div>
                 <div class="stat-item">
                     <div class="stat-num">{st.session_state.get('kamus_count', '—')}</div>
-                    <div class="stat-lbl">Glosarium SNI</div>
+                    <div class="stat-lbl">Kamus SNI</div>
                 </div>
                 <div class="stat-divider"></div>
                 <div class="stat-item">
                     <div class="stat-num">{st.session_state.get('italic_count', '—')}</div>
-                    <div class="stat-lbl">Glosarium Istilah Asing</div>
+                    <div class="stat-lbl">Kamus Istilah Asing</div>
                 </div>
                 <div class="stat-divider"></div>
                 <div class="stat-item">
@@ -1129,43 +879,28 @@ def _render_header_with_live_kamus():
 _render_header_with_live_kamus()
 
 
-@st.fragment(run_every=_KAMUS_TTL)
-def _refresh_header_counts_silently():
-    """Refresh angka tanpa merender atau menghapus kotak header."""
-    try:
-        new_sni = _count_google_sheet_data_rows(_SNI_SHEET_ID)
-        new_foreign = _count_google_sheet_data_rows(_FOREIGN_SHEET_ID)
-    except Exception:
-        return
-    changed = (
-        st.session_state.get('kamus_count') != new_sni
-        or st.session_state.get('italic_count') != new_foreign
-    )
-    if changed:
-        st.session_state['kamus_count'] = new_sni
-        st.session_state['italic_count'] = new_foreign
-        st.rerun()
-
-
-_refresh_header_counts_silently()
-
 # Ambil nilai kamus dari session_state untuk dipakai di bawah
 _kamus = st.session_state.get('custom_dict')
 _count = st.session_state.get('kamus_count', 0)
 _italic_count = st.session_state.get('italic_count', 0)
 
-# Footer dirender sebelum blok proses yang dapat berjalan lama. Karena
+# Footer fixed dirender sebelum blok proses yang dapat berjalan lama. Karena
 # itu footer tetap berada di layar sejak awal rerun sampai proses selesai.
 _FOOTER_HTML = """
 <div class='footer'>
-  <a class='fast-translation-button'
-     href='https://generator-sni.streamlit.app/'
-     target='_blank'
-     rel='noopener noreferrer'>Ganti Mode Terjemahan Cepat</a><br>
+  <div style='margin-bottom:0.55rem;'>
+    <a href='https://generator-sni.streamlit.app/' target='_blank'
+       style='display:inline-block;padding:0.30rem 0.72rem;border:1px solid #6366f1;
+              border-radius:7px;background:linear-gradient(135deg,#312e81,#3730a3);
+              color:#ffffff;text-decoration:none;font-size:0.72rem;font-weight:700;
+              line-height:1.1;box-shadow:0 0 10px rgba(99,102,241,0.22);'>
+      Ganti Mode Terjemahan Cepat
+    </a>
+  </div>
   <span style='font-size:0.85rem;'>
-    <a href='https://docs.google.com/spreadsheets/d/1BBPCMPwvbBk5LPdoDQwnjQzcPHv7_RDKENqeMsklF-8/edit?usp=sharing' target='_blank' style='color:#ffffff;text-decoration:none;'>📖 Glosarium SNI</a>
+    <a href='https://docs.google.com/spreadsheets/d/1BBPCMPwvbBk5LPdoDQwnjQzcPHv7_RDKENqeMsklF-8/edit?usp=sharing' target='_blank' style='color:#ffffff;text-decoration:none;'>📖 Kamus SNI</a>
     &nbsp;&nbsp;·&nbsp;&nbsp;
-    <a href='https://docs.google.com/spreadsheets/d/1NZm1HjsjxmflxnZlzV_O2XF75ZlMUOu8VVofsKfp_FA/edit?usp=sharing' target='_blank' style='color:#ffffff;text-decoration:none;'>🌐 Glosarium Istilah Asing</a><br>
+    <a href='https://docs.google.com/spreadsheets/d/1NZm1HjsjxmflxnZlzV_O2XF75ZlMUOu8VVofsKfp_FA/edit?usp=sharing' target='_blank' style='color:#ffffff;text-decoration:none;'>🌐 Kamus Istilah Asing</a><br>
     <a href='https://iec-to-iso.streamlit.app/' target='_blank' style='color:#ffffff;text-decoration:none;'>📄 IEC to ISO Converter</a>
   </span><br>
   <span style='font-size:0.8rem;color:#ffffff;'>© 2026 Generator RSNI · ISO to RSNI Converter · All rights reserved.</span><br>
@@ -1182,99 +917,12 @@ def _render_footer_once():
     st.markdown(_FOOTER_HTML, unsafe_allow_html=True)
     _footer_rendered_this_run = True
 
-
-# Panel pemulihan untuk ERROR proses apa pun.
-# Tombol selalu tersedia agar error tidak menjadi jalan buntu. Untuk error
-# Engine 9, Lanjutkan meneruskan file hasil Engine 8 langsung ke Engine 9
-# tanpa mengulang Engine 1-8. Untuk error tahap lain, Lanjutkan mengulang
-# proses dari file upload yang tersimpan.
-if st.session_state.get('_process_error_pending'):
-    st.error(st.session_state.get('_process_error_message', 'Terjadi error pada proses.'))
-    _back_col, _continue_col = st.columns(2)
-    with _back_col:
-        if st.button("⬅️ Kembali", key="process_error_back",
-                     use_container_width=True):
-            _cleanup_session_files(st.session_state)
-            for _key in [
-                '_process_error_pending', '_process_error_message',
-                '_process_error_stage', '_engine8_partial_file',
-                '_pending_engine9_out', '_continue_engine9', '_run_process',
-                '_show_results', '_final_opt_file', '_final_tr_file',
-                '_final_time', '_doc_text', '_chat_history', '_doc_sections',
-                '_target_file', '_original_upload_name', '_doc_title',
-                '_ics_number', '_sid', 'upl_main',
-            ]:
-                st.session_state.pop(_key, None)
-            st.rerun()
-    with _continue_col:
-        if st.button("Lanjutkan ➡️", key="process_error_continue",
-                     type="primary", use_container_width=True):
-            _stage = st.session_state.get('_process_error_stage')
-            st.session_state.pop('_process_error_message', None)
-            st.session_state.pop('_process_error_pending', None)
-            if _stage == 'engine9':
-                st.session_state['_continue_engine9'] = True
-                st.session_state['_run_process'] = True
-            else:
-                st.session_state['_run_process'] = True
-            st.rerun()
-    _render_footer_once()
-    st.stop()
-
-# Engine 8 berhenti di sini bila setelah Pemulihan 1 masih ada bagian gagal.
-# Panel ditempatkan sebelum footer sehingga tombol Kembali/Lanjutkan muncul
-# tepat di atas tombol "Ganti Mode Terjemahan Cepat".
-if st.session_state.get('_translation_review_pending'):
-    _failed_count = int(st.session_state.get('_translation_failed_count', 0))
-    if st.session_state.get('_engine9_continue_error'):
-        st.error(st.session_state['_engine9_continue_error'])
-    st.warning(
-        f"⚠️ {_failed_count} bagian belum berhasil diterjemahkan setelah "
-        "Pemulihan 1. Bagian tersebut tetap berbahasa Inggris dan ditandai "
-        "dengan font merah."
-    )
-    _back_col, _continue_col = st.columns(2)
-    with _back_col:
-        if st.button("⬅️ Kembali", key="translation_review_back",
-                     use_container_width=True):
-            # File proses sesi dibersihkan, tetapi cache terjemahan SQLite
-            # sengaja tidak disentuh agar tetap dapat digunakan berikutnya.
-            _cleanup_session_files(st.session_state)
-            for _key in [
-                '_translation_review_pending', '_translation_failed_count',
-                '_engine9_continue_error',
-                '_completed_with_translation_warning',
-                '_continue_engine9', '_engine8_partial_file',
-                '_engine8_partial_bytes', '_pending_engine9_out', '_run_process', '_show_results',
-                '_final_opt_file', '_final_tr_file', '_final_time',
-                '_doc_text', '_chat_history', '_doc_sections', '_target_file',
-                '_original_upload_name', '_doc_title', '_ics_number',
-                '_sid', 'upl_main',
-            ]:
-                st.session_state.pop(_key, None)
-            st.rerun()
-    with _continue_col:
-        if st.button("Lanjutkan ➡️", key="translation_review_continue",
-                     type="primary", use_container_width=True):
-            st.session_state.pop('_engine9_continue_error', None)
-            st.session_state['_translation_review_pending'] = False
-            st.session_state['_continue_engine9'] = True
-            st.session_state['_run_process'] = True
-            st.rerun()
-    _render_footer_once()
-    st.stop()
-
 import datetime
 _tahun = str(datetime.date.today().year)
 
 # --- FORM INPUT ---
 st.markdown('<div class="section-label">📂 Upload Dokumen ISO</div>', unsafe_allow_html=True)
-uploaded_file = st.file_uploader(
-    "Upload file .doc atau .docx di sini atau klik Browse",
-    type=["doc", "docx"],
-    key="upl_main",
-    label_visibility="collapsed",
-)
+uploaded_file = st.file_uploader("Upload file .docx di sini atau klik Browse", type=["docx"], key="upl_main", label_visibility="collapsed")
 
 st.markdown('<div class="section-label">⚙️ Pengaturan</div>', unsafe_allow_html=True)
 col_set1, col_set2 = st.columns([2, 3])
@@ -1291,6 +939,40 @@ with col_set2:
 # --- TOMBOL PROSES ---
 btn_process = st.button("🚀 Proses", key="btn_main", use_container_width=True)
 
+# Saat error, ketiga tombol kecil tampil setelah tombol Proses dan tepat di
+# atas tombol "Ganti Mode Terjemahan Cepat" yang berada di dalam footer.
+if st.session_state.get('_process_error'):
+    st.error(st.session_state['_process_error'])
+    _last_path = st.session_state.get('_last_output')
+    _last_engine = int(st.session_state.get('_last_engine', 0) or 0)
+    _back_col, _download_col, _continue_col = st.columns(3)
+    with _back_col:
+        if st.button('↩ Kembali', key='error_back', use_container_width=True):
+            _reset_to_start()
+            st.rerun()
+    with _download_col:
+        if _last_path and os.path.isfile(_last_path):
+            with open(_last_path, 'rb') as _last_file:
+                st.download_button(
+                    '⬇ Download', data=_last_file,
+                    file_name=f'Hasil_Engine{_last_engine}.docx',
+                    key='error_download', use_container_width=True,
+                )
+        else:
+            st.button('⬇ Download', key='error_download_disabled',
+                      disabled=True, use_container_width=True)
+    with _continue_col:
+        if st.button('▶ Lanjutkan', key='error_continue',
+                     disabled=not (_last_path and os.path.isfile(_last_path)),
+                     use_container_width=True):
+            st.session_state['_target_file'] = _last_path
+            st.session_state['_resume_engine'] = min(_last_engine + 1, 9)
+            st.session_state['_force_continue'] = True
+            st.session_state['_forced_errors'] = []
+            st.session_state['_run_process'] = True
+            st.session_state.pop('_process_error', None)
+            st.rerun()
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # LOGIC EXECUTION
@@ -1298,42 +980,155 @@ btn_process = st.button("🚀 Proses", key="btn_main", use_container_width=True)
 
 if btn_process:
     if uploaded_file:
-        # ID unik per sesi browser — mencegah tabrakan nama file saat beberapa
-        # pengguna mengakses aplikasi secara bersamaan (satu proses melayani
-        # banyak sesi di Streamlit Community Cloud).
-        _sid = st.session_state.setdefault('_sid', uuid.uuid4().hex[:8])
-        uploaded_name = os.path.basename(uploaded_file.name)
-        uploaded_ext = os.path.splitext(uploaded_name)[1].lower()
-        uploaded_path = f"temp_main_{_sid}_{uploaded_name}"
-        with open(uploaded_path, "wb") as f:
-            f.write(uploaded_file.getbuffer())
-
         try:
-            if uploaded_ext == '.doc':
-                target_file = os.path.splitext(uploaded_path)[0] + '.docx'
-                _convert_legacy_doc_to_docx(uploaded_path, target_file)
-                try:
-                    os.remove(uploaded_path)
-                except OSError:
-                    pass
-            elif uploaded_ext == '.docx':
-                target_file = uploaded_path
-            else:
-                raise ValueError('Format file harus .doc atau .docx.')
+            st.session_state.pop('_process_error', None)
+            st.session_state.pop('_last_engine', None)
+            st.session_state.pop('_last_output', None)
+            st.session_state.pop('_force_continue', None)
+            st.session_state.pop('_forced_errors', None)
+            st.session_state.pop('_forced_summary', None)
+            # Satu-satunya refresh otomatis setelah halaman terbuka: saat
+            # pengguna secara eksplisit menekan Proses.
+            _refresh_kamus_data(force=True)
+            # ID unik per sesi browser — mencegah tabrakan nama file saat
+            # beberapa pengguna mengakses aplikasi secara bersamaan.
+            _sid = st.session_state.setdefault('_sid', uuid.uuid4().hex[:8])
+            target_file = f"temp_main_{_sid}_{uploaded_file.name}"
+            with open(target_file, "wb") as f:
+                f.write(uploaded_file.getbuffer())
 
             st.session_state['_run_process'] = True
             st.session_state['_target_file'] = target_file
-            st.session_state['_original_upload_name'] = uploaded_name
             st.session_state['_doc_title'] = doc_title
             st.session_state['_ics_number'] = ics_number
             st.rerun()
-        except Exception as exc:
+        except Exception as upload_error:
+            # Bahkan kegagalan sebelum Engine 1 tetap masuk ke UI recovery.
+            st.session_state['_process_error'] = (
+                f'❌ Error menyiapkan proses: {upload_error}'
+            )
             st.session_state['_run_process'] = False
-            st.session_state.pop('_target_file', None)
-            st.error(f'❌ Gagal membaca file unggahan: {exc}')
+            st.rerun()
     else:
         st.warning("Silakan upload file terlebih dahulu.")
 
+
+# Jalur "Lanjutkan": mulai persis dari engine setelah output terakhir dan
+# teruskan sampai Engine 9. Dalam mode paksa, engine yang error dicatat lalu
+# otomatis di-skip; input berikutnya tetap output terakhir yang valid.
+if (st.session_state.get('_run_process') and
+        st.session_state.get('_target_file') and
+        int(st.session_state.get('_resume_engine', 1) or 1) > 1):
+    _resume = int(st.session_state['_resume_engine'])
+    _resume_input = st.session_state['_target_file']
+    _sid = st.session_state.setdefault('_sid', uuid.uuid4().hex[:8])
+    _base_name = os.path.basename(_resume_input)
+    # Buang seluruh prefix engine terdahulu agar nama tetap pendek.
+    _base_name = re.sub(r'^(?:engine\d+_[0-9a-f]{8}_)+', '', _base_name)
+    _resume_output = f'engine{_resume}_{_sid}_{_base_name}'
+    _sni = st.session_state.get('_doc_title', 'SNI ISO XXXXX-X:XXXX')
+    _ics = st.session_state.get('_ics_number', 'XX.XXX.XX')
+    try:
+        if _resume == 2:
+            _ok, _msg = engine2.process(
+                input_docx=_resume_input, output_docx=_resume_output,
+                sni_number=_sni, ics_number=_ics,
+            )
+        elif _resume == 3:
+            _ok, _unused, _msg = engine3.process(_resume_input, _resume_output, _sni)
+        elif _resume == 4:
+            _ok, _unused, _msg = engine4.process(
+                input_docx=_resume_input, output_docx=_resume_output,
+                sni_number=_sni, bsn_year=_tahun,
+            )
+        elif _resume == 5:
+            _ok, _unused, _msg = engine5.process(_resume_input, _resume_output)
+        elif _resume == 6:
+            _ok, _unused, _msg = engine6.process(_resume_input, _resume_output)
+        elif _resume == 7:
+            _ok, _unused, _msg = engine7.process(
+                input_docx=_resume_input, output_docx=_resume_output,
+                sni_number=_sni,
+            )
+        elif _resume == 8:
+            _ok, _unused, _msg = engine8.process(_resume_input, _resume_output)
+        elif _resume == 9:
+            _ok, _unused, _msg = engine9.process(_resume_input, _resume_output)
+        else:
+            raise ValueError(f'Nomor engine lanjutan tidak valid: {_resume}')
+        if not _ok:
+            # Engine 8 sengaja menyimpan dokumen parsial yang valid sebelum
+            # mengembalikan status gagal. Pakai file itu untuk Engine 9.
+            if _resume == 8 and os.path.isfile(_resume_output):
+                _remember_engine_output(8, _resume_output)
+                st.session_state['_target_file'] = _resume_output
+            raise RuntimeError(_msg)
+        _remember_engine_output(_resume, _resume_output)
+        st.session_state['_target_file'] = _resume_output
+        if _resume < 9:
+            st.session_state['_resume_engine'] = _resume + 1
+            st.rerun()
+        else:
+            st.session_state['_final_opt_file'] = _resume_output
+            st.session_state['_final_engine'] = 9
+            st.session_state['_final_time'] = 'proses lanjutan'
+            st.session_state['_show_results'] = True
+            st.session_state['_run_process'] = False
+            _skipped = st.session_state.get('_forced_errors', [])
+            if _skipped:
+                _numbers = ', '.join(str(item['engine']) for item in _skipped)
+                st.session_state['_forced_summary'] = (
+                    f'Mode paksa selesai. Engine yang dilewati karena error: '
+                    f'{_numbers}.'
+                )
+            st.session_state.pop('_resume_engine', None)
+            st.session_state.pop('_force_continue', None)
+            st.rerun()
+    except Exception as _resume_error:
+        if st.session_state.get('_force_continue'):
+            _errors = st.session_state.setdefault('_forced_errors', [])
+            _errors.append({
+                'engine': _resume,
+                'message': str(_resume_error)[:1000],
+            })
+            st.session_state.pop('_process_error', None)
+            if _resume < 9:
+                # Jangan mengganti _target_file: engine sesudahnya memakai
+                # output valid terakhir, bukan output engine yang gagal.
+                st.session_state['_resume_engine'] = _resume + 1
+                st.session_state['_run_process'] = True
+                st.rerun()
+            else:
+                # Engine 9 juga gagal: mode paksa tetap selesai dan menyediakan
+                # dokumen terakhir yang valid untuk diunduh.
+                _last_valid = st.session_state.get('_last_output')
+                _last_no = int(st.session_state.get('_last_engine', 0) or 0)
+                if _last_valid and os.path.isfile(_last_valid):
+                    st.session_state['_final_opt_file'] = _last_valid
+                    st.session_state['_final_engine'] = _last_no
+                    st.session_state['_final_time'] = 'mode paksa selesai'
+                    st.session_state['_show_results'] = True
+                    _numbers = ', '.join(
+                        str(item['engine']) for item in _errors
+                    )
+                    st.session_state['_forced_summary'] = (
+                        'Semua step lanjutan sudah dicoba. Engine yang '
+                        f'dilewati karena error: {_numbers}. File yang tersedia '
+                        f'adalah output terakhir Engine {_last_no}.'
+                    )
+                    st.session_state['_run_process'] = False
+                    st.session_state.pop('_resume_engine', None)
+                    st.session_state.pop('_force_continue', None)
+                    st.rerun()
+        # Fallback bila mode paksa tidak aktif atau tidak ada output valid.
+        st.session_state['_process_error'] = (
+            f'❌ Error Proses Engine {_resume}: {_resume_error}'
+        )
+        st.session_state['_run_process'] = False
+        st.session_state.pop('_resume_engine', None)
+        st.session_state.pop('_force_continue', None)
+        st.rerun()
+    st.stop()
 
 if st.session_state.get('_run_process') and st.session_state.get('_target_file'):
     target_file = st.session_state['_target_file']
@@ -1490,59 +1285,6 @@ if st.session_state.get('_run_process') and st.session_state.get('_target_file')
 
         return final_file
 
-    # Rerun khusus setelah pengguna memilih "Lanjutkan". Engine 1–8 tidak
-    # dijalankan ulang; dokumen parsial Engine 8 langsung diteruskan ke Engine 9.
-    if st.session_state.get('_continue_engine9'):
-        partial_file, engine9_out = _restore_engine8_checkpoint(st.session_state)
-        if (not partial_file or not os.path.isfile(partial_file)
-                or not engine9_out):
-            st.session_state['_engine9_continue_error'] = (
-                'Checkpoint Engine 8 tidak tersedia dan tidak dapat dipulihkan. '
-                'Gunakan Kembali hanya jika ingin memulai dokumen baru.'
-            )
-            st.session_state['_translation_review_pending'] = True
-            st.session_state['_continue_engine9'] = False
-            st.session_state['_run_process'] = False
-            st.rerun()
-        try:
-            update_ui(
-                98,
-                "Melanjutkan dengan bagian gagal berwarna merah...\n"
-                "Menjalankan Engine 9 dan memperbarui daftar isi.",
-            )
-            ok_e9, _path_e9, msg_e9 = _run_engine9_verified(
-                engine9, partial_file, engine9_out
-            )
-            if not ok_e9:
-                raise Exception(f"Engine 9: {msg_e9}")
-            update_ui(99, f"Menyimpan dokumen final...\n{msg_e9}")
-            final_elapsed = get_elapsed_str(start_time)
-            update_ui(100, "✅ Engine 9 selesai dengan peringatan translasi!")
-            time_placeholder.markdown(
-                f'<div class="timer-text">⏱ {final_elapsed}</div>',
-                unsafe_allow_html=True,
-            )
-            st.session_state['_final_opt_file'] = engine9_out
-            st.session_state.pop('_final_tr_file', None)
-            st.session_state['_final_time'] = final_elapsed
-            st.session_state['_show_results'] = True
-            st.session_state['_completed_with_translation_warning'] = True
-            st.session_state['_doc_sections'] = _parse_doc_structure(
-                engine9_out
-            )
-            st.session_state['_run_process'] = False
-            st.session_state['_continue_engine9'] = False
-            st.session_state['_translation_review_pending'] = False
-            st.rerun()
-        except Exception as exc:
-            st.session_state['_engine9_continue_error'] = (
-                f'Gagal melanjutkan ke Engine 9: {exc}'
-            )
-            st.session_state['_translation_review_pending'] = True
-            st.session_state['_continue_engine9'] = False
-            st.session_state['_run_process'] = False
-            st.rerun()
-
     try:
         # MODE ENGINE 1 → ENGINE 2 → ENGINE 3 → ENGINE 4 → ENGINE 5 →
         # ENGINE 6 → ENGINE 7 → ENGINE 8 → ENGINE 9.
@@ -1557,6 +1299,7 @@ if st.session_state.get('_run_process') and st.session_state.get('_target_file')
         ok_e1, msg_e1 = engine1.process(target_file, engine1_out)
         if not ok_e1:
             raise Exception(f"Engine 1: {msg_e1}")
+        _remember_engine_output(1, engine1_out)
 
         update_ui(2, f"Struktur awal selesai ✓\n{msg_e1}")
 
@@ -1570,6 +1313,7 @@ if st.session_state.get('_run_process') and st.session_state.get('_target_file')
         )
         if not ok_e2:
             raise Exception(f"Engine 2: {msg_e2}")
+        _remember_engine_output(2, engine2_out)
 
         update_ui(3, f"Cover dan copyright selesai ✓\n{msg_e2}")
 
@@ -1582,6 +1326,7 @@ if st.session_state.get('_run_process') and st.session_state.get('_target_file')
         )
         if not ok_e3:
             raise Exception(f"Engine 3: {msg_e3}")
+        _remember_engine_output(3, engine3_out)
 
         update_ui(4, f"Daftar isi selesai ✓\n{msg_e3}")
 
@@ -1595,6 +1340,7 @@ if st.session_state.get('_run_process') and st.session_state.get('_target_file')
         )
         if not ok_e4:
             raise Exception(f"Engine 4: {msg_e4}")
+        _remember_engine_output(4, engine4_out)
 
         update_ui(5, f"Prakata selesai ✓\n{msg_e4}")
 
@@ -1606,6 +1352,7 @@ if st.session_state.get('_run_process') and st.session_state.get('_target_file')
         )
         if not ok_e5:
             raise Exception(f"Engine 5: {msg_e5}")
+        _remember_engine_output(5, engine5_out)
 
         update_ui(7, f"Salinan dokumen selesai ✓\n{msg_e5}")
 
@@ -1617,6 +1364,7 @@ if st.session_state.get('_run_process') and st.session_state.get('_target_file')
         )
         if not ok_e6:
             raise Exception(f"Engine 6: {msg_e6}")
+        _remember_engine_output(6, engine6_out)
 
         update_ui(8, f"Informasi pendukung selesai ✓\n{msg_e6}")
 
@@ -1629,77 +1377,29 @@ if st.session_state.get('_run_process') and st.session_state.get('_target_file')
         )
         if not ok_e7:
             raise Exception(f"Engine 7: {msg_e7}")
+        _remember_engine_output(7, engine7_out)
 
         update_ui(10, f"Format dasar selesai ✓\n{msg_e7}")
 
-        engine8_out = os.path.abspath(f"engine8_{_sid}_{original_name}")
+        engine8_out = f"engine8_{_sid}_{original_name}"
         update_ui(10, "Memulai penerjemahan dokumen...")
         _engine8_progress_state = {'pct': 10}
 
         def _engine8_progress(pct, msg):
-            message = msg or ''
-            # Pemulihan mempunyai counter sendiri (1/1). Deteksi tahap
-            # ini SEBELUM counter translasi agar 1/3 tidak salah dipetakan ke
-            # rentang 10–80%. Setiap putaran pemulihan mempunyai rentang
-            # tersendiri hingga batas akhir 98%.
-            recovery = re.search(
-                r'\[pemulihan\s+(\d+)\s*/\s*(\d+)\]',
-                message, re.IGNORECASE,
-            )
-            recovery_items = re.search(
-                r'\[pemulihan\s+\d+\s*/\s*\d+\]\s*'
-                r'(\d+)\s*/\s*(\d+)',
-                message, re.IGNORECASE,
-            )
-            translation = re.search(
-                r'\[(?:translate(?:\s+paralel)?|pra-scan)\][^\n]*?'
-                r'(?<!\d)(\d+)\s*/\s*(\d+)(?!\d)',
-                message, re.IGNORECASE,
-            )
-
-            if recovery and int(recovery.group(2)) > 0:
-                recovery_no = max(1, int(recovery.group(1)))
-                recovery_total = max(1, int(recovery.group(2)))
-                recovery_no = min(recovery_no, recovery_total)
-                if recovery_items and int(recovery_items.group(2)) > 0:
-                    item_ratio = min(
-                        int(recovery_items.group(1)) /
-                        int(recovery_items.group(2)), 1.0
-                    )
-                else:
-                    item_ratio = 0.0
-                recovery_ranges = {1: (80, 98)}
-                range_start, range_end = recovery_ranges.get(1, (80, 98))
-                calculated_pct = min(
-                    range_start
-                    + int(item_ratio * (range_end - range_start)),
-                    range_end,
-                )
-            elif translation and int(translation.group(2)) > 0:
-                # Progres riil xx/XXX menguasai tepat rentang 10–80%.
-                ratio = min(
-                    int(translation.group(1)) /
-                    int(translation.group(2)), 1.0
-                )
-                calculated_pct = min(10 + int(ratio * 70), 80)
-            elif pct >= 90:
-                # Sinkronisasi judul dan penyimpanan Engine 8 berada setelah
-                # translasi/pemulihan, tetapi tidak boleh melewati 98% karena
-                # 98–100% disediakan untuk Engine 9 dan finalisasi aplikasi.
-                calculated_pct = 98
+            # Utamakan progres riil xx/yyy dari callback Engine 8. Jika pesan
+            # belum memiliki counter (pemuatan kamus/inisialisasi), gunakan
+            # persentase internal sebagai fallback.
+            match = re.search(r'(?<!\d)(\d+)\s*/\s*(\d+)(?!\d)', msg or '')
+            if match and int(match.group(2)) > 0:
+                ratio = min(int(match.group(1)) / int(match.group(2)), 1.0)
             else:
-                # Pemuatan kamus/inisialisasi tetap di titik awal 10%.
-                calculated_pct = 10
-
-            # Callback paralel dapat selesai tidak berurutan; progress UI harus
-            # monoton dan tidak boleh mundur.
+                ratio = max(0, min(pct, 100)) / 100.0
+            calculated_pct = min(10 + int(ratio * 88), 98)
+            # Jangan biarkan fase sinkronisasi/penyimpanan setelah 100% antrean
+            # membuat progress bar mundur karena pesannya tidak punya xx/yyy.
             mapped_pct = max(_engine8_progress_state['pct'], calculated_pct)
             _engine8_progress_state['pct'] = mapped_pct
-            phase = (
-                "Memulihkan bagian terjemahan..."
-                if recovery else "Menerjemahkan dokumen..."
-            )
-            update_ui(mapped_pct, f"{phase}\n{message}")
+            update_ui(mapped_pct, f"Menerjemahkan dokumen...\n{msg}")
 
         ok_e8, _path_e8, msg_e8 = engine8.process(
             input_docx=engine7_out,
@@ -1707,53 +1407,21 @@ if st.session_state.get('_run_process') and st.session_state.get('_target_file')
             progress_callback=_engine8_progress,
         )
         if not ok_e8:
+            _remember_engine_output(8, engine8_out)
             raise Exception(f"Engine 8: {msg_e8}")
-
-        engine9_out = os.path.abspath(f"engine9_{_sid}_{original_name}")
-        review_required = (
-            bool(getattr(engine8, 'needs_review', False))
-            or str(msg_e8).startswith('TRANSLATION_REVIEW_REQUIRED:')
-        )
-        if review_required:
-            failed_count = int(getattr(engine8, 'failed_count', 0) or 0)
-            if not failed_count:
-                marker = re.search(r':(\d+)', str(msg_e8))
-                failed_count = int(marker.group(1)) if marker else 0
-            _store_engine8_checkpoint(engine8_out, engine9_out, st.session_state)
-            st.session_state['_translation_failed_count'] = failed_count
-            st.session_state['_translation_review_pending'] = True
-            st.session_state['_continue_engine9'] = False
-            st.session_state['_run_process'] = False
-            st.session_state['_show_results'] = False
-            update_ui(
-                98,
-                "Pemulihan selesai dengan bagian gagal.\n"
-                f"{failed_count} bagian dipertahankan dalam bahasa Inggris "
-                "dan diberi warna merah.",
-            )
-            st.rerun()
+        _remember_engine_output(8, engine8_out)
 
         update_ui(98, f"Penerjemahan selesai ✓\n{msg_e8}")
 
+        engine9_out = f"engine9_{_sid}_{original_name}"
         update_ui(98, "Menerapkan style final dan daftar isi...")
-        try:
-            ok_e9, _path_e9, msg_e9 = _run_engine9_verified(
-                engine9, engine8_out, engine9_out
-            )
-            if not ok_e9:
-                raise Exception(f"Engine 9: {msg_e9}")
-        except Exception as _engine9_exc:
-            # Simpan checkpoint Engine 8 agar tombol Lanjutkan benar-benar
-            # meneruskan ke Engine 9 tanpa mengulang Engine 1-8.
-            _store_engine8_checkpoint(engine8_out, engine9_out, st.session_state)
-            st.session_state['_process_error_stage'] = 'engine9'
-            st.session_state['_process_error_message'] = (
-                f"Gagal melanjutkan ke Engine 9: {_engine9_exc}"
-            )
-            st.session_state['_process_error_pending'] = True
-            st.session_state['_run_process'] = False
-            st.session_state['_show_results'] = False
-            st.rerun()
+        ok_e9, _path_e9, msg_e9 = engine9.process(
+            input_docx=engine8_out,
+            output_docx=engine9_out,
+        )
+        if not ok_e9:
+            raise Exception(f"Engine 9: {msg_e9}")
+        _remember_engine_output(9, engine9_out)
 
         update_ui(99, f"Menyimpan dokumen final...\n{msg_e9}")
         final_elapsed = get_elapsed_str(start_time)
@@ -1763,18 +1431,14 @@ if st.session_state.get('_run_process') and st.session_state.get('_target_file')
             unsafe_allow_html=True
         )
         st.session_state['_final_opt_file'] = engine9_out
+        st.session_state['_final_engine'] = 9
         st.session_state.pop('_final_tr_file', None)
         st.session_state['_final_time'] = final_elapsed
         st.session_state['_show_results'] = True
-        st.session_state['_completed_with_translation_warning'] = False
         st.session_state['_doc_sections'] = _parse_doc_structure(engine9_out)
 
     except Exception as e:
-        # Error di tahap lain tetap menyediakan Kembali/Lanjutkan.
-        # Lanjutkan akan mengulang proses dari file upload yang tersimpan.
-        st.session_state['_process_error_message'] = f"❌ Error Proses: {e}"
-        st.session_state['_process_error_stage'] = 'restart'
-        st.session_state['_process_error_pending'] = True
+        st.session_state['_process_error'] = f"❌ Error Proses: {e}"
         st.session_state['_run_process'] = False
         st.session_state['_show_results'] = False
         st.rerun()
@@ -1798,19 +1462,19 @@ if st.session_state.get('_show_results'):
         </div>""",
         unsafe_allow_html=True
     )
-    if st.session_state.get('_completed_with_translation_warning'):
-        st.warning(
-            "Dokumen dilanjutkan atas pilihan pengguna. Bagian yang gagal "
-            "diterjemahkan tetap berbahasa Inggris dan berwarna merah."
-        )
+
+    forced_summary = st.session_state.get('_forced_summary')
+    if forced_summary:
+        st.warning(forced_summary)
 
     opt_file = st.session_state.get('_final_opt_file')
+    final_engine = int(st.session_state.get('_final_engine', 9) or 9)
     if opt_file and os.path.exists(opt_file):
         with open(opt_file, "rb") as f:
             st.download_button(
-                label="📄 Download RSNI",
+                label=f"📄 Download RSNI",
                 data=f,
-                file_name="Hasil_Engine9.docx",
+                file_name=f"Hasil_Engine{final_engine}.docx",
                 use_container_width=True
             )
 
@@ -1818,13 +1482,9 @@ if st.session_state.get('_show_results'):
     if st.button("🔄 Proses File Baru", key="reset", use_container_width=True):
         # Hapus file sesi ini segera sebelum reset
         _cleanup_session_files(st.session_state)
-        for k in ['_show_results', '_final_opt_file', '_final_tr_file', '_final_time', '_run_process',
-                  '_doc_text', '_chat_history', '_doc_sections', '_target_file',
-                  '_translation_review_pending', '_translation_failed_count',
-                  '_continue_engine9', '_engine8_partial_file',
-                  '_engine8_partial_bytes', '_pending_engine9_out', '_engine9_continue_error',
-                  '_process_error_pending', '_process_error_message',
-                  '_process_error_stage', '_completed_with_translation_warning']:
+        for k in ['_show_results', '_final_opt_file', '_final_tr_file', '_final_time',
+                  '_final_engine', '_forced_summary', '_forced_errors', '_force_continue',
+                  '_run_process', '_doc_text', '_chat_history', '_doc_sections', '_target_file']:
             if k in st.session_state: del st.session_state[k]
         st.rerun()
 
