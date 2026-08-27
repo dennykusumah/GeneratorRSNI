@@ -298,7 +298,6 @@ class InfoPendukungEngine:
     """
 
     HEADING = 'Informasi pendukung terkait perumus standar'
-    DUPLICATE_MARKER = 'Engine5DuplicateStart'
 
     @staticmethod
     def _normalize(text: str) -> str:
@@ -326,19 +325,11 @@ class InfoPendukungEngine:
                 f'ditemukan {len(doc.sections)}.'
             )
         bibliography = next(
-            (
-                p for p in doc.paragraphs
-                if cls._normalize(p.text).casefold() == 'bibliography'
-                and cls._section_number(p) >= 4
-            ),
+            (p for p in doc.paragraphs if cls._normalize(p.text).casefold() == 'bibliography'),
             None,
         )
-        marker_found = any(
-            item.get(qn('w:name')) == cls.DUPLICATE_MARKER
-            for item in doc.element.xpath('.//w:bookmarkStart')
-        )
-        if not marker_found:
-            raise ValueError('Bookmark keluaran Engine 5 tidak ditemukan.')
+        if bibliography is None or cls._section_number(bibliography) < 4:
+            raise ValueError('Bibliography tidak ditemukan pada area Content.')
         return doc
 
     @classmethod
@@ -356,13 +347,15 @@ class InfoPendukungEngine:
         if heading is None or cls._section_number(heading) != len(doc.sections):
             raise RuntimeError('Heading informasi perumus SNI tidak berada di section terakhir.')
         bibliography = next(
-            (
-                p for p in doc.paragraphs
-                if cls._normalize(p.text).casefold() == 'bibliography'
-                and 4 <= cls._section_number(p) < len(doc.sections)
-            ),
+            (p for p in doc.paragraphs if cls._normalize(p.text).casefold() == 'bibliography'),
             None,
         )
+        if (
+            bibliography is None
+            or cls._section_number(bibliography) < 4
+            or cls._section_number(bibliography) >= len(doc.sections)
+        ):
+            raise RuntimeError('Posisi Bibliography pada area Content berubah.')
         return doc
 
     def build_perumus_only(
@@ -684,8 +677,8 @@ class InfoPendukungEngine:
         return (
             True,
             result,
-            'Informasi perumus SNI berhasil disisipkan setelah Content atau '
-            'Bibliography sebagai section terakhir.',
+            'Informasi perumus SNI berhasil disisipkan setelah Bibliography '
+            'sebagai section terakhir.',
         )
 
 
