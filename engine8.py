@@ -371,7 +371,7 @@ def _skip_paragraph(para, past_bibliography: bool = False) -> bool:
     if _get_para_style_id(para) in _NO_TRANSLATE_STYLE_IDS: return True
     for tag in [f'{_W}drawing', f'{_W}pict']:
         if para._element.find('.//' + tag) is not None: return True
-    style_name = (para.style.name or '').lower()
+    style_name = (para.style.name or '').lower() if para.style is not None else ''
     if any(style_name.startswith(s) for s in _SKIP_STYLES): return True
     return False
 
@@ -1048,6 +1048,27 @@ def _normalize_all_clause_heading_spacing(doc: Document) -> None:
                     _normalize_clause_heading_spacing(para)
 
 
+def _mark_untranslated_paragraph_red(para) -> None:
+    """Warnai teks sumber yang gagal diterjemahkan tanpa merusak format run.
+
+    Operasi dilakukan langsung pada ``w:rPr`` sehingga bold, italic,
+    superscript, subscript, ukuran font, dan struktur tabel tetap utuh.
+    """
+    for run_element in para._element.iter(qn('w:r')):
+        # Run tanpa teks (misalnya hanya drawing/field) tidak perlu diwarnai.
+        if not any((node.text or '') for node in run_element.iter(qn('w:t'))):
+            continue
+        run_properties = run_element.find(qn('w:rPr'))
+        if run_properties is None:
+            run_properties = OxmlElement('w:rPr')
+            run_element.insert(0, run_properties)
+        for old_color in list(run_properties.findall(qn('w:color'))):
+            run_properties.remove(old_color)
+        color = OxmlElement('w:color')
+        color.set(qn('w:val'), 'FF0000')
+        run_properties.append(color)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # BIBLIOGRAFI & AUTONUMBERING
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1452,12 +1473,17 @@ def _sync_body_title(doc: Document, cover_id: str) -> bool:
     for i, p in enumerate(paras):
         if sect_idx == -1 and _has_inline_sectpr(p): sect_idx = i
         txt = p.text.strip()
-        if txt and _RE_H1.match(txt) and 'heading' in (p.style.name or '').lower(): h1_idx = i; break
+        style_name = (p.style.name or '').lower() if p.style is not None else ''
+        if txt and _RE_H1.match(txt) and 'heading' in style_name: h1_idx = i; break
     start = sect_idx + 1 if sect_idx != -1 else 0
     end = h1_idx if h1_idx != -1 else start + 20
     if end > len(paras): end = len(paras)
     for i in range(start, end):
-        if (paras[i].style.name or '').lower().strip() in _BODY_TITLE_STYLES and paras[i].text.strip():
+        style_name = (
+            (paras[i].style.name or '').lower().strip()
+            if paras[i].style is not None else ''
+        )
+        if style_name in _BODY_TITLE_STYLES and paras[i].text.strip():
             _replace_para_text(paras[i], cover_id); return True
     for i in range(start, end):
         txt = paras[i].text.strip()
@@ -1520,7 +1546,8 @@ def _translation_targets(doc: Document) -> tuple[set, set]:
 
     Zona mengikuti kontrak keluaran Engine 5--7:
     - Cover: hanya judul Indonesia paling atas (bold, >= 16 pt, non-italic).
-    - Section 3: hanya heading dan seluruh isi Introduction.
+    - Section 3: heading dan seluruh isi Introduction jika bagian itu tersedia.
+      Standar yang langsung dimulai dari Content (mis. CISPR 32) tetap valid.
     - Area Content asli: seluruh elemen sebelum bookmark duplikasi Engine 5,
       kecuali paragraf style ``RefNorm``.
     - Bibliography: hanya heading-nya.
@@ -1596,12 +1623,10 @@ def _translation_targets(doc: Document) -> tuple[set, set]:
 
     if not cover_title_found:
         raise ValueError('Judul atas Cover tidak ditemukan.')
-    if not any(
-        re.sub(r'\s+', ' ', para_map[el].text or '').strip().casefold()
-        == 'introduction'
-        for el in para_targets if el in para_map
-    ):
-        raise ValueError('Heading Introduction pada section 3 tidak ditemukan.')
+    # Introduction memang opsional. Engine 1--4 secara sah menghasilkan front
+    # matter tanpa Introduction untuk standar yang langsung dimulai dari pasal
+    # Content, misalnya CISPR 32. Dalam kasus itu target section 3 cukup kosong
+    # dan penerjemahan tetap dilanjutkan ke area Content pada section 4+.
     if not duplicate_started:
         raise ValueError(
             'Bookmark Engine5DuplicateStart tidak ditemukan; output Engine 5 '
@@ -1782,6 +1807,8 @@ class DocxFinalTranslatorEngine:
                 re.sub(r'\s+', ' ', para.text or '').strip()[:100]
                 for para in still_failed
             ]
+            for para in still_failed:
+                _mark_untranslated_paragraph_red(para)
 
             # Tidak menjalankan formatting global di sini. Dengan demikian
             # Copyright, Daftar isi, salinan Engine 5, Bibliography entries,
@@ -1804,7 +1831,8 @@ class DocxFinalTranslatorEngine:
                 return False, (
                     f"{len(still_failed)} bagian masih belum berhasil "
                     "diterjemahkan setelah pemulihan 1 worker. Dokumen parsial "
-                    "Engine 8 sudah disimpan dan dapat di-download atau "
+                    "Engine 8 sudah disimpan; teks sumber yang gagal diberi "
+                    "font merah dan dapat di-download atau "
                     "dipaksa lanjut ke Engine 9."
                 )
             
