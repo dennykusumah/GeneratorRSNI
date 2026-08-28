@@ -1026,7 +1026,7 @@ if st.session_state.get('_process_error'):
         if _last_path and os.path.isfile(_last_path):
             with open(_last_path, 'rb') as _last_file:
                 st.download_button(
-                    '⬇ Download Hasil Engine {final_engine}', data=_last_file,
+                    '⬇ Download', data=_last_file,
                     file_name=f'Hasil_Engine{_last_engine}.docx',
                     key='error_download', use_container_width=True,
                 )
