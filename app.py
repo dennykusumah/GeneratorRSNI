@@ -971,7 +971,6 @@ _FOOTER_HTML = """
     <a href='https://docs.google.com/spreadsheets/d/1BBPCMPwvbBk5LPdoDQwnjQzcPHv7_RDKENqeMsklF-8/edit?usp=sharing' target='_blank' style='color:#ffffff;text-decoration:none;'>📖 Glosarium SNI</a>
     &nbsp;&nbsp;·&nbsp;&nbsp;
     <a href='https://docs.google.com/spreadsheets/d/1NZm1HjsjxmflxnZlzV_O2XF75ZlMUOu8VVofsKfp_FA/edit?usp=sharing' target='_blank' style='color:#ffffff;text-decoration:none;'>🌐 Glosarium Istilah Asing</a><br>
-#    <a href='https://iec-to-iso.streamlit.app/' target='_blank' style='color:#ffffff;text-decoration:none;'>📄 IEC to ISO Converter</a>
   </span><br>
   <span style='font-size:0.8rem;color:#ffffff;'>© 2026 Generator RSNI · ISO to RSNI Converter · All rights reserved.</span><br>
   <span style='font-size:0.72rem;opacity:0.8;color:#ffffff;'>Developed by Denny Kusuma H.</span>
