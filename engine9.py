@@ -925,6 +925,227 @@ class TableOfContentsEngine:
             blank_count += 1
         return anchor
 
+
+    @staticmethod
+    def _refresh_toc_with_word(output_docx: str) -> tuple[bool, str]:
+        """Buat TOC *native* Microsoft Word lalu hitung nomor halamannya.
+
+        Kenapa tidak cukup hanya ``toc.UpdatePageNumbers()``?
+        Field TOC yang dibentuk lewat XML/python-docx belum tentu sudah memiliki
+        cache PAGEREF/bookmark internal yang valid. Akibatnya Word dapat
+        menampilkan semua front-matter sebagai ``i`` dan semua pasal sebagai
+        ``1`` walaupun footer sudah benar.
+
+        Solusi yang dipakai di sini:
+          1. buka DOCX dengan Microsoft Word;
+          2. ganti placeholder TOC buatan python-docx dengan TOC yang dibuat
+             langsung oleh Word melalui ``TablesOfContents.Add``;
+          3. repaginate -> update seluruh TOC satu kali;
+          4. save, close, lalu OPEN ULANG dokumen;
+          5. repaginate -> ``UpdatePageNumbers`` -> repaginate ->
+             ``UpdatePageNumbers`` lagi;
+          6. simpan final.
+
+        Open ulang sengaja dilakukan karena Word baru mengetahui pagination
+        final setelah TOC nyata terbentuk; panjang TOC dapat menggeser seluruh
+        halaman Content.
+        """
+        if os.name != 'nt':
+            return False, (
+                'Microsoft Word automation hanya tersedia pada Windows. '
+                'Nomor halaman TOC tidak dapat dihitung sempurna tanpa layout '
+                'engine Microsoft Word.'
+            )
+
+        absolute_path = os.path.abspath(output_docx)
+
+        try:
+            import pythoncom
+            import win32com.client
+        except Exception as exc:
+            return False, (
+                'pywin32 tidak tersedia. Instal dengan: pip install pywin32. '
+                f'Detail: {exc}'
+            )
+
+        # Konstanta Word, ditulis literal supaya tidak tergantung makepy.
+        wdCollapseStart = 1
+        wdDoNotSaveChanges = 0
+
+        pythoncom.CoInitialize()
+        word = None
+        document = None
+        try:
+            word = win32com.client.DispatchEx('Word.Application')
+            word.Visible = False
+            word.DisplayAlerts = 0
+            try:
+                word.ScreenUpdating = False
+            except Exception:
+                pass
+
+            # ---------------- PASS 1: buat TOC native Word ----------------
+            document = word.Documents.Open(
+                absolute_path,
+                ReadOnly=False,
+                AddToRecentFiles=False,
+                ConfirmConversions=False,
+            )
+
+            document.Repaginate()
+
+            # Placeholder yang dibuat python-docx diberi bookmark khusus.
+            # Gunakan bookmark ini sebagai posisi penyisipan TOC native.
+            try:
+                if document.Bookmarks.Exists(_TOC_MARK_BOOKMARK):
+                    bm = document.Bookmarks(_TOC_MARK_BOOKMARK)
+                    start_pos = int(bm.Range.Start)
+                    end_pos = int(bm.Range.End)
+                else:
+                    raise RuntimeError(
+                        f'Bookmark {_TOC_MARK_BOOKMARK} tidak ditemukan.'
+                    )
+            except Exception as exc:
+                raise RuntimeError(
+                    'Posisi Daftar Isi tidak dapat ditemukan oleh Word: '
+                    f'{exc}'
+                )
+
+            # Hapus semua TOC lama/placeholder yang bersinggungan dengan
+            # bookmark agar tidak ada dua TOC dalam dokumen.
+            for i in range(document.TablesOfContents.Count, 0, -1):
+                try:
+                    old_toc = document.TablesOfContents.Item(i)
+                    if (
+                        old_toc.Range.Start <= end_pos
+                        and old_toc.Range.End >= start_pos
+                    ):
+                        old_toc.Delete()
+                except Exception:
+                    pass
+
+            # Hapus isi placeholder field XML, tetapi pertahankan paragrafnya.
+            insert_range = document.Range(Start=start_pos, End=end_pos)
+            insert_range.Text = ''
+            insert_range.Collapse(wdCollapseStart)
+
+            # BUAT TOC NATIF WORD.
+            # AddedStyles memakai format Word Object Model:
+            #   "Judul,1,Pasal,1"
+            # sehingga hanya style Judul + Pasal yang masuk pada level 1.
+            toc = document.TablesOfContents.Add(
+                Range=insert_range,
+                UseHeadingStyles=False,
+                UpperHeadingLevel=1,
+                LowerHeadingLevel=1,
+                UseFields=False,
+                TableID='',
+                RightAlignPageNumbers=True,
+                IncludePageNumbers=True,
+                AddedStyles='Judul,1,Pasal,1',
+                UseHyperlinks=True,
+                HidePageNumbersInWeb=False,
+                UseOutlineLevels=False,
+            )
+
+            # Seluruh TOC sekali untuk membuat bookmark/PAGEREF internal.
+            document.Repaginate()
+            toc.Update()
+            document.Repaginate()
+            toc.UpdatePageNumbers()
+            document.Repaginate()
+
+            document.Save()
+            document.Close(SaveChanges=wdDoNotSaveChanges)
+            document = None
+
+            # ---------------- PASS 2: pagination final ----------------
+            # Setelah TOC benar-benar tersimpan, buka ulang supaya Word
+            # menghitung ulang halaman berdasarkan panjang TOC final.
+            document = word.Documents.Open(
+                absolute_path,
+                ReadOnly=False,
+                AddToRecentFiles=False,
+                ConfirmConversions=False,
+            )
+
+            document.Repaginate()
+
+            if document.TablesOfContents.Count < 1:
+                raise RuntimeError(
+                    'TOC native Microsoft Word tidak ditemukan setelah reopen.'
+                )
+
+            # Dokumen ini hanya memakai satu TOC utama.
+            toc = document.TablesOfContents.Item(1)
+
+            # Update NOMOR HALAMAN ONLY pada layout final.
+            toc.UpdatePageNumbers()
+            document.Repaginate()
+            toc.UpdatePageNumbers()
+
+            # Update PAGE/NUMPAGES di semua story (header/footer) tanpa
+            # membangun ulang isi TOC. Ini menyelaraskan footer dan TOC.
+            try:
+                for story_type in range(1, 18):
+                    try:
+                        story = document.StoryRanges(story_type)
+                    except Exception:
+                        continue
+                    while story is not None:
+                        try:
+                            story.Fields.Update()
+                        except Exception:
+                            pass
+                        try:
+                            story = story.NextStoryRange
+                        except Exception:
+                            story = None
+            except Exception:
+                pass
+
+            document.Repaginate()
+            toc.UpdatePageNumbers()
+
+            document.Save()
+
+            # ---------------- PASS 3: verifikasi stabil ----------------
+            # Save sekali lagi setelah reopen terakhir. Ini menghindari cache
+            # pagination stale pada beberapa versi Word.
+            document.Close(SaveChanges=wdDoNotSaveChanges)
+            document = None
+
+            document = word.Documents.Open(
+                absolute_path,
+                ReadOnly=False,
+                AddToRecentFiles=False,
+                ConfirmConversions=False,
+            )
+            document.Repaginate()
+            if document.TablesOfContents.Count < 1:
+                raise RuntimeError('TOC hilang pada verifikasi akhir.')
+            document.TablesOfContents.Item(1).UpdatePageNumbers()
+            document.Repaginate()
+            document.Save()
+
+            return True, 'TOC native Word dan nomor halaman berhasil diperbarui.'
+
+        except Exception as exc:
+            return False, f'Gagal memperbarui TOC melalui Microsoft Word: {exc}'
+        finally:
+            if document is not None:
+                try:
+                    document.Close(SaveChanges=wdDoNotSaveChanges)
+                except Exception:
+                    pass
+            if word is not None:
+                try:
+                    word.Quit()
+                except Exception:
+                    pass
+            pythoncom.CoUninitialize()
+
+
     def insert_toc(self, input_docx: str, output_docx: str) -> str:
         if not input_docx or not os.path.isfile(input_docx):
             raise FileNotFoundError(f'File input tidak ditemukan: {input_docx}')
@@ -942,6 +1163,13 @@ class TableOfContentsEngine:
         anchor.addnext(toc._p)
         self._force_update_fields(doc)
         doc.save(output_docx)
+
+        # WAJIB: bangun ulang placeholder menjadi TOC native Microsoft Word.
+        # Jangan abaikan kegagalan, karena tanpa Word pagination angka TOC
+        # dapat tetap i/1 walaupun footer dokumen sudah benar.
+        refreshed, refresh_message = self._refresh_toc_with_word(output_docx)
+        if not refreshed:
+            raise RuntimeError(refresh_message)
         return output_docx
 
     def process(self, input_docx: Optional[str] = None,
