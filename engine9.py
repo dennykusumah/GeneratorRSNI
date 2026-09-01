@@ -224,11 +224,11 @@ _PASAL_STYLE_XML = f'''<w:style {nsdecls("w")} w:type="paragraph" w:customStyle=
 # agar formatting dokumen tetap sama namun entri tersebut tidak masuk Daftar Isi.
 _PASAL_NONTOC_STYLE_XML = f'''<w:style {nsdecls("w")} w:type="paragraph" w:customStyle="1" w:styleId="Engine9PasalNonTOC">
   <w:name w:val="Engine9 Pasal Non-TOC"/>
-  <w:basedOn w:val="Heading1"/>
+  <w:basedOn w:val="BodyText"/>
   <w:next w:val="BodyText"/>
-  <w:qFormat/>
   <w:pPr>
     <w:numPr><w:ilvl w:val="0"/><w:numId w:val="0"/></w:numPr>
+    <w:outlineLvl w:val="9"/>
     <w:spacing w:before="0" w:after="0" w:line="240" w:lineRule="auto"/>
     <w:jc w:val="both"/>
   </w:pPr>
@@ -355,6 +355,30 @@ def _set_pstyle(paragraph, style_id):
         pStyle.set(qn('w:val'), style_id)
 
 
+def _set_pasal_toc_safe_style(paragraph, depth):
+    """Set style Pasal secara aman untuk ToC maksimum dua tingkat.
+
+    depth 0/1 = Pasal/Subpasal yang boleh masuk ToC.
+    depth >=2 = sub-subpasal atau lebih dalam; style dibuat non-ToC DAN
+    outline level paragraf dipaksa ke body-text (9) agar Word tidak dapat
+    memasukkannya lewat inheritance Heading/outline level.
+    """
+    try:
+        depth = int(depth)
+    except (TypeError, ValueError):
+        depth = 99
+    non_toc = depth >= 2
+    _set_pstyle(paragraph, 'Engine9PasalNonTOC' if non_toc else 'Engine9PasalTOC')
+    pPr = paragraph._p.get_or_add_pPr()
+    old_outline = pPr.find(qn('w:outlineLvl'))
+    if old_outline is not None:
+        pPr.remove(old_outline)
+    if non_toc:
+        outline = OxmlElement('w:outlineLvl')
+        outline.set(qn('w:val'), '9')
+        pPr.append(outline)
+
+
 def _apply_judul(doc, paragraph, force_page_break_before=False):
     _set_pstyle(paragraph, 'Engine9JudulTOC')
     pPr = _clear_paragraph_direct_formatting(
@@ -372,10 +396,20 @@ def _apply_pasal(doc, paragraph, ilvl, num_id, number_text=None):
         toc_level = int(ilvl)
     except (TypeError, ValueError):
         toc_level = (number_text or '').count('.')
-    _set_pstyle(paragraph, 'Engine9PasalTOC' if toc_level <= 1 else 'Engine9PasalNonTOC')
+    _set_pasal_toc_safe_style(paragraph, toc_level)
     pPr = _clear_paragraph_direct_formatting(
         paragraph, ['w:jc', 'w:spacing', 'w:ind', 'w:numPr']
     )
+    # _clear_paragraph_direct_formatting tidak boleh menghapus guard outlineLvl=9
+    # pada level ketiga ke bawah. Jika sumber membawa outline heading langsung,
+    # helper di atas sudah menggantinya secara deterministik.
+    if toc_level >= 2:
+        old_outline = pPr.find(qn('w:outlineLvl'))
+        if old_outline is not None:
+            pPr.remove(old_outline)
+        outline = OxmlElement('w:outlineLvl')
+        outline.set(qn('w:val'), '9')
+        pPr.append(outline)
     # Nonaktifkan bullet/numbering Word (numId=0) secara eksplisit per-paragraf.
     # Nomor Pasal/Subpasal TIDAK lagi dibangkitkan oleh Word auto-numbering —
     # sebagai gantinya, nomor yang BENAR (dihitung oleh _collect_pasal_targets
@@ -710,7 +744,9 @@ class StyleFinalizerEngine:
             # mencocokkan display-name style, sehingga 6.4.1/7.8.1 dapat ikut
             # walaupun bukan Heading 1/2. Semua heading bernomor >= 3 tingkat
             # dipaksa ke style unik non-TOC, sedangkan 1/1.1/A.1 tetap pada
-            # style unik TOC. Tampilan visual kedua style dibuat identik.
+            # style unik TOC. Untuk level >=3, outlineLvl juga dipaksa 9
+            # (body text) agar tidak dapat masuk ToC melalui inheritance.
+            # Tampilan visual kedua style dibuat identik.
             for i in range(n):
                 if section_by_idx[i] < 4 or i >= marker_idx:
                     continue
@@ -731,10 +767,7 @@ class StyleFinalizerEngine:
                 )
                 if not is_heading_like:
                     continue
-                _set_pstyle(
-                    paras[i],
-                    'Engine9PasalTOC' if depth <= 1 else 'Engine9PasalNonTOC'
-                )
+                _set_pasal_toc_safe_style(paras[i], depth)
 
             # Invariant final: style yang dipetakan ke TOC tidak boleh pernah
             # membawa nomor tiga tingkat atau lebih, termasuk kasus tanpa spasi
@@ -750,7 +783,7 @@ class StyleFinalizerEngine:
                     check_text, flags=re.I
                 )
                 if m_check and m_check.group(1).count('.') >= 2:
-                    _set_pstyle(paras[i], 'Engine9PasalNonTOC')
+                    _set_pasal_toc_safe_style(paras[i], 2)
 
             # 6) Jaring pengaman terakhir: pastikan "Red Green Blue" pada
             #    Prakata SELALU tercetak italic — jaminan final sebelum
