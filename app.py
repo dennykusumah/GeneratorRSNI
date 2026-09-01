@@ -935,12 +935,12 @@ def _render_header_with_live_kamus():
                 <div class="stat-divider"></div>
                 <div class="stat-item">
                     <div class="stat-num">{st.session_state.get('kamus_count', '—')}</div>
-                    <div class="stat-lbl">Kamus SNI</div>
+                    <div class="stat-lbl">Glosarium SNI</div>
                 </div>
                 <div class="stat-divider"></div>
                 <div class="stat-item">
                     <div class="stat-num">{st.session_state.get('italic_count', '—')}</div>
-                    <div class="stat-lbl">Kamus Istilah Asing</div>
+                    <div class="stat-lbl">Glosarium Istilah Asing</div>
                 </div>
                 <div class="stat-divider"></div>
                 <div class="stat-item">
@@ -968,10 +968,10 @@ _italic_count = st.session_state.get('italic_count', 0)
 _FOOTER_HTML = """
 <div class='footer'>
   <span style='font-size:0.85rem;'>
-    <a href='https://docs.google.com/spreadsheets/d/1BBPCMPwvbBk5LPdoDQwnjQzcPHv7_RDKENqeMsklF-8/edit?usp=sharing' target='_blank' style='color:#ffffff;text-decoration:none;'>📖 Kamus SNI</a>
+    <a href='https://docs.google.com/spreadsheets/d/1BBPCMPwvbBk5LPdoDQwnjQzcPHv7_RDKENqeMsklF-8/edit?usp=sharing' target='_blank' style='color:#ffffff;text-decoration:none;'>📖 Glosarium SNI</a>
     &nbsp;&nbsp;·&nbsp;&nbsp;
-    <a href='https://docs.google.com/spreadsheets/d/1NZm1HjsjxmflxnZlzV_O2XF75ZlMUOu8VVofsKfp_FA/edit?usp=sharing' target='_blank' style='color:#ffffff;text-decoration:none;'>🌐 Kamus Istilah Asing</a><br>
-    <a href='https://iec-to-iso.streamlit.app/' target='_blank' style='color:#ffffff;text-decoration:none;'>📄 IEC to ISO Converter</a>
+    <a href='https://docs.google.com/spreadsheets/d/1NZm1HjsjxmflxnZlzV_O2XF75ZlMUOu8VVofsKfp_FA/edit?usp=sharing' target='_blank' style='color:#ffffff;text-decoration:none;'>🌐 Glosarium Istilah Asing</a><br>
+    
   </span><br>
   <span style='font-size:0.8rem;color:#ffffff;'>© 2026 Generator RSNI · ISO to RSNI Converter · All rights reserved.</span><br>
   <span style='font-size:0.72rem;opacity:0.8;color:#ffffff;'>Developed by Denny Kusuma H.</span>
