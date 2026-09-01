@@ -92,7 +92,7 @@ _SKIP_SUBSECTION_TITLES = {
 _JUDUL_TARGET_TEXTS = {'daftar isi', 'prakata', 'pendahuluan', 'bibliografi'}
 _ENGINE5_MARKER = 'Engine5DuplicateStart'
 _TOC_STYLE_NAME = 'TOC 1'
-_TOC_FIELD_INSTR = ' TOC \\h \\z \\t "Judul;1;Pasal;1" '
+_TOC_FIELD_INSTR = ' TOC \\h \\z \\t "Engine9 Judul ToC;1;Engine9 Pasal ToC;1" '
 _TOC_MARK_BOOKMARK = 'Engine9TocField'
 
 
@@ -180,8 +180,8 @@ def _insert_number_run(paragraph, number_text: str) -> None:
 # Style XML — "Judul" & "Pasal"
 # ─────────────────────────────────────────────────────────────────────────────
 
-_JUDUL_STYLE_XML = f'''<w:style {nsdecls("w")} w:type="paragraph" w:customStyle="1" w:styleId="Judul">
-  <w:name w:val="Judul"/>
+_JUDUL_STYLE_XML = f'''<w:style {nsdecls("w")} w:type="paragraph" w:customStyle="1" w:styleId="Engine9JudulTOC">
+  <w:name w:val="Engine9 Judul ToC"/>
   <w:basedOn w:val="Heading1"/>
   <w:next w:val="BodyText"/>
   <w:qFormat/>
@@ -200,8 +200,8 @@ _JUDUL_STYLE_XML = f'''<w:style {nsdecls("w")} w:type="paragraph" w:customStyle=
   </w:rPr>
 </w:style>'''
 
-_PASAL_STYLE_XML = f'''<w:style {nsdecls("w")} w:type="paragraph" w:customStyle="1" w:styleId="Pasal">
-  <w:name w:val="Pasal"/>
+_PASAL_STYLE_XML = f'''<w:style {nsdecls("w")} w:type="paragraph" w:customStyle="1" w:styleId="Engine9PasalTOC">
+  <w:name w:val="Engine9 Pasal ToC"/>
   <w:basedOn w:val="Heading1"/>
   <w:next w:val="BodyText"/>
   <w:qFormat/>
@@ -222,8 +222,8 @@ _PASAL_STYLE_XML = f'''<w:style {nsdecls("w")} w:type="paragraph" w:customStyle=
 # Style visual identik dengan "Pasal", tetapi sengaja TIDAK dipetakan ke
 # field TOC. Dipakai untuk level ketiga dan lebih dalam (mis. 1.1.1, A.1.2)
 # agar formatting dokumen tetap sama namun entri tersebut tidak masuk Daftar Isi.
-_PASAL_NONTOC_STYLE_XML = f'''<w:style {nsdecls("w")} w:type="paragraph" w:customStyle="1" w:styleId="PasalNonTOC">
-  <w:name w:val="Pasal Non-TOC"/>
+_PASAL_NONTOC_STYLE_XML = f'''<w:style {nsdecls("w")} w:type="paragraph" w:customStyle="1" w:styleId="Engine9PasalNonTOC">
+  <w:name w:val="Engine9 Pasal Non-TOC"/>
   <w:basedOn w:val="Heading1"/>
   <w:next w:val="BodyText"/>
   <w:qFormat/>
@@ -356,7 +356,7 @@ def _set_pstyle(paragraph, style_id):
 
 
 def _apply_judul(doc, paragraph, force_page_break_before=False):
-    _set_pstyle(paragraph, 'Judul')
+    _set_pstyle(paragraph, 'Engine9JudulTOC')
     pPr = _clear_paragraph_direct_formatting(
         paragraph, ['w:jc', 'w:spacing', 'w:ind', 'w:outlineLvl', 'w:numPr']
     )
@@ -372,7 +372,7 @@ def _apply_pasal(doc, paragraph, ilvl, num_id, number_text=None):
         toc_level = int(ilvl)
     except (TypeError, ValueError):
         toc_level = (number_text or '').count('.')
-    _set_pstyle(paragraph, 'Pasal' if toc_level <= 1 else 'PasalNonTOC')
+    _set_pstyle(paragraph, 'Engine9PasalTOC' if toc_level <= 1 else 'Engine9PasalNonTOC')
     pPr = _clear_paragraph_direct_formatting(
         paragraph, ['w:jc', 'w:spacing', 'w:ind', 'w:numPr']
     )
@@ -570,9 +570,9 @@ class StyleFinalizerEngine:
             doc = Document(input_docx)
 
             # 1) Pastikan style "Judul" & "Pasal" tersedia di styles.xml
-            _ensure_style(doc, 'Judul', _JUDUL_STYLE_XML)
-            _ensure_style(doc, 'Pasal', _PASAL_STYLE_XML)
-            _ensure_style(doc, 'PasalNonTOC', _PASAL_NONTOC_STYLE_XML)
+            _ensure_style(doc, 'Engine9JudulTOC', _JUDUL_STYLE_XML)
+            _ensure_style(doc, 'Engine9PasalTOC', _PASAL_STYLE_XML)
+            _ensure_style(doc, 'Engine9PasalNonTOC', _PASAL_NONTOC_STYLE_XML)
 
             paras = doc.paragraphs
             n = len(paras)
@@ -668,7 +668,7 @@ class StyleFinalizerEngine:
                 # Hanya section Content Indonesia dan selalu sebelum marker.
                 if section_by_idx[i] < 4 or i >= marker_idx:
                     continue
-                if sname in ('@Pasal', 'Pasal', 'Pasal Non-TOC'):
+                if sname in ('@Pasal', 'Pasal', 'Pasal Non-TOC', 'Engine9 Pasal ToC', 'Engine9 Pasal Non-TOC'):
                     # Migrasi style lama. Pertahankan nomor literal yang telah
                     # dibuat Engine7/8, termasuk A.1/A.1.1 pada Lampiran.
                     m_num = re.match(r'^\s*([A-Z]?\d+(?:\.\d+)*)\.?\s+', paras[i].text or '', re.I)
@@ -703,6 +703,54 @@ class StyleFinalizerEngine:
 
             for idx, ilvl, num_id, number_text in pasal_targets:
                 _apply_pasal(doc, paras[idx], ilvl, num_id, number_text)
+
+            # 5b) Sanitasi ToC berbasis NOMOR AKTUAL, bukan hanya style sumber.
+            # Dokumen ISO/IEC kompleks dapat membawa style duplikat seperti
+            # styleId Pasal0 dengan display-name 'Pasal'. Word field TOC \t
+            # mencocokkan display-name style, sehingga 6.4.1/7.8.1 dapat ikut
+            # walaupun bukan Heading 1/2. Semua heading bernomor >= 3 tingkat
+            # dipaksa ke style unik non-TOC, sedangkan 1/1.1/A.1 tetap pada
+            # style unik TOC. Tampilan visual kedua style dibuat identik.
+            for i in range(n):
+                if section_by_idx[i] < 4 or i >= marker_idx:
+                    continue
+                text_now = re.sub(r'[\u200b\u200c\u200d\ufeff]', '', paras[i].text or '').strip()
+                m_num = re.match(r'^([A-Z]?\d+(?:\.\d+)*)(?:\.)?(?=\s|[\u200b\u200c\u200d\ufeff]|[^0-9.]|$)', text_now, re.I)
+                if not m_num:
+                    continue
+                number_now = m_num.group(1).upper()
+                depth = number_now.count('.')
+                s_now = style_name(paras[i])
+                # Batasi perubahan hanya pada paragraf yang memang heading/pasal
+                # atau sudah pernah disentuh engine sebelumnya.
+                is_heading_like = (
+                    s_now in ('@Pasal', 'Pasal', 'Pasal Non-TOC',
+                              'Engine9 Pasal ToC', 'Engine9 Pasal Non-TOC')
+                    or s_now.startswith('Heading ')
+                    or s_now.lower() in ('a2', 'a3')
+                )
+                if not is_heading_like:
+                    continue
+                _set_pstyle(
+                    paras[i],
+                    'Engine9PasalTOC' if depth <= 1 else 'Engine9PasalNonTOC'
+                )
+
+            # Invariant final: style yang dipetakan ke TOC tidak boleh pernah
+            # membawa nomor tiga tingkat atau lebih, termasuk kasus tanpa spasi
+            # seperti '7.8.1.1Tujuan' atau yang mengandung zero-width character.
+            for i in range(n):
+                if section_by_idx[i] < 4 or i >= marker_idx:
+                    continue
+                if style_name(paras[i]) != 'Engine9 Pasal ToC':
+                    continue
+                check_text = re.sub(r'[\u200b\u200c\u200d\ufeff]', '', paras[i].text or '').strip()
+                m_check = re.match(
+                    r'^([A-Z]?\d+(?:\.\d+)*)(?:\.)?(?=\s|[^0-9.]|$)',
+                    check_text, flags=re.I
+                )
+                if m_check and m_check.group(1).count('.') >= 2:
+                    _set_pstyle(paras[i], 'Engine9PasalNonTOC')
 
             # 6) Jaring pengaman terakhir: pastikan "Red Green Blue" pada
             #    Prakata SELALU tercetak italic — jaminan final sebelum
@@ -891,7 +939,7 @@ class TableOfContentsEngine:
         for paragraph in doc.paragraphs:
             if paragraph._p is toc_title._p:
                 continue
-            if _style_name(paragraph) not in ('Judul', 'Pasal'):
+            if _style_name(paragraph) not in ('Engine9 Judul ToC', 'Engine9 Pasal ToC'):
                 continue
             text = re.sub(r'\s+', ' ', paragraph.text or '').strip()
             if text:
