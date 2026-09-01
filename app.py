@@ -971,6 +971,7 @@ _FOOTER_HTML = """
     <a href='https://docs.google.com/spreadsheets/d/1BBPCMPwvbBk5LPdoDQwnjQzcPHv7_RDKENqeMsklF-8/edit?usp=sharing' target='_blank' style='color:#ffffff;text-decoration:none;'>📖 Glosarium SNI</a>
     &nbsp;&nbsp;·&nbsp;&nbsp;
     <a href='https://docs.google.com/spreadsheets/d/1NZm1HjsjxmflxnZlzV_O2XF75ZlMUOu8VVofsKfp_FA/edit?usp=sharing' target='_blank' style='color:#ffffff;text-decoration:none;'>🌐 Glosarium Istilah Asing</a><br>
+    
   </span><br>
   <span style='font-size:0.8rem;color:#ffffff;'>© 2026 Generator RSNI · ISO to RSNI Converter · All rights reserved.</span><br>
   <span style='font-size:0.72rem;opacity:0.8;color:#ffffff;'>Developed by Denny Kusuma H.</span>
@@ -1025,7 +1026,7 @@ if st.session_state.get('_process_error'):
         if _last_path and os.path.isfile(_last_path):
             with open(_last_path, 'rb') as _last_file:
                 st.download_button(
-                    '⬇ Download', data=_last_file,
+                    '⬇ Download Hasil Engine {final_engine}', data=_last_file,
                     file_name=f'Hasil_Engine{_last_engine}.docx',
                     key='error_download', use_container_width=True,
                 )
