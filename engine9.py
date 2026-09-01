@@ -219,6 +219,28 @@ _PASAL_STYLE_XML = f'''<w:style {nsdecls("w")} w:type="paragraph" w:customStyle=
 </w:style>'''
 
 
+# Style visual identik dengan "Pasal", tetapi sengaja TIDAK dipetakan ke
+# field TOC. Dipakai untuk level ketiga dan lebih dalam (mis. 1.1.1, A.1.2)
+# agar formatting dokumen tetap sama namun entri tersebut tidak masuk Daftar Isi.
+_PASAL_NONTOC_STYLE_XML = f'''<w:style {nsdecls("w")} w:type="paragraph" w:customStyle="1" w:styleId="PasalNonTOC">
+  <w:name w:val="Pasal Non-TOC"/>
+  <w:basedOn w:val="Heading1"/>
+  <w:next w:val="BodyText"/>
+  <w:qFormat/>
+  <w:pPr>
+    <w:numPr><w:ilvl w:val="0"/><w:numId w:val="0"/></w:numPr>
+    <w:spacing w:before="0" w:after="0" w:line="240" w:lineRule="auto"/>
+    <w:jc w:val="both"/>
+  </w:pPr>
+  <w:rPr>
+    <w:rFonts w:ascii="Arial" w:hAnsi="Arial" w:cs="Arial"/>
+    <w:b/>
+    <w:sz w:val="22"/>
+    <w:szCs w:val="22"/>
+  </w:rPr>
+</w:style>'''
+
+
 def _find_style_el(doc, style_id):
     for st in doc.styles.element.findall(qn('w:style')):
         if st.get(qn('w:styleId')) == style_id:
@@ -344,7 +366,13 @@ def _apply_judul(doc, paragraph, force_page_break_before=False):
 
 
 def _apply_pasal(doc, paragraph, ilvl, num_id, number_text=None):
-    _set_pstyle(paragraph, 'Pasal')
+    # ToC dibatasi maksimal dua tingkat. Level 0 = Pasal, level 1 = Subpasal.
+    # Level >= 2 tetap diformat identik, tetapi memakai style non-TOC.
+    try:
+        toc_level = int(ilvl)
+    except (TypeError, ValueError):
+        toc_level = (number_text or '').count('.')
+    _set_pstyle(paragraph, 'Pasal' if toc_level <= 1 else 'PasalNonTOC')
     pPr = _clear_paragraph_direct_formatting(
         paragraph, ['w:jc', 'w:spacing', 'w:ind', 'w:numPr']
     )
@@ -544,6 +572,7 @@ class StyleFinalizerEngine:
             # 1) Pastikan style "Judul" & "Pasal" tersedia di styles.xml
             _ensure_style(doc, 'Judul', _JUDUL_STYLE_XML)
             _ensure_style(doc, 'Pasal', _PASAL_STYLE_XML)
+            _ensure_style(doc, 'PasalNonTOC', _PASAL_NONTOC_STYLE_XML)
 
             paras = doc.paragraphs
             n = len(paras)
@@ -639,7 +668,7 @@ class StyleFinalizerEngine:
                 # Hanya section Content Indonesia dan selalu sebelum marker.
                 if section_by_idx[i] < 4 or i >= marker_idx:
                     continue
-                if sname in ('@Pasal', 'Pasal'):
+                if sname in ('@Pasal', 'Pasal', 'Pasal Non-TOC'):
                     # Migrasi style lama. Pertahankan nomor literal yang telah
                     # dibuat Engine7/8, termasuk A.1/A.1.1 pada Lampiran.
                     m_num = re.match(r'^\s*([A-Z]?\d+(?:\.\d+)*)\.?\s+', paras[i].text or '', re.I)
@@ -692,7 +721,7 @@ class StyleFinalizerEngine:
 
             msg = (
                 f'OK: {len(judul_targets)} heading/Lampiran -> "Judul", '
-                f'{len(pasal_targets)} pasal/subpasal -> "Pasal".'
+                f'{len(pasal_targets)} pasal/subpasal diformat; ToC maksimal dua tingkat.'
             )
             return True, msg
 
@@ -951,7 +980,7 @@ class TableOfContentsEngine:
             path = self.insert_toc(input_docx, output_docx)
             return True, path, (
                 'Engine 9 selesai: style custom Judul/Pasal diterapkan hanya '
-                'pada bagian Indonesia dan TOC dibuat dari "Judul,1,Pasal,1".'
+                'pada bagian Indonesia dan TOC dibatasi sampai Pasal/Subpasal (dua tingkat).'
             )
         except Exception as exc:
             return False, None, f'Engine9 Error: {exc}\n{traceback.format_exc()}'
