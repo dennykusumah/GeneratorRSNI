@@ -65,6 +65,7 @@ import os
 import re
 import copy
 import traceback
+import subprocess
 from typing import Optional
 from docx import Document
 from docx.enum.style import WD_STYLE_TYPE
@@ -925,6 +926,197 @@ class TableOfContentsEngine:
             blank_count += 1
         return anchor
 
+    @staticmethod
+    def _update_toc_page_numbers_with_word(docx_path: str) -> None:
+        """Paksa Microsoft Word menghitung pagination lalu menjalankan
+        *Update page numbers only* pada seluruh TOC sebelum file dikembalikan.
+
+        ``w:updateFields`` hanya meminta Word memperbarui field saat dokumen
+        dibuka. Karena itu Engine9 harus benar-benar membuka dokumen melalui
+        Word, melakukan Repaginate(), UpdatePageNumbers(), lalu Save/Close.
+        """
+        if not docx_path or not os.path.isfile(docx_path):
+            raise FileNotFoundError(f'File untuk update TOC tidak ditemukan: {docx_path}')
+        if os.name != 'nt':
+            raise RuntimeError(
+                'Update page numbers only memerlukan Microsoft Word di Windows. '
+                'Engine9 tidak mengeluarkan file dengan nomor TOC yang belum dihitung.'
+            )
+
+        abs_path = os.path.abspath(docx_path)
+        pywin32_error = None
+
+        # Metode utama: Word COM via pywin32.
+        try:
+            import pythoncom
+            import win32com.client
+
+            pythoncom.CoInitialize()
+            word = None
+            doc = None
+            try:
+                word = win32com.client.DispatchEx('Word.Application')
+                word.Visible = False
+                word.DisplayAlerts = 0
+                try:
+                    word.AutomationSecurity = 3  # msoAutomationSecurityForceDisable
+                except Exception:
+                    pass
+
+                doc = word.Documents.Open(
+                    abs_path,
+                    ConfirmConversions=False,
+                    ReadOnly=False,
+                    AddToRecentFiles=False,
+                    Visible=False,
+                    OpenAndRepair=True,
+                    NoEncodingDialog=True,
+                )
+                doc.Repaginate()
+
+                toc_count = int(doc.TablesOfContents.Count)
+                if toc_count < 1:
+                    # Field TOC mentah kadang belum masuk koleksi TablesOfContents
+                    # sebelum field tersebut dimaterialisasi Word.
+                    for i in range(1, int(doc.Fields.Count) + 1):
+                        fld = doc.Fields.Item(i)
+                        try:
+                            code = str(fld.Code.Text or '').strip().upper()
+                        except Exception:
+                            code = ''
+                        if code == 'TOC' or code.startswith('TOC '):
+                            fld.Update()
+                    doc.Repaginate()
+                    toc_count = int(doc.TablesOfContents.Count)
+
+                if toc_count < 1:
+                    raise RuntimeError('Microsoft Word tidak menemukan objek Table of Contents.')
+
+                # TOC yang baru dibuat memiliki result field kosong. Full Update
+                # hanya dipakai sekali bila memang kosong agar entry terbentuk;
+                # operasi FINAL tetap UpdatePageNumbers() sesuai permintaan.
+                for i in range(1, toc_count + 1):
+                    toc = doc.TablesOfContents.Item(i)
+                    try:
+                        result_text = str(toc.Range.Text or '').strip()
+                    except Exception:
+                        result_text = ''
+                    if not result_text:
+                        toc.Update()
+
+                doc.Repaginate()
+                for i in range(1, int(doc.TablesOfContents.Count) + 1):
+                    doc.TablesOfContents.Item(i).UpdatePageNumbers()
+
+                # TOC sendiri dapat mengubah pagination. Hitung ulang sekali lagi
+                # dan lakukan UpdatePageNumbers() kedua agar angka yang tersimpan
+                # adalah pagination final dokumen.
+                doc.Repaginate()
+                for i in range(1, int(doc.TablesOfContents.Count) + 1):
+                    doc.TablesOfContents.Item(i).UpdatePageNumbers()
+
+                doc.Save()
+                return
+            finally:
+                if doc is not None:
+                    try:
+                        doc.Close(SaveChanges=True)
+                    except Exception:
+                        pass
+                if word is not None:
+                    try:
+                        word.Quit()
+                    except Exception:
+                        pass
+                pythoncom.CoUninitialize()
+        except Exception as exc:
+            pywin32_error = exc
+
+        # Fallback: PowerShell COM. Tidak membutuhkan paket pywin32, tetapi
+        # tetap membutuhkan Windows dan Microsoft Word terpasang.
+        escaped = abs_path.replace("'", "''")
+        ps_script = rf'''
+$ErrorActionPreference = 'Stop'
+$word = $null
+$doc = $null
+try {{
+    $word = New-Object -ComObject Word.Application
+    $word.Visible = $false
+    $word.DisplayAlerts = 0
+    try {{ $word.AutomationSecurity = 3 }} catch {{}}
+
+    $doc = $word.Documents.Open('{escaped}')
+    $doc.Repaginate()
+
+    $tocCount = $doc.TablesOfContents.Count
+    if ($tocCount -lt 1) {{
+        for ($j = 1; $j -le $doc.Fields.Count; $j++) {{
+            $field = $doc.Fields.Item($j)
+            $code = ''
+            try {{ $code = ($field.Code.Text).Trim().ToUpperInvariant() }} catch {{}}
+            if ($code -eq 'TOC' -or $code.StartsWith('TOC ')) {{
+                [void]$field.Update()
+            }}
+        }}
+        $doc.Repaginate()
+        $tocCount = $doc.TablesOfContents.Count
+    }}
+
+    if ($tocCount -lt 1) {{
+        throw 'Microsoft Word tidak menemukan objek Table of Contents.'
+    }}
+
+    for ($i = 1; $i -le $tocCount; $i++) {{
+        $toc = $doc.TablesOfContents.Item($i)
+        $txt = ''
+        try {{ $txt = ($toc.Range.Text).Trim() }} catch {{}}
+        if ([string]::IsNullOrWhiteSpace($txt)) {{
+            [void]$toc.Update()
+        }}
+    }}
+
+    $doc.Repaginate()
+    $tocCount = $doc.TablesOfContents.Count
+    for ($i = 1; $i -le $tocCount; $i++) {{
+        [void]$doc.TablesOfContents.Item($i).UpdatePageNumbers()
+    }}
+
+    $doc.Repaginate()
+    $tocCount = $doc.TablesOfContents.Count
+    for ($i = 1; $i -le $tocCount; $i++) {{
+        [void]$doc.TablesOfContents.Item($i).UpdatePageNumbers()
+    }}
+
+    $doc.Save()
+}}
+finally {{
+    if ($doc -ne $null) {{ try {{ $doc.Close($true) }} catch {{}} }}
+    if ($word -ne $null) {{ try {{ $word.Quit() }} catch {{}} }}
+    if ($doc -ne $null) {{ [void][Runtime.InteropServices.Marshal]::ReleaseComObject($doc) }}
+    if ($word -ne $null) {{ [void][Runtime.InteropServices.Marshal]::ReleaseComObject($word) }}
+    [GC]::Collect()
+    [GC]::WaitForPendingFinalizers()
+}}
+'''
+        try:
+            completed = subprocess.run(
+                ['powershell.exe', '-NoProfile', '-NonInteractive',
+                 '-ExecutionPolicy', 'Bypass', '-Command', ps_script],
+                capture_output=True, text=True, timeout=180, check=False,
+            )
+        except Exception as ps_exc:
+            raise RuntimeError(
+                'Gagal menjalankan Update page numbers only melalui Microsoft Word. '
+                f'pywin32: {pywin32_error}; PowerShell: {ps_exc}'
+            ) from ps_exc
+
+        if completed.returncode != 0:
+            detail = (completed.stderr or completed.stdout or '').strip()
+            raise RuntimeError(
+                'Microsoft Word gagal menjalankan Update page numbers only pada TOC. '
+                f'pywin32: {pywin32_error}; PowerShell: {detail}'
+            )
+
     def insert_toc(self, input_docx: str, output_docx: str) -> str:
         if not input_docx or not os.path.isfile(input_docx):
             raise FileNotFoundError(f'File input tidak ditemukan: {input_docx}')
@@ -942,6 +1134,10 @@ class TableOfContentsEngine:
         anchor.addnext(toc._p)
         self._force_update_fields(doc)
         doc.save(output_docx)
+
+        # Jangan sediakan file untuk download sebelum Word benar-benar selesai
+        # menghitung pagination dan menjalankan "Update page numbers only".
+        self._update_toc_page_numbers_with_word(output_docx)
         return output_docx
 
     def process(self, input_docx: Optional[str] = None,
@@ -951,7 +1147,8 @@ class TableOfContentsEngine:
             path = self.insert_toc(input_docx, output_docx)
             return True, path, (
                 'Engine 9 selesai: style custom Judul/Pasal diterapkan hanya '
-                'pada bagian Indonesia dan TOC dibuat dari "Judul,1,Pasal,1".'
+                'pada bagian Indonesia, TOC dibuat dari "Judul,1,Pasal,1", '
+                'dan Microsoft Word sudah menjalankan Update page numbers only.'
             )
         except Exception as exc:
             return False, None, f'Engine9 Error: {exc}\n{traceback.format_exc()}'
