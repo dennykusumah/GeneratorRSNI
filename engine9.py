@@ -925,6 +925,83 @@ class TableOfContentsEngine:
             blank_count += 1
         return anchor
 
+
+    @staticmethod
+    def _refresh_toc_with_word(output_docx: str) -> bool:
+        """Bangun cache TOC Word dan hitung nomor halaman setelah repaginasi.
+
+        Penting: TOC yang baru dibuat oleh python-docx baru berupa field TOC.
+        Agar perintah Word "Update page numbers only" bekerja benar, Word
+        terlebih dahulu harus pernah membangun hasil TOC/PAGEREF-nya sendiri.
+
+        Urutan dibuat dua kali karena panjang TOC dapat menggeser halaman
+        Content; setelah pergeseran itu nomor halaman perlu dihitung ulang.
+        """
+        if os.name != 'nt':
+            return False
+
+        absolute_path = os.path.abspath(output_docx)
+        try:
+            import pythoncom
+            import win32com.client
+
+            pythoncom.CoInitialize()
+            word = None
+            document = None
+            try:
+                word = win32com.client.DispatchEx('Word.Application')
+                word.Visible = False
+                word.DisplayAlerts = 0
+
+                document = word.Documents.Open(
+                    absolute_path,
+                    ReadOnly=False,
+                    AddToRecentFiles=False,
+                )
+
+                # Pastikan layout dan PAGE field sudah dihitung Word.
+                document.Repaginate()
+
+                if document.TablesOfContents.Count < 1:
+                    raise RuntimeError(
+                        'Field Daftar Isi tidak dikenali Microsoft Word.'
+                    )
+
+                toc = document.TablesOfContents.Item(1)
+
+                # Update ENTIRE TABLE diperlukan SATU KALI untuk membuat
+                # bookmark/PAGEREF internal TOC yang valid.
+                toc.Update()
+                document.Repaginate()
+
+                # Sesudah TOC terbentuk, sinkronkan hanya nomor halamannya.
+                # Dua pass mencegah nomor stale jika panjang TOC menggeser
+                # awal Content satu halaman.
+                toc.UpdatePageNumbers()
+                document.Repaginate()
+                toc.UpdatePageNumbers()
+
+                document.Save()
+                return True
+            finally:
+                if document is not None:
+                    try:
+                        document.Close(SaveChanges=False)
+                    except Exception:
+                        pass
+                if word is not None:
+                    try:
+                        word.Quit()
+                    except Exception:
+                        pass
+                pythoncom.CoUninitialize()
+        except Exception:
+            # Tidak dibuat fatal: file DOCX tetap valid. Pada Windows normal,
+            # requirements.txt sudah memasang pywin32 sehingga jalur ini
+            # semestinya berhasil.
+            return False
+
+
     def insert_toc(self, input_docx: str, output_docx: str) -> str:
         if not input_docx or not os.path.isfile(input_docx):
             raise FileNotFoundError(f'File input tidak ditemukan: {input_docx}')
@@ -942,6 +1019,11 @@ class TableOfContentsEngine:
         anchor.addnext(toc._p)
         self._force_update_fields(doc)
         doc.save(output_docx)
+
+        # WAJIB setelah save: Microsoft Word harus membangun cache TOC sekali
+        # agar pilihan "Update page numbers only" berikutnya membaca PAGEREF
+        # yang benar, bukan cache awal (i/1) dari field TOC kosong.
+        self._refresh_toc_with_word(output_docx)
         return output_docx
 
     def process(self, input_docx: Optional[str] = None,
