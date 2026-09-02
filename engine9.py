@@ -992,28 +992,45 @@ class TableOfContentsEngine:
                 if toc_count < 1:
                     raise RuntimeError('Microsoft Word tidak menemukan objek Table of Contents.')
 
-                # TOC yang baru dibuat memiliki result field kosong. Full Update
-                # hanya dipakai sekali bila memang kosong agar entry terbentuk;
-                # operasi FINAL tetap UpdatePageNumbers() sesuai permintaan.
+                # WAJIB materialisasikan ulang seluruh entry. Range.Text pada
+                # field TOC baru tidak selalu kosong (dapat berisi karakter
+                # field/bookmark), sehingga pengujian ``if not result_text``
+                # sebelumnya salah melewati Update(). Akibatnya Word hanya
+                # memperbarui cache PAGEREF lama dan semua entry menjadi i/1.
                 for i in range(1, toc_count + 1):
                     toc = doc.TablesOfContents.Item(i)
                     try:
-                        result_text = str(toc.Range.Text or '').strip()
+                        toc.Range.Fields.Locked = False
                     except Exception:
-                        result_text = ''
-                    if not result_text:
-                        toc.Update()
+                        pass
+                    toc.Update()
 
-                doc.Repaginate()
-                for i in range(1, int(doc.TablesOfContents.Count) + 1):
-                    doc.TablesOfContents.Item(i).UpdatePageNumbers()
+                # Pembentukan TOC dapat menggeser isi beberapa halaman. Ulangi
+                # pagination + UpdatePageNumbers sampai hasil stabil.
+                previous = None
+                for _ in range(4):
+                    doc.Repaginate()
+                    for i in range(1, int(doc.TablesOfContents.Count) + 1):
+                        doc.TablesOfContents.Item(i).UpdatePageNumbers()
+                    current = tuple(
+                        str(doc.TablesOfContents.Item(i).Range.Text or '')
+                        for i in range(1, int(doc.TablesOfContents.Count) + 1)
+                    )
+                    if current == previous:
+                        break
+                    previous = current
 
-                # TOC sendiri dapat mengubah pagination. Hitung ulang sekali lagi
-                # dan lakukan UpdatePageNumbers() kedua agar angka yang tersimpan
-                # adalah pagination final dokumen.
-                doc.Repaginate()
+                # Jangan pernah mengembalikan file bila Word ternyata masih
+                # menyimpan nomor dummy yang sama untuk TOC panjang.
                 for i in range(1, int(doc.TablesOfContents.Count) + 1):
-                    doc.TablesOfContents.Item(i).UpdatePageNumbers()
+                    lines = [x.strip() for x in str(doc.TablesOfContents.Item(i).Range.Text or '').splitlines() if x.strip()]
+                    page_values = []
+                    for line in lines:
+                        match = re.search(r'(?:\t|\s)([ivxlcdm]+|\d+)\s*$', line, re.I)
+                        if match:
+                            page_values.append(match.group(1).lower())
+                    if len(page_values) >= 8 and len(set(page_values)) < 2:
+                        raise RuntimeError('Validasi TOC gagal: semua nomor halaman masih sama.')
 
                 doc.Save()
                 return
@@ -1066,25 +1083,40 @@ try {{
         throw 'Microsoft Word tidak menemukan objek Table of Contents.'
     }}
 
+    # Selalu bangun ulang entry terlebih dahulu. Range.Text bukan indikator
+    # yang andal bahwa result field TOC sudah termaterialisasi.
     for ($i = 1; $i -le $tocCount; $i++) {{
         $toc = $doc.TablesOfContents.Item($i)
-        $txt = ''
-        try {{ $txt = ($toc.Range.Text).Trim() }} catch {{}}
-        if ([string]::IsNullOrWhiteSpace($txt)) {{
-            [void]$toc.Update()
+        try {{ $toc.Range.Fields.Locked = $false }} catch {{}}
+        [void]$toc.Update()
+    }}
+
+    $previous = $null
+    for ($pass = 1; $pass -le 4; $pass++) {{
+        $doc.Repaginate()
+        $tocCount = $doc.TablesOfContents.Count
+        for ($i = 1; $i -le $tocCount; $i++) {{
+            [void]$doc.TablesOfContents.Item($i).UpdatePageNumbers()
         }}
+        $current = ''
+        for ($i = 1; $i -le $tocCount; $i++) {{
+            $current += [string]$doc.TablesOfContents.Item($i).Range.Text
+        }}
+        if ($null -ne $previous -and $current -eq $previous) {{ break }}
+        $previous = $current
     }}
 
-    $doc.Repaginate()
-    $tocCount = $doc.TablesOfContents.Count
     for ($i = 1; $i -le $tocCount; $i++) {{
-        [void]$doc.TablesOfContents.Item($i).UpdatePageNumbers()
-    }}
-
-    $doc.Repaginate()
-    $tocCount = $doc.TablesOfContents.Count
-    for ($i = 1; $i -le $tocCount; $i++) {{
-        [void]$doc.TablesOfContents.Item($i).UpdatePageNumbers()
+        $values = New-Object System.Collections.Generic.List[string]
+        $lines = ([string]$doc.TablesOfContents.Item($i).Range.Text) -split "`r?`n"
+        foreach ($line in $lines) {{
+            if ($line -match '(?:\t|\s)([ivxlcdm]+|\d+)\s*$') {{
+                [void]$values.Add($Matches[1].ToLowerInvariant())
+            }}
+        }}
+        if ($values.Count -ge 8 -and @($values | Select-Object -Unique).Count -lt 2) {{
+            throw 'Validasi TOC gagal: semua nomor halaman masih sama.'
+        }}
     }}
 
     $doc.Save()
