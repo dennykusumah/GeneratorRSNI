@@ -858,6 +858,24 @@ class TableOfContentsEngine:
         node.set(qn('w:val'), 'true')
 
     @staticmethod
+    def _disable_update_fields_after_finalization(docx_path: str) -> None:
+        """Jangan biarkan Word menghitung ulang semua field saat file dibuka.
+
+        Engine9 sendiri sudah membuka dokumen di Word, melakukan repaginasi,
+        membangun TOC, dan menyimpan nomor halaman final. Bila
+        ``w:updateFields`` tetap ``true``, Word dapat mengulang pembaruan saat
+        dokumen baru dibuka (sebelum pagination tampilan stabil) dan menimpa
+        hasil tersimpan menjadi i/1. PAGE field di footer tetap bekerja tanpa
+        opsi global ini.
+        """
+        doc = Document(docx_path)
+        settings = doc.settings.element
+        node = settings.find(qn('w:updateFields'))
+        if node is not None:
+            node.set(qn('w:val'), 'false')
+        doc.save(docx_path)
+
+    @staticmethod
     def _collect_entries(doc: Document, toc_title: Paragraph):
         entries = []
         for paragraph in doc.paragraphs:
@@ -959,6 +977,10 @@ class TableOfContentsEngine:
                 word.Visible = False
                 word.DisplayAlerts = 0
                 try:
+                    word.Options.Pagination = True
+                except Exception:
+                    pass
+                try:
                     word.AutomationSecurity = 3  # msoAutomationSecurityForceDisable
                 except Exception:
                     pass
@@ -972,6 +994,12 @@ class TableOfContentsEngine:
                     OpenAndRepair=True,
                     NoEncodingDialog=True,
                 )
+                try:
+                    doc.Activate()
+                    word.ActiveWindow.View.Type = 3  # wdPrintView
+                    word.ActiveWindow.View.ShowFieldCodes = False
+                except Exception:
+                    pass
                 doc.Repaginate()
 
                 toc_count = int(doc.TablesOfContents.Count)
@@ -1060,9 +1088,15 @@ try {{
     $word = New-Object -ComObject Word.Application
     $word.Visible = $false
     $word.DisplayAlerts = 0
+    try {{ $word.Options.Pagination = $true }} catch {{}}
     try {{ $word.AutomationSecurity = 3 }} catch {{}}
 
     $doc = $word.Documents.Open('{escaped}')
+    try {{
+        $doc.Activate()
+        $word.ActiveWindow.View.Type = 3
+        $word.ActiveWindow.View.ShowFieldCodes = $false
+    }} catch {{}}
     $doc.Repaginate()
 
     $tocCount = $doc.TablesOfContents.Count
@@ -1170,6 +1204,9 @@ finally {{
         # Jangan sediakan file untuk download sebelum Word benar-benar selesai
         # menghitung pagination dan menjalankan "Update page numbers only".
         self._update_toc_page_numbers_with_word(output_docx)
+        # Hasil COM di atas adalah hasil final. Cegah Word mengulang Update All
+        # saat pengguna membuka file dan merusak nomor tersimpan menjadi i/1.
+        self._disable_update_fields_after_finalization(output_docx)
         return output_docx
 
     def process(self, input_docx: Optional[str] = None,
