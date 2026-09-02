@@ -66,6 +66,8 @@ import re
 import copy
 import traceback
 import subprocess
+import shutil
+import tempfile
 from typing import Optional
 from docx import Document
 from docx.enum.style import WD_STYLE_TYPE
@@ -956,10 +958,8 @@ class TableOfContentsEngine:
         if not docx_path or not os.path.isfile(docx_path):
             raise FileNotFoundError(f'File untuk update TOC tidak ditemukan: {docx_path}')
         if os.name != 'nt':
-            raise RuntimeError(
-                'Update page numbers only memerlukan Microsoft Word di Windows. '
-                'Engine9 tidak mengeluarkan file dengan nomor TOC yang belum dihitung.'
-            )
+            TableOfContentsEngine._update_toc_page_numbers_on_linux(docx_path)
+            return
 
         abs_path = os.path.abspath(docx_path)
         pywin32_error = None
@@ -1183,6 +1183,179 @@ finally {{
                 f'pywin32: {pywin32_error}; PowerShell: {detail}'
             )
 
+    @staticmethod
+    def _roman(number: int) -> str:
+        values = ((1000, 'm'), (900, 'cm'), (500, 'd'), (400, 'cd'),
+                  (100, 'c'), (90, 'xc'), (50, 'l'), (40, 'xl'),
+                  (10, 'x'), (9, 'ix'), (5, 'v'), (4, 'iv'), (1, 'i'))
+        result = []
+        number = max(1, int(number))
+        for value, symbol in values:
+            while number >= value:
+                result.append(symbol)
+                number -= value
+        return ''.join(result)
+
+    @staticmethod
+    def _pdf_pages(docx_path: str):
+        """Render DOCX dengan LibreOffice dan kembalikan teks setiap halaman."""
+        soffice = shutil.which('libreoffice') or shutil.which('soffice')
+        if not soffice:
+            raise RuntimeError(
+                'LibreOffice tidak ditemukan. Tambahkan "libreoffice-writer" '
+                'ke packages.txt pada Streamlit Cloud.'
+            )
+        try:
+            from pypdf import PdfReader
+        except Exception as exc:
+            raise RuntimeError('Paket pypdf diperlukan untuk menghitung halaman TOC.') from exc
+
+        with tempfile.TemporaryDirectory(prefix='engine9_pdf_') as tmp:
+            profile = os.path.join(tmp, 'profile')
+            completed = subprocess.run(
+                [soffice, f'-env:UserInstallation=file://{profile}', '--headless',
+                 '--convert-to', 'pdf', '--outdir', tmp, os.path.abspath(docx_path)],
+                capture_output=True, text=True, timeout=240, check=False,
+            )
+            pdf_path = os.path.join(
+                tmp, os.path.splitext(os.path.basename(docx_path))[0] + '.pdf'
+            )
+            if completed.returncode != 0 or not os.path.isfile(pdf_path):
+                detail = (completed.stderr or completed.stdout or '').strip()
+                raise RuntimeError(f'LibreOffice gagal menghitung pagination: {detail}')
+            reader = PdfReader(pdf_path)
+            pages = [re.sub(r'\s+', ' ', page.extract_text() or '').strip().lower()
+                     for page in reader.pages]
+            outline = []
+
+            def collect(items):
+                for item in items or []:
+                    if isinstance(item, list):
+                        collect(item)
+                        continue
+                    try:
+                        name = re.sub(r'\s+', ' ', str(item.title)).strip()
+                        page_no = reader.get_destination_page_number(item)
+                    except Exception:
+                        continue
+                    if name and page_no is not None:
+                        outline.append((_norm(name), int(page_no)))
+
+            collect(reader.outline)
+            return pages, outline
+
+    @staticmethod
+    def _write_static_toc(docx_path: str, entries) -> None:
+        """Ganti field TOC dengan paragraf statis ber-tab leader titik."""
+        doc = Document(docx_path)
+        field_p = None
+        for paragraph in doc.paragraphs:
+            instruction = ''.join(
+                node.text or '' for node in paragraph._p.iter(qn('w:instrText'))
+            )
+            if ' TOC ' in f' {instruction} ':
+                field_p = paragraph
+                break
+        if field_p is None:
+            # Iterasi kedua dan selanjutnya: hapus TOC statis yang ditandai.
+            marked = [p for p in doc.paragraphs
+                      if p._p.get(qn('w:rsidRPr')) == 'E9000001']
+            if not marked:
+                raise RuntimeError('Field/hasil TOC tidak ditemukan untuk ditulis.')
+            anchor = marked[0]._p
+            for p in marked:
+                if p._p is not anchor:
+                    p._p.getparent().remove(p._p)
+            field_p = marked[0]
+
+        anchor = field_p._p
+        # Kosongkan paragraf anchor lalu gunakan sebagai entry pertama.
+        for child in list(anchor):
+            if child.tag != qn('w:pPr'):
+                anchor.remove(child)
+
+        style = TableOfContentsEngine._ensure_toc_style(doc)
+        for index, (title, page_label) in enumerate(entries):
+            if index == 0:
+                paragraph = field_p
+            else:
+                paragraph = doc.add_paragraph()
+                new_p = paragraph._p
+                anchor.addnext(new_p)
+                anchor = new_p
+            paragraph.style = style
+            paragraph._p.set(qn('w:rsidRPr'), 'E9000001')
+            paragraph.add_run(title)
+            paragraph.add_run('\t' + page_label)
+        doc.save(docx_path)
+
+    @staticmethod
+    def _update_toc_page_numbers_on_linux(docx_path: str) -> None:
+        """Hitung TOC secara deterministik di Streamlit Cloud/Linux.
+
+        LibreOffice dipakai hanya sebagai layout engine. Nomor halaman dicari
+        dari PDF hasil render dan ditulis ke TOC statis; jadi tidak bergantung
+        pada dukungan LibreOffice terhadap field TOC khusus Microsoft Word.
+        """
+        doc = Document(docx_path)
+        title = next((p for p in doc.paragraphs if _norm(p.text) == 'daftar isi'), None)
+        if title is None:
+            raise RuntimeError('Heading Daftar isi tidak ditemukan.')
+        source_entries = [(re.sub(r'\s+', ' ', title.text).strip(), '…')]
+        source_entries.extend(TableOfContentsEngine._collect_entries(doc, title))
+        if not source_entries:
+            raise RuntimeError('Tidak ada Judul/Pasal untuk membangun TOC.')
+
+        # Materialisasikan seluruh baris terlebih dahulu agar panjang TOC sudah
+        # ikut memengaruhi pagination pada render berikutnya.
+        labels = ['i' if not re.match(r'^1(?:\s|\.)', text) else '1'
+                  for text, _ in source_entries]
+        TableOfContentsEngine._write_static_toc(
+            docx_path, [(item[0], labels[i]) for i, item in enumerate(source_entries)]
+        )
+
+        previous = None
+        for _ in range(4):
+            pages, outline = TableOfContentsEngine._pdf_pages(docx_path)
+            normalized_titles = [_norm(text) for text, _ in source_entries]
+            content_index = next((i for i, text in enumerate(normalized_titles)
+                                  if re.match(r'^1(?:\s|\.)', text)), None)
+            if content_index is None:
+                raise RuntimeError('Awal halaman TOC/konten tidak dapat dideteksi.')
+
+            # Style Judul/Pasal memiliki outline level 1, sehingga ekspor PDF
+            # LibreOffice membawa destination bookmark yang menunjuk tepat ke
+            # halaman heading asli (bukan teks duplikat di halaman TOC).
+            found_pages = []
+            for heading in normalized_titles:
+                match_page = next((page for name, page in outline if name == heading), None)
+                if match_page is None:
+                    # Toleransi untuk perbedaan tanda baca/line wrapping pada
+                    # judul bookmark hasil ekspor.
+                    match_page = next((page for name, page in outline
+                                       if heading in name or name in heading), None)
+                if match_page is None:
+                    raise RuntimeError(f'Halaman heading tidak ditemukan: {heading[:80]}')
+                found_pages.append(match_page)
+
+            toc_page = found_pages[0]
+            content_page = found_pages[content_index]
+            labels = [
+                (TableOfContentsEngine._roman(page - toc_page + 1)
+                 if i < content_index else str(page - content_page + 1))
+                for i, page in enumerate(found_pages)
+            ]
+            state = tuple(labels)
+            TableOfContentsEngine._write_static_toc(
+                docx_path, [(item[0], labels[i]) for i, item in enumerate(source_entries)]
+            )
+            if state == previous:
+                break
+            previous = state
+
+        if len(labels) >= 8 and len(set(labels)) < 2:
+            raise RuntimeError('Validasi TOC Linux gagal: nomor halaman masih seragam.')
+
     def insert_toc(self, input_docx: str, output_docx: str) -> str:
         if not input_docx or not os.path.isfile(input_docx):
             raise FileNotFoundError(f'File input tidak ditemukan: {input_docx}')
@@ -1217,7 +1390,7 @@ finally {{
             return True, path, (
                 'Engine 9 selesai: style custom Judul/Pasal diterapkan hanya '
                 'pada bagian Indonesia, TOC dibuat dari "Judul,1,Pasal,1", '
-                'dan Microsoft Word sudah menjalankan Update page numbers only.'
+                'dan nomor halaman TOC sudah dihitung berdasarkan pagination final.'
             )
         except Exception as exc:
             return False, None, f'Engine9 Error: {exc}\n{traceback.format_exc()}'
