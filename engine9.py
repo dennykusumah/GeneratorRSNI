@@ -38,8 +38,8 @@ Penerapan otomatis:
           diberi style "Pasal" supaya ikut muncul di Daftar Isi (ToC
           dibangun dari style "Judul" & "Pasal").
         - Seluruh bagian berbahasa Inggris — dilewati sepenuhnya.
-      Style "Pasal" JUGA diterapkan pada subpasal di dalam Lampiran/Annex
-      berbahasa Indonesia (paragraf ber-style "a2"/"a3"), dengan penomoran
+      Style "Pasal" JUGA diterapkan pada subpasal tingkat pertama di dalam
+      Lampiran/Annex berbahasa Indonesia (paragraf ber-style "a2"), dengan penomoran
       yang mengikuti huruf Lampirannya sendiri (mis. B.1, B.2, ... untuk
       Lampiran B), BUKAN nomor Heading 1/2 dari badan dokumen utama.
       Judul Lampiran itu sendiri (paragraf ber-style "ANNEX", mis.
@@ -131,9 +131,8 @@ def _style_name(paragraph) -> str:
 #   - Setiap heading "ANNEX" (Lampiran) -> menaikkan huruf Lampiran
 #     (A, B, C, ...), reset counter subpasal Lampiran ('a2'/'a3').
 #   - Setiap "a2" (subpasal Lampiran, level 1) -> "<huruf>.<urut>" (mis.
-#     A.1, A.2, ...), reset counter 'a3'.
-#   - Setiap "a3" (sub-subpasal Lampiran, level 2) -> "<huruf>.<urut a2>.
-#     <urut a3>" (mis. A.1.1, A.1.2, ...).
+#     A.1, A.2, ...).
+#   - "a3" (mis. A.1.1) tidak diberi style Pasal dan tidak masuk TOC.
 _RE_LEADING_NUMBER = re.compile(r'^\s*[A-Za-z]?\d+(?:\.\d+)*\.?\s+')
 
 
@@ -594,7 +593,7 @@ class StyleFinalizerEngine:
                 _apply_judul(doc, paras[idx], force_page_break_before=force_pb)
 
             # 4) Kumpulkan target style "Pasal": seluruh Pasal/Subpasal pada
-            # Content Indonesia sebelum marker, termasuk a2/a3 di Lampiran.
+            # Content Indonesia sebelum marker, termasuk a2 di Lampiran.
             heading1_num_id = _resolve_num_id(doc, 'Heading1')
             heading2_num_id = _resolve_num_id(doc, 'Heading2') or heading1_num_id
 
@@ -606,9 +605,7 @@ class StyleFinalizerEngine:
             # di _apply_pasal, nomor mengikuti teks literal dokumen asli
             # (mis. B.1, B.2, ... untuk Lampiran B, apa adanya dari teks).
             annex_a2_num_id = _resolve_num_id(doc, 'a2')
-            annex_a3_num_id = _resolve_num_id(doc, 'a3') or annex_a2_num_id
             annex_a2_ilvl = _resolve_style_ilvl(doc, 'a2')
-            annex_a3_ilvl = _resolve_style_ilvl(doc, 'a3')
 
             pasal_targets = []  # (idx, ilvl, num_id, number_text)
             # Counter untuk membangkitkan nomor Pasal/Subpasal (lihat
@@ -617,7 +614,6 @@ class StyleFinalizerEngine:
             h2_counter = 0          # nomor Subpasal (Heading 2), reset tiap Pasal baru
             annex_letter = None       # huruf Lampiran/Annex aktif, mis. A, B, C
             annex_sub_counter = 0      # nomor 'a2' (mis. B.1, B.2, ...), reset tiap Annex baru
-            annex_sub2_counter = 0     # nomor 'a3' (mis. B.1.1, ...), reset tiap 'a2' baru
             for i in range(n):
                 sname = style_name(paras[i])
                 if i in annex_indices:
@@ -636,7 +632,6 @@ class StyleFinalizerEngine:
                     )
                     annex_letter = m_annex.group(1).upper() if m_annex else annex_letter
                     annex_sub_counter = 0
-                    annex_sub2_counter = 0
                     continue
 
                 # Hanya section Content Indonesia dan selalu sebelum marker.
@@ -649,7 +644,13 @@ class StyleFinalizerEngine:
                     if m_num:
                         number = m_num.group(1).upper()
                         level = number.count('.')
-                        pasal_targets.append((i, level, None, number))
+                        if level <= 1:
+                            pasal_targets.append((i, level, None, number))
+                        else:
+                            # Bersihkan hasil Engine9 lama/idempotent: Pasal
+                            # tingkat 3 tidak boleh tetap memakai style Pasal,
+                            # karena field TOC Word mengambil style tersebut.
+                            _set_pstyle(paras[i], 'a3' if number[0].isalpha() else 'Heading3')
                     else:
                         pasal_targets.append((i, 0, None, None))
                 elif sname == 'Heading 1':
@@ -661,18 +662,11 @@ class StyleFinalizerEngine:
                     pasal_targets.append((i, 1, heading2_num_id, f'{h1_counter}.{h2_counter}'))
                 elif sname.lower() == 'a2' and annex_letter:
                     annex_sub_counter += 1
-                    annex_sub2_counter = 0
                     pasal_targets.append(
                         (i, annex_a2_ilvl, annex_a2_num_id,
                          f'{annex_letter}.{annex_sub_counter}')
                     )
-                elif sname.lower() == 'a3' and annex_letter:
-                    annex_sub2_counter += 1
-                    pasal_targets.append(
-                        (i, annex_a3_ilvl, annex_a3_num_id,
-                         f'{annex_letter}.{annex_sub_counter}.{annex_sub2_counter}')
-                    )
-                # Heading 3+ (sub-subpasal) sengaja tidak disentuh
+                # a3/Heading 3+ (mis. A.1.1/1.1.1) sengaja tidak disentuh
                 # Judul Lampiran sendiri (style "ANNEX") sengaja tidak disentuh
 
             for idx, ilvl, num_id, number_text in pasal_targets:
@@ -886,6 +880,13 @@ class TableOfContentsEngine:
             if _style_name(paragraph) not in ('Judul', 'Pasal'):
                 continue
             text = re.sub(r'\s+', ' ', paragraph.text or '').strip()
+            if _style_name(paragraph) == 'Pasal':
+                match = re.match(r'^([A-Z]?\d+(?:\.\d+)*)\b', text, re.I)
+                # Pertahanan berlapis untuk dokumen lama: meskipun style
+                # Pasal tingkat 3 masih tertinggal, jangan masukkan 1.1.1,
+                # A.1.1, dan level yang lebih dalam ke TOC.
+                if match and match.group(1).count('.') > 1:
+                    continue
             if text:
                 entries.append((text, '…'))
         return entries
