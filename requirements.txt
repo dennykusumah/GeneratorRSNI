@@ -12,5 +12,8 @@ deep-translator>=1.11.4
 pandas>=2.2
 openpyxl>=3.1.5
 
+# Membaca bookmark dan halaman PDF hasil render LibreOffice (Engine 9 Linux)
+pypdf>=5.0
+
 # Otomatisasi Microsoft Word oleh Engine 9 (hanya dipasang di Windows)
 pywin32>=308; sys_platform == "win32"
