@@ -21,6 +21,9 @@ import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import csv
 import os
+import threading
+from contextlib import contextmanager
+import random
 
 from docx import Document
 from docx.shared import Pt
@@ -64,7 +67,73 @@ _HEADING_STYLES_WITH_NUM = {
     'ANNEX', 'a2', 'a3',
     'Heading4', 'Heading5', 'Heading6',
 }
-_TRANSLATE_DELAY = 0.15
+_TRANSLATE_DELAY = 0.10
+
+# Pengaman adaptif layanan Google Translate gratis (deep-translator).
+# Saat provider sehat, empat request boleh berjalan paralel sehingga kecepatan
+# 4 worker tetap terasa. Jika provider mulai menolak request, gate otomatis
+# menurunkan concurrency HANYA selama periode gangguan lalu naik lagi setelah
+# deretan request berhasil. Ini lebih cepat daripada membatasi seluruh proses
+# menjadi 1--2 request sejak awal, tetapi jauh lebih tahan terhadap 429/5xx.
+_GOOGLE_GATE_COND = threading.Condition()
+_GOOGLE_INFLIGHT = 0
+_GOOGLE_DYNAMIC_LIMIT = 4
+_GOOGLE_LAST_START = 0.0
+_GOOGLE_SUCCESS_STREAK = 0
+_GOOGLE_FAILURE_STREAK = 0
+_TRANSLATOR_THREAD_LOCAL = threading.local()
+
+
+def _google_gate_feedback(success: bool, rate_limited: bool = False) -> None:
+    global _GOOGLE_DYNAMIC_LIMIT, _GOOGLE_SUCCESS_STREAK, _GOOGLE_FAILURE_STREAK
+    with _GOOGLE_GATE_COND:
+        if success:
+            _GOOGLE_SUCCESS_STREAK += 1
+            _GOOGLE_FAILURE_STREAK = 0
+            # Pulihkan kecepatan bertahap setelah provider kembali sehat.
+            if _GOOGLE_SUCCESS_STREAK >= 8 and _GOOGLE_DYNAMIC_LIMIT < 4:
+                _GOOGLE_DYNAMIC_LIMIT += 1
+                _GOOGLE_SUCCESS_STREAK = 0
+        else:
+            _GOOGLE_SUCCESS_STREAK = 0
+            _GOOGLE_FAILURE_STREAK += 1
+            # Hanya throttle jika ada bukti provider sedang bermasalah.
+            if rate_limited or _GOOGLE_FAILURE_STREAK >= 3:
+                _GOOGLE_DYNAMIC_LIMIT = max(1, _GOOGLE_DYNAMIC_LIMIT - 1)
+                _GOOGLE_FAILURE_STREAK = 0
+        _GOOGLE_GATE_COND.notify_all()
+
+
+@contextmanager
+def _google_request_gate():
+    """Gate adaptif: 4 paralel saat sehat, otomatis melambat saat throttle."""
+    global _GOOGLE_INFLIGHT, _GOOGLE_LAST_START
+    with _GOOGLE_GATE_COND:
+        while _GOOGLE_INFLIGHT >= _GOOGLE_DYNAMIC_LIMIT:
+            _GOOGLE_GATE_COND.wait(timeout=0.25)
+        # Spacing sangat kecil saat sehat; bertambah hanya ketika limit turun.
+        min_gap = {4: 0.06, 3: 0.10, 2: 0.18, 1: 0.32}[_GOOGLE_DYNAMIC_LIMIT]
+        now = time.monotonic()
+        wait = min_gap - (now - _GOOGLE_LAST_START)
+        if wait > 0:
+            _GOOGLE_GATE_COND.wait(timeout=wait)
+        _GOOGLE_INFLIGHT += 1
+        _GOOGLE_LAST_START = time.monotonic()
+    try:
+        yield
+    finally:
+        with _GOOGLE_GATE_COND:
+            _GOOGLE_INFLIGHT -= 1
+            _GOOGLE_GATE_COND.notify_all()
+
+
+def _is_rate_limit_error(exc: Exception) -> bool:
+    msg = str(exc).casefold()
+    return any(x in msg for x in (
+        '429', 'too many requests', 'rate limit', 'ratelimit',
+        'unusual traffic', 'temporarily unavailable', 'service unavailable',
+        'connection', 'timeout', 'timed out', '502', '503', '504'
+    ))
 _EM_DASH = '—'
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1180,9 +1249,18 @@ class _Translator:
         last_error = None
         for attempt in range(1, 5):
             try:
-                candidate = self._client.translate(t)
-                if not candidate or _looks_like_error_response(t, candidate):
-                    raise ValueError('respons layanan terjemahan tidak valid')
+                # Batasi burst request dari 4 worker. Ini bukan mengubah
+                # jumlah worker; hanya mencegah endpoint gratis Google menerima
+                # terlalu banyak request pada saat yang persis bersamaan.
+                try:
+                    with _google_request_gate():
+                        candidate = self._client.translate(t)
+                    if not candidate or _looks_like_error_response(t, candidate):
+                        raise ValueError('respons layanan terjemahan tidak valid')
+                    _google_gate_feedback(True)
+                except Exception as gate_exc:
+                    _google_gate_feedback(False, _is_rate_limit_error(gate_exc))
+                    raise
                 returned_tokens = {
                     token.casefold()
                     for token in _RE_PROTECTION_TOKEN.findall(candidate)
@@ -1203,7 +1281,20 @@ class _Translator:
             except Exception as exc:
                 last_error = exc
                 if attempt < 4:
-                    time.sleep(0.8 * attempt)
+                    # Backoff lebih panjang bila terindikasi throttle/network.
+                    # Jitter mencegah 4 worker mencoba ulang pada saat yang sama.
+                    # Retry cepat untuk error biasa; untuk throttle beri jeda
+                    # secukupnya agar request berikutnya tidak ikut diblokir.
+                    base = (1.15 if _is_rate_limit_error(exc) else 0.45) * attempt
+                    time.sleep(base + random.uniform(0.08, 0.28))
+                    # Client baru pada retry untuk memulihkan session yang
+                    # mungkin sudah menerima halaman blok/error dari provider.
+                    try:
+                        self._client = self._cls(
+                            source=self.source, target=self.target
+                        )
+                    except Exception:
+                        pass
 
         if result is None:
             # Judul standar lazim terdiri dari beberapa klausa yang dipisahkan
@@ -1272,6 +1363,19 @@ class _Translator:
             _idict = self.italic_dict if self.italic_dict is not None else ItalicDictionary()
             result, italic_terms_found = _idict._apply_post(result, final_italic_map)
         return result, italic_terms_found
+
+def _get_worker_translator(source: str, target: str,
+                           custom_dict, italic_dict) -> _Translator:
+    """Satu translator/client per thread worker, dipakai ulang antar-paragraf."""
+    key = (source, target, id(custom_dict), id(italic_dict))
+    cached_key = getattr(_TRANSLATOR_THREAD_LOCAL, 'translator_key', None)
+    tr = getattr(_TRANSLATOR_THREAD_LOCAL, 'translator', None)
+    if tr is None or cached_key != key:
+        tr = _Translator(source, target, custom_dict, italic_dict)
+        _TRANSLATOR_THREAD_LOCAL.translator = tr
+        _TRANSLATOR_THREAD_LOCAL.translator_key = key
+    return tr
+
 
 def _match_capitalization(original: str, translated: str) -> str:
     orig = original.strip(); tran = translated.strip()
@@ -1748,12 +1852,17 @@ class DocxFinalTranslatorEngine:
 
             def _translate_job(index_para):
                 index, para = index_para
-                worker_tr = _Translator(
+                # PENTING: jangan membuat GoogleTranslator baru untuk setiap
+                # paragraf. Empat thread masing-masing memiliki satu client
+                # yang dipakai ulang. Ini jauh lebih stabil terhadap throttle.
+                worker_tr = _get_worker_translator(
                     self.source_lang, self.target_lang,
                     self.custom_dict, self.italic_dict,
                 )
+                before_failed = len(worker_tr.failed_texts)
                 found = _translate_para(para, worker_tr)
-                return index, para, found, bool(worker_tr.failed_texts)
+                failed = len(worker_tr.failed_texts) > before_failed
+                return index, para, found, failed
 
             # Tahap utama: tepat 4 worker translate.
             with ThreadPoolExecutor(max_workers=4, thread_name_prefix='translate') as pool:
@@ -1774,7 +1883,7 @@ class DocxFinalTranslatorEngine:
                         progress_callback, pct,
                         f"[translate 4 worker] {done}/{total} | "
                         f"berhasil={translated_count} | "
-                        f"tersisa={len(failed_paras)} | "
+                        f"gagal-sementara={len(failed_paras)} | "
                         f"[progres-total] {done}/{total + len(failed_paras)}",
                     )
 
@@ -1839,7 +1948,9 @@ class DocxFinalTranslatorEngine:
             if still_failed:
                 return False, (
                     f"{len(still_failed)} bagian masih belum berhasil "
-                    "diterjemahkan setelah pemulihan 1 worker. Dokumen parsial "
+                    "diterjemahkan setelah pemulihan 1 worker. Kondisi ini biasanya "
+                    "terjadi ketika endpoint Google Translate gratis sedang melakukan "
+                    "throttling/rate-limit atau koneksi provider tidak stabil. Dokumen parsial "
                     "Engine 8 sudah disimpan; teks sumber yang gagal diberi "
                     "font merah dan dapat di-download atau "
                     "dipaksa lanjut ke Engine 9."
