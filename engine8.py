@@ -1206,6 +1206,62 @@ class TranslationFailedError(RuntimeError):
     """Mencegah dokumen setengah diterjemahkan tetap disimpan."""
 
 
+
+def _google_gtx_translate(text: str, source: str = 'auto', target: str = 'id') -> str:
+    """Jalur Google Translate kedua yang ringan untuk fallback request.
+
+    Dipanggil hanya saat client ``deep-translator`` gagal/ditolak. Karena itu
+    jalur normal yang sehat tidak mendapat overhead dan kecepatan normal tetap
+    sama. Session disimpan per-thread supaya koneksi HTTP dipakai ulang oleh
+    empat worker.
+    """
+    try:
+        import requests
+    except ImportError as exc:
+        raise RuntimeError('requests belum terpasang') from exc
+
+    session = getattr(_TRANSLATOR_THREAD_LOCAL, 'gtx_session', None)
+    if session is None:
+        session = requests.Session()
+        session.headers.update({
+            'User-Agent': (
+                'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+                'AppleWebKit/537.36 (KHTML, like Gecko) '
+                'Chrome/122.0 Safari/537.36'
+            ),
+            'Accept': 'application/json,text/plain,*/*',
+        })
+        _TRANSLATOR_THREAD_LOCAL.gtx_session = session
+
+    params = {
+        'client': 'gtx',
+        'sl': source or 'auto',
+        'tl': target or 'id',
+        'dt': 't',
+        'q': text,
+    }
+    # Endpoint ini masih memakai backend Google Translate, jadi kualitasnya
+    # konsisten dengan jalur utama. Timeout dibuat singkat agar fallback tidak
+    # menambah waktu signifikan ketika provider benar-benar sedang down.
+    resp = session.get(
+        'https://translate.googleapis.com/translate_a/single',
+        params=params,
+        timeout=(4, 9),
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    if not data or not isinstance(data, list) or not data[0]:
+        raise ValueError('respons Google GTX kosong/tidak valid')
+    pieces = []
+    for item in data[0]:
+        if isinstance(item, list) and item and item[0] is not None:
+            pieces.append(str(item[0]))
+    result = ''.join(pieces).strip()
+    if not result:
+        raise ValueError('hasil Google GTX kosong')
+    return result
+
+
 class _Translator:
     def __init__(self, source: str = 'auto', target: str = 'id', 
                  custom_dict: CustomDictionary | None = None,
@@ -1252,6 +1308,7 @@ class _Translator:
                 # Batasi burst request dari 4 worker. Ini bukan mengubah
                 # jumlah worker; hanya mencegah endpoint gratis Google menerima
                 # terlalu banyak request pada saat yang persis bersamaan.
+                primary_error = None
                 try:
                     with _google_request_gate():
                         candidate = self._client.translate(t)
@@ -1259,8 +1316,30 @@ class _Translator:
                         raise ValueError('respons layanan terjemahan tidak valid')
                     _google_gate_feedback(True)
                 except Exception as gate_exc:
+                    primary_error = gate_exc
                     _google_gate_feedback(False, _is_rate_limit_error(gate_exc))
-                    raise
+                    # Jalur kedua tetap backend Google, tetapi tidak melalui
+                    # wrapper deep-translator. Ini sangat membantu bila yang
+                    # bermasalah adalah session/parser deep-translator, tanpa
+                    # menurunkan akurasi dengan provider berbeda. Karena hanya
+                    # dipanggil setelah primary gagal, performa saat sehat tidak
+                    # berubah.
+                    try:
+                        with _google_request_gate():
+                            candidate = _google_gtx_translate(
+                                t, self.source, self.target
+                            )
+                        if (not candidate or
+                                _looks_like_error_response(t, candidate)):
+                            raise ValueError('respons Google GTX tidak valid')
+                        _google_gate_feedback(True)
+                    except Exception as gtx_exc:
+                        _google_gate_feedback(
+                            False, _is_rate_limit_error(gtx_exc)
+                        )
+                        # Pertahankan error yang paling informatif untuk
+                        # mekanisme backoff/retry di bawah.
+                        raise gtx_exc from primary_error
                 returned_tokens = {
                     token.casefold()
                     for token in _RE_PROTECTION_TOKEN.findall(candidate)
@@ -1887,37 +1966,66 @@ class DocxFinalTranslatorEngine:
                         f"[progres-total] {done}/{total + len(failed_paras)}",
                     )
 
-            # Hanya bagian yang belum berhasil diterjemahkan yang diulang,
-            # secara berurutan dengan tepat 1 worker.
+            # Hanya bagian yang belum berhasil diterjemahkan yang diulang.
+            # Tepat SATU tahap pemulihan, tetap 4 worker. Worker pemulihan
+            # menggunakan client/session sendiri dan jalur Google kedua di
+            # translate_one(), sehingga peluang sukses naik tanpa mengulang
+            # elemen yang sudah berhasil pada tahap normal.
             recovery_total = len(failed_paras)
             still_failed = []
             recovery_success = 0
-            recovery_tr = _Translator(
-                self.source_lang, self.target_lang,
-                self.custom_dict, self.italic_dict,
-            )
-            for recovery_done, (index, para) in enumerate(
-                    sorted(failed_paras, key=lambda item: item[0]), start=1):
-                before = len(recovery_tr.failed_texts)
-                found = _translate_para(para, recovery_tr)
-                failed = len(recovery_tr.failed_texts) > before
-                if failed:
-                    still_failed.append(para)
-                else:
-                    recovery_success += 1
-                    translated_count += 1
-                    italic_count += len(found)
-                # Pemulihan memakai rentang 90%--98%, dihitung murni dari
-                # counter recovery_done/recovery_total (YY/YY).
-                pct = 90 + int(recovery_done / max(recovery_total, 1) * 8)
-                _notify(
-                    progress_callback, pct,
-                    f"[pemulihan 1 worker] {recovery_done}/{recovery_total} | "
-                    f"berhasil={recovery_success} | "
-                    f"tersisa={recovery_total - recovery_done + len(still_failed)} "
-                    f"| [progres-total] {total + recovery_done}/"
-                    f"{total + recovery_total}",
+            recovery_done = 0
+
+            def _recovery_job(index_para):
+                index, para = index_para
+                # Instance per-thread dari executor pemulihan. Karena pool baru,
+                # session/client tidak berbagi state dengan pekerjaan normal.
+                recovery_tr = _get_worker_translator(
+                    self.source_lang, self.target_lang,
+                    self.custom_dict, self.italic_dict,
                 )
+                before_failed = len(recovery_tr.failed_texts)
+                found = _translate_para(para, recovery_tr)
+                failed = len(recovery_tr.failed_texts) > before_failed
+                return index, para, found, failed
+
+            if recovery_total:
+                with ThreadPoolExecutor(
+                    max_workers=4, thread_name_prefix='recovery'
+                ) as pool:
+                    futures = [
+                        pool.submit(_recovery_job, item)
+                        for item in sorted(
+                            failed_paras, key=lambda value: value[0]
+                        )
+                    ]
+                    for future in as_completed(futures):
+                        index, para, found, failed = future.result()
+                        recovery_done += 1
+                        if failed:
+                            still_failed.append((index, para))
+                        else:
+                            recovery_success += 1
+                            translated_count += 1
+                            italic_count += len(found)
+
+                        pct = 90 + int(
+                            recovery_done / max(recovery_total, 1) * 8
+                        )
+                        _notify(
+                            progress_callback, pct,
+                            f"[pemulihan 4 worker] "
+                            f"{recovery_done}/{recovery_total} | "
+                            f"berhasil={recovery_success} | "
+                            f"tersisa={recovery_total - recovery_done + len(still_failed)} "
+                            f"| [progres-total] {total + recovery_done}/"
+                            f"{total + recovery_total}",
+                        )
+
+            # Urutkan kembali sesuai posisi dokumen sebelum penandaan merah.
+            still_failed = [
+                para for _, para in sorted(still_failed, key=lambda x: x[0])
+            ]
 
             # Dipakai ringkasan dan UI peringatan. Dokumen parsial tetap
             # disimpan agar dapat di-download atau dipaksa lanjut ke Engine 9.
@@ -1948,7 +2056,7 @@ class DocxFinalTranslatorEngine:
             if still_failed:
                 return False, (
                     f"{len(still_failed)} bagian masih belum berhasil "
-                    "diterjemahkan setelah pemulihan 1 worker. Kondisi ini biasanya "
+                    "diterjemahkan setelah pemulihan 4 worker. Kondisi ini biasanya "
                     "terjadi ketika endpoint Google Translate gratis sedang melakukan "
                     "throttling/rate-limit atau koneksi provider tidak stabil. Dokumen parsial "
                     "Engine 8 sudah disimpan; teks sumber yang gagal diberi "
