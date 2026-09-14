@@ -1324,6 +1324,63 @@ class _Translator:
         dst = {x.casefold() for x in _RE_PROTECTION_TOKEN.findall(clean(translated_text))}
         return src == dst
 
+    @staticmethod
+    def _repair_protection_tokens(source_text: str, translated_text: str) -> str:
+        """Pulihkan token proteksi yang hanya berubah kosmetik oleh Google.
+
+        Google kadang menyisipkan spasi / tanda baca di tengah placeholder,
+        misalnya ``ZXQTKABC123QXZ`` menjadi ``ZXQ TK ABC123 QXZ``. Secara
+        semantik terjemahan sebenarnya berhasil, tetapi validasi lama
+        menghitungnya sebagai gagal. Fungsi ini hanya menyatukan kembali token
+        yang memang ada pada source; isi terjemahan di luar token tidak diubah.
+        """
+        result = translated_text or ''
+        source_tokens = _RE_PROTECTION_TOKEN.findall(source_text or '')
+        for token in source_tokens:
+            # Cocokkan setiap karakter token dengan toleransi whitespace dan
+            # separator ringan di antaranya. Batas alfanumerik mencegah match
+            # ke kata normal di hasil terjemahan.
+            chars = [re.escape(ch) for ch in token]
+            flexible = r'[\s\-_.:/\\]*'.join(chars)
+            pattern = re.compile(
+                r'(?<![A-Za-z0-9])' + flexible + r'(?![A-Za-z0-9])',
+                re.IGNORECASE,
+            )
+            result, n = pattern.subn(token, result, count=1)
+            if n:
+                continue
+
+            # Fallback kedua: Google kadang memberi spasi hanya di batas
+            # ZXQ / tipe / payload / QXZ. Ini lebih konservatif daripada
+            # pencocokan karakter-per-karakter.
+            m = re.fullmatch(r'(ZXQ)(TK|IT|SRC)([A-F0-9]{12})(QXZ)', token, re.I)
+            if m:
+                parts = [re.escape(x) for x in m.groups()]
+                coarse = re.compile(
+                    r'(?<![A-Za-z0-9])' + r'[\s\-_.:/\\]*'.join(parts)
+                    + r'(?![A-Za-z0-9])', re.IGNORECASE
+                )
+                result = coarse.sub(token, result, count=1)
+        return result
+
+    def _validate_candidate(self, source_text: str, candidate: str) -> str:
+        """Validasi hasil provider sambil menghindari false-failure token."""
+        if not candidate or _looks_like_error_response(source_text, candidate):
+            raise ValueError('respons Google Translate tidak valid')
+        candidate = self._repair_protection_tokens(source_text, candidate)
+        if not self._tokens_preserved(source_text, candidate):
+            raise ValueError('token kamus/format berubah atau hilang')
+
+        source_plain = _RE_PROTECTION_TOKEN.sub('', source_text)
+        result_plain = _RE_PROTECTION_TOKEN.sub('', candidate)
+        if (
+            len(re.findall(r'[A-Za-z]{3,}', source_plain)) >= 3
+            and re.sub(r'\s+', ' ', source_plain).strip().casefold()
+            == re.sub(r'\s+', ' ', result_plain).strip().casefold()
+        ):
+            raise ValueError('teks dikembalikan tanpa diterjemahkan')
+        return candidate
+
     def translate_one(self, text: str, italic_map: dict = None) -> tuple[str, list[str]]:
         t = text.strip()
         if not t or _skip_text(t):
@@ -1354,29 +1411,27 @@ class _Translator:
         for attempt in range(2):
             try:
                 candidate = self._google_once(t)
-                if not candidate or _looks_like_error_response(t, candidate):
-                    raise ValueError('respons Google Translate tidak valid')
-                if not self._tokens_preserved(t, candidate):
-                    raise ValueError('token kamus/format berubah atau hilang')
-
-                source_plain = _RE_PROTECTION_TOKEN.sub('', t)
-                result_plain = _RE_PROTECTION_TOKEN.sub('', candidate)
-                # Paragraf bahasa Inggris yang identik dianggap belum berhasil.
-                # Pemeriksaan ini tidak diterapkan pada teks pendek/teknis yang
-                # memang secara sah dapat tidak berubah.
-                if (
-                    len(re.findall(r'[A-Za-z]{3,}', source_plain)) >= 3
-                    and re.sub(r'\s+', ' ', source_plain).strip().casefold()
-                    == re.sub(r'\s+', ' ', result_plain).strip().casefold()
-                ):
-                    raise ValueError('teks dikembalikan tanpa diterjemahkan')
-
-                result = candidate
+                result = self._validate_candidate(t, candidate)
                 break
             except Exception as exc:
                 last_error = exc
                 if attempt == 0:
                     time.sleep(0.8)
+
+        # Jalur Google kedua hanya dipakai jika dua percobaan deep-translator
+        # gagal. Endpoint ini tetap Google Translate (gtx), sehingga tidak
+        # mengganti provider/karakter terjemahan. Pada kondisi deployment saat
+        # endpoint web yang dipakai deep-translator sedang throttle, jalur ini
+        # sering tetap merespons. Karena hanya aktif untuk elemen gagal,
+        # overhead terhadap kecepatan normal sangat kecil.
+        if result is None:
+            try:
+                candidate = _google_gtx_translate(
+                    t, source=self.source, target=self.target
+                )
+                result = self._validate_candidate(t, candidate)
+            except Exception as gtx_error:
+                last_error = gtx_error
 
         # Judul dengan em dash dapat dicoba per segmen hanya setelah dua
         # request Google di atas gagal. Tetap GoogleTranslator, sehingga tidak
@@ -1394,14 +1449,10 @@ class _Translator:
                             continue
                         # Satu percobaan per segmen; jangan rekursif berulang.
                         seg = self._google_once(part)
-                        if not seg or _looks_like_error_response(part, seg):
-                            raise ValueError('segmen judul gagal diterjemahkan')
-                        if not self._tokens_preserved(part, seg):
-                            raise ValueError('token segmen judul berubah/hilang')
+                        seg = self._validate_candidate(part, seg)
                         translated_parts.append(seg)
                     candidate = ''.join(translated_parts)
-                    if candidate and self._tokens_preserved(t, candidate):
-                        result = candidate
+                    result = self._validate_candidate(t, candidate)
                 except Exception as split_error:
                     last_error = split_error
 
