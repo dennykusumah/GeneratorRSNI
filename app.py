@@ -20,41 +20,67 @@ from urllib.request import Request, urlopen
 # ─────────────────────────────────────────────────────────────────────────────
 
 # Resource ini bersifat global untuk seluruh sesi pada satu proses Streamlit.
-# Engine dan alur aplikasi tidak diubah; guard hanya menentukan sesi mana yang
-# sedang berhak menjalankan pipeline Generator RSNI.
+# Versi V2 sengaja memakai fungsi cache baru agar lock lama/stale dari deployment
+# sebelumnya tidak ikut terbawa setelah app.py diperbarui.
+_GENERATOR_LOCK_STALE_SECONDS = 15 * 60
+
 @st.cache_resource
-def _get_generator_usage_guard():
+def _get_generator_usage_guard_v2():
     return {
         "mutex": threading.Lock(),
         "owner": None,
+        "last_activity": 0.0,
     }
 
-# ID sesi sudah digunakan aplikasi untuk nama file; dibuat lebih awal agar guard
-# dan penamaan file memakai identitas sesi yang sama.
+# ID sesi browser dibuat sekali dan dipertahankan oleh Streamlit session_state.
 _GENERATOR_SESSION_ID = st.session_state.setdefault('_sid', uuid.uuid4().hex[:8])
 
 def _generator_busy_for_other_user() -> bool:
-    guard = _get_generator_usage_guard()
+    """True hanya bila sesi LAIN benar-benar sedang memegang lock aktif."""
+    guard = _get_generator_usage_guard_v2()
+    now = time.monotonic()
     with guard["mutex"]:
         owner = guard["owner"]
-        return owner is not None and owner != _GENERATOR_SESSION_ID
+        if owner is None:
+            return False
+        # Pulihkan otomatis lock yang tertinggal karena tab ditutup, koneksi
+        # terputus, exception, atau deployment/reload yang tidak sempat release.
+        if now - float(guard.get("last_activity", 0.0)) > _GENERATOR_LOCK_STALE_SECONDS:
+            guard["owner"] = None
+            guard["last_activity"] = 0.0
+            return False
+        return owner != _GENERATOR_SESSION_ID
 
 def _acquire_generator_usage() -> bool:
-    """Ambil hak penggunaan Generator RSNI secara atomik."""
-    guard = _get_generator_usage_guard()
+    """Ambil hak penggunaan secara atomik; lock stale boleh direbut kembali."""
+    guard = _get_generator_usage_guard_v2()
+    now = time.monotonic()
     with guard["mutex"]:
         owner = guard["owner"]
-        if owner is None or owner == _GENERATOR_SESSION_ID:
+        stale = (
+            owner is not None
+            and now - float(guard.get("last_activity", 0.0)) > _GENERATOR_LOCK_STALE_SECONDS
+        )
+        if owner is None or owner == _GENERATOR_SESSION_ID or stale:
             guard["owner"] = _GENERATOR_SESSION_ID
+            guard["last_activity"] = now
             return True
         return False
 
+def _touch_generator_usage() -> None:
+    """Perbarui aktivitas lock milik sesi ini selama Engine 1-9 berjalan."""
+    guard = _get_generator_usage_guard_v2()
+    with guard["mutex"]:
+        if guard["owner"] == _GENERATOR_SESSION_ID:
+            guard["last_activity"] = time.monotonic()
+
 def _release_generator_usage() -> None:
     """Lepas hak penggunaan hanya jika sesi ini adalah pemiliknya."""
-    guard = _get_generator_usage_guard()
+    guard = _get_generator_usage_guard_v2()
     with guard["mutex"]:
         if guard["owner"] == _GENERATOR_SESSION_ID:
             guard["owner"] = None
+            guard["last_activity"] = 0.0
 
 @st.dialog("Generator RSNI")
 def _show_generator_busy_popup():
@@ -1265,6 +1291,7 @@ if (st.session_state.get('_run_process') and
                     _release_generator_usage()
                     st.rerun()
         # Fallback bila mode paksa tidak aktif atau tidak ada output valid.
+        _release_generator_usage()
         st.session_state['_process_error'] = (
             f'❌ Error Proses Engine {_resume}: {_resume_error}'
         )
@@ -1332,6 +1359,7 @@ if st.session_state.get('_run_process') and st.session_state.get('_target_file')
 
     # Helper Update UI — TIDAK menyentuh timer iframe, hanya status & progress
     def update_ui(pct, msg, skip_progress=False):
+        _touch_generator_usage()
         parts = msg.split("\n", 1)
         line1 = parts[0].strip()
         line2 = parts[1].strip() if len(parts) > 1 else ""
@@ -1616,6 +1644,8 @@ if st.session_state.get('_run_process') and st.session_state.get('_target_file')
         _release_generator_usage()
 
     except Exception as e:
+        # Jangan biarkan lock tertinggal bila Engine mana pun gagal.
+        _release_generator_usage()
         st.session_state['_process_error'] = f"❌ Error Proses: {e}"
         st.session_state['_run_process'] = False
         st.session_state['_show_results'] = False
