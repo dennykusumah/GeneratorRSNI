@@ -16,70 +16,80 @@ from io import BytesIO
 from urllib.request import Request, urlopen
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SINGLE-USER GUARD — hanya satu sesi yang boleh memakai Generator RSNI
+# SINGLE-USER GUARD — hanya satu proses Engine 1–9 yang boleh berjalan
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Resource ini bersifat global untuk seluruh sesi pada satu proses Streamlit.
-# Versi V2 sengaja memakai fungsi cache baru agar lock lama/stale dari deployment
-# sebelumnya tidak ikut terbawa setelah app.py diperbarui.
+# V3: lock dikaitkan dengan thread Streamlit yang BENAR-BENAR sedang menjalankan
+# Engine 1–9. Ini mencegah "ghost lock" dari sesi/tab lama. Jika thread pemilik
+# sudah berhenti, lock langsung dianggap bebas tanpa harus menunggu 15 menit.
 _GENERATOR_LOCK_STALE_SECONDS = 15 * 60
 
 @st.cache_resource
-def _get_generator_usage_guard_v2():
+def _get_generator_usage_guard_v3():
     return {
         "mutex": threading.Lock(),
         "owner": None,
+        "owner_thread": None,
         "last_activity": 0.0,
     }
 
 # ID sesi browser dibuat sekali dan dipertahankan oleh Streamlit session_state.
 _GENERATOR_SESSION_ID = st.session_state.setdefault('_sid', uuid.uuid4().hex[:8])
 
+def _clear_dead_generator_owner(guard, now: float) -> None:
+    """Bersihkan owner bila thread prosesnya sudah mati atau lease benar-benar stale."""
+    owner = guard.get("owner")
+    if owner is None:
+        return
+
+    owner_thread = guard.get("owner_thread")
+    thread_dead = owner_thread is not None and not owner_thread.is_alive()
+    stale = now - float(guard.get("last_activity", 0.0)) > _GENERATOR_LOCK_STALE_SECONDS
+
+    if thread_dead or stale:
+        guard["owner"] = None
+        guard["owner_thread"] = None
+        guard["last_activity"] = 0.0
+
 def _generator_busy_for_other_user() -> bool:
-    """True hanya bila sesi LAIN benar-benar sedang memegang lock aktif."""
-    guard = _get_generator_usage_guard_v2()
+    """True hanya bila sesi LAIN sedang menjalankan Engine 1–9 pada thread aktif."""
+    guard = _get_generator_usage_guard_v3()
     now = time.monotonic()
     with guard["mutex"]:
-        owner = guard["owner"]
-        if owner is None:
-            return False
-        # Pulihkan otomatis lock yang tertinggal karena tab ditutup, koneksi
-        # terputus, exception, atau deployment/reload yang tidak sempat release.
-        if now - float(guard.get("last_activity", 0.0)) > _GENERATOR_LOCK_STALE_SECONDS:
-            guard["owner"] = None
-            guard["last_activity"] = 0.0
-            return False
-        return owner != _GENERATOR_SESSION_ID
+        _clear_dead_generator_owner(guard, now)
+        owner = guard.get("owner")
+        return owner is not None and owner != _GENERATOR_SESSION_ID
 
 def _acquire_generator_usage() -> bool:
-    """Ambil hak penggunaan secara atomik; lock stale boleh direbut kembali."""
-    guard = _get_generator_usage_guard_v2()
+    """Ambil hak penggunaan secara atomik untuk run Engine 1–9 saat ini."""
+    guard = _get_generator_usage_guard_v3()
     now = time.monotonic()
+    current_thread = threading.current_thread()
     with guard["mutex"]:
-        owner = guard["owner"]
-        stale = (
-            owner is not None
-            and now - float(guard.get("last_activity", 0.0)) > _GENERATOR_LOCK_STALE_SECONDS
-        )
-        if owner is None or owner == _GENERATOR_SESSION_ID or stale:
+        _clear_dead_generator_owner(guard, now)
+        owner = guard.get("owner")
+        if owner is None or owner == _GENERATOR_SESSION_ID:
             guard["owner"] = _GENERATOR_SESSION_ID
+            guard["owner_thread"] = current_thread
             guard["last_activity"] = now
             return True
         return False
 
 def _touch_generator_usage() -> None:
-    """Perbarui aktivitas lock milik sesi ini selama Engine 1-9 berjalan."""
-    guard = _get_generator_usage_guard_v2()
+    """Perbarui aktivitas lock milik sesi ini selama Engine 1–9 berjalan."""
+    guard = _get_generator_usage_guard_v3()
     with guard["mutex"]:
-        if guard["owner"] == _GENERATOR_SESSION_ID:
+        if guard.get("owner") == _GENERATOR_SESSION_ID:
+            guard["owner_thread"] = threading.current_thread()
             guard["last_activity"] = time.monotonic()
 
 def _release_generator_usage() -> None:
     """Lepas hak penggunaan hanya jika sesi ini adalah pemiliknya."""
-    guard = _get_generator_usage_guard_v2()
+    guard = _get_generator_usage_guard_v3()
     with guard["mutex"]:
-        if guard["owner"] == _GENERATOR_SESSION_ID:
+        if guard.get("owner") == _GENERATOR_SESSION_ID:
             guard["owner"] = None
+            guard["owner_thread"] = None
             guard["last_activity"] = 0.0
 
 @st.dialog("Generator RSNI")
@@ -1130,10 +1140,10 @@ _generator_busy_popup_shown = False
 
 if btn_process:
     if uploaded_file:
-        if not _acquire_generator_usage():
-            if not _generator_busy_popup_shown:
-                _show_generator_busy_popup()
-            st.stop()
+        # Jangan mengambil global lock di tahap persiapan/upload.
+        # Lock baru diambil pada blok eksekusi Engine 1–9 setelah rerun.
+        # Dengan begitu tab/sesi lama tidak meninggalkan ghost lock hanya karena
+        # user menekan Proses lalu halaman reload/iframe membuat sesi baru.
         try:
             st.session_state.pop('_process_error', None)
             st.session_state.pop('_last_engine', None)
@@ -1163,7 +1173,7 @@ if btn_process:
             st.session_state['_ics_number'] = ics_number
             st.rerun()
         except Exception as upload_error:
-            _release_generator_usage()
+            # Belum ada global lock pada tahap persiapan file.
             # Bahkan kegagalan sebelum Engine 1 tetap masuk ke UI recovery.
             st.session_state['_process_error'] = (
                 f'❌ Error menyiapkan proses: {upload_error}'
