@@ -1138,153 +1138,135 @@ class TranslationFailedError(RuntimeError):
 
 
 class _Translator:
-    """
-    Translator RSNI dengan pola request yang disamakan dengan Generator SNI.
-
-    Perbedaan penting terhadap versi RSNI sebelumnya:
-      * tidak memakai satu client GoogleTranslator persisten;
-      * setiap request membuat instance GoogleTranslator baru, sama seperti
-        Generator SNI;
-      * retry utama hanya 2 kali dengan jeda 0,8 detik;
-      * tetap mempertahankan proteksi Kamus SNI, istilah asing, serta
-        penolakan halaman error agar format/isi RSNI tidak rusak.
-    """
-    def __init__(self, source: str = 'auto', target: str = 'id',
+    def __init__(self, source: str = 'auto', target: str = 'id', 
                  custom_dict: CustomDictionary | None = None,
                  italic_dict: ItalicDictionary | None = None):
-        try:
-            from deep_translator import GoogleTranslator
-        except ImportError:
-            raise ImportError("Jalankan: pip install deep-translator")
+        try: from deep_translator import GoogleTranslator
+        except ImportError: raise ImportError("Jalankan: pip install deep-translator")
         self._cls = GoogleTranslator
-        self.source = source
-        self.target = target
-        self.custom_dict = custom_dict
-        self.italic_dict = italic_dict
+        self.source = source; self.target = target
+        self.custom_dict = custom_dict; self.italic_dict = italic_dict
+        self._client = self._cls(source=self.source, target=self.target)
         self.failed_texts: list[str] = []
 
-    def _google_once(self, text: str) -> str | None:
-        """Satu request Google Translate, mengikuti pola Generator SNI."""
-        result = self._cls(source=self.source, target=self.target).translate(text)
-        if not result or _looks_like_error_response(text, result):
-            return None
-        return result
-
     def translate_one(self, text: str, italic_map: dict = None) -> tuple[str, list[str]]:
-        original_text = text
         t = text.strip()
-        if not t or _skip_text(t):
-            return text, []
-
+        if not t or _skip_text(t): return text, []
         token_map = {}
         if self.custom_dict and len(self.custom_dict) > 0:
             t, token_map = self.custom_dict._apply_pre(t)
         final_italic_map = italic_map or {}
 
-        # Jika seluruh isi sudah ditentukan oleh Kamus SNI, tidak perlu
-        # mengirim request eksternal.
+        # Jika seluruh teks sudah dicakup Kamus SNI, hasil kamus adalah hasil
+        # final. Ini berlaku untuk satu token ("Introduction") maupun beberapa
+        # token yang hanya dipisahkan tanda baca, angka bagian, atau em dash
+        # (judul Cover). Rangkaian token semacam itu tidak memiliki bahasa
+        # alami untuk diterjemahkan dan sering ditolak Google Translate.
         uncovered = _RE_PROTECTION_TOKEN.sub('', t)
         uncovered_words = re.findall(r'[A-Za-zÀ-ÿ]{2,}', uncovered)
         if token_map and not uncovered_words:
             result = self.custom_dict._apply_post(t, token_map)
             italic_terms_found = []
             if final_italic_map:
-                _idict = self.italic_dict if self.italic_dict is not None else ItalicDictionary()
-                result, italic_terms_found = _idict._apply_post(result, final_italic_map)
+                result, italic_terms_found = self.italic_dict._apply_post(
+                    result, final_italic_map
+                )
             return result, italic_terms_found
 
         expected_tokens = {
             token.casefold() for token in _RE_PROTECTION_TOKEN.findall(t)
         }
-
         result = None
         last_error = None
-
-        # Generator SNI: request pertama, tunggu 0,8 detik jika gagal, lalu
-        # request kedua. Tidak ada 4 request berturut-turut pada tiap teks.
-        for attempt in range(2):
+        for attempt in range(1, 5):
             try:
-                candidate = self._google_once(t)
-                if not candidate:
+                candidate = self._client.translate(t)
+                if not candidate or _looks_like_error_response(t, candidate):
                     raise ValueError('respons layanan terjemahan tidak valid')
-
-                # Kamus/format RSNI menggunakan token proteksi. Terima hasil
-                # hanya jika token tetap utuh; ini satu-satunya validasi ekstra
-                # yang memang diperlukan agar dokumen RSNI tidak rusak.
                 returned_tokens = {
-                    token.casefold() for token in _RE_PROTECTION_TOKEN.findall(candidate)
+                    token.casefold()
+                    for token in _RE_PROTECTION_TOKEN.findall(candidate)
                 }
                 if returned_tokens != expected_tokens:
                     raise ValueError('token kamus/format berubah atau hilang')
 
-                # Sama dengan Generator SNI: hasil yang identik dengan sumber
-                # tidak otomatis dianggap error. Beberapa nama teknis/istilah
-                # memang dapat dikembalikan apa adanya oleh Google Translate.
+                source_plain = _RE_PROTECTION_TOKEN.sub('', t)
+                result_plain = _RE_PROTECTION_TOKEN.sub('', candidate)
+                if (
+                    re.search(r'[A-Za-z]{3}', source_plain)
+                    and re.sub(r'\s+', ' ', source_plain).strip().casefold()
+                    == re.sub(r'\s+', ' ', result_plain).strip().casefold()
+                ):
+                    raise ValueError('teks dikembalikan tanpa diterjemahkan')
                 result = candidate
                 break
             except Exception as exc:
                 last_error = exc
-                if attempt == 0:
-                    time.sleep(0.8)
+                if attempt < 4:
+                    time.sleep(0.8 * attempt)
 
-        # Jika judul panjang gagal sebagai satu request, pecah per em-dash.
-        # Ini dipertahankan karena meningkatkan peluang terjemahan tanpa
-        # menambah konkurensi/rate-limit.
         if result is None:
+            # Judul standar lazim terdiri dari beberapa klausa yang dipisahkan
+            # em dash. Jika layanan menolak judul panjang sebagai satu request,
+            # coba setiap klausa secara mandiri lalu gabungkan kembali dengan
+            # tanda pisah asli. Ini juga membuat bagian yang sudah dicakup
+            # kamus langsung diselesaikan lokal per klausa.
             title_parts = re.split(r'(\s*[—–]\s*)', t)
             if len(title_parts) > 1:
                 translated_parts = []
-                split_ok = True
-                for part in title_parts:
-                    if not part:
-                        continue
-                    if re.fullmatch(r'\s*[—–]\s*', part):
-                        translated_parts.append(part)
-                        continue
-                    part_result, _ = self.translate_one(part, {})
-                    # translate_one mengembalikan teks sumber jika provider
-                    # benar-benar gagal; tetap gabungkan seperti Generator SNI.
-                    translated_parts.append(part_result)
-                if split_ok:
+                try:
+                    for part in title_parts:
+                        if not part:
+                            continue
+                        if re.fullmatch(r'\s*[—–]\s*', part):
+                            translated_parts.append(part)
+                        else:
+                            part_result, _ = self.translate_one(part, {})
+                            translated_parts.append(part_result)
                     result = ''.join(translated_parts)
+                except TranslationFailedError as split_error:
+                    last_error = split_error
 
-        # Fallback cadangan dipertahankan untuk meningkatkan hasil nyata.
         if result is None:
+            # Provider cadangan untuk kondisi Google Translate sedang menolak
+            # request/rate-limited. Deep-translator menyertakan MyMemory;
+            # kegagalannya tetap ditangani tanpa merusak dokumen.
             try:
                 from deep_translator import MyMemoryTranslator
-                fallback_source = 'english' if self.source in ('auto', 'en') else self.source
-                fallback_target = 'indonesian' if self.target == 'id' else self.target
+                fallback_source = (
+                    'english' if self.source in ('auto', 'en') else self.source
+                )
+                fallback_target = (
+                    'indonesian' if self.target == 'id' else self.target
+                )
                 fallback = MyMemoryTranslator(
                     source=fallback_source, target=fallback_target
                 ).translate(t)
                 if fallback and not _looks_like_error_response(t, fallback):
                     fallback_tokens = {
-                        token.casefold() for token in _RE_PROTECTION_TOKEN.findall(fallback)
+                        token.casefold()
+                        for token in _RE_PROTECTION_TOKEN.findall(fallback)
                     }
                     if fallback_tokens == expected_tokens:
                         result = fallback
-            except Exception as exc:
-                last_error = exc
+            except Exception as fallback_error:
+                last_error = fallback_error
 
         if result is None:
             safe_title = _TITLE_SAFE_FALLBACKS.get(
-                re.sub(r'\s+', ' ', original_text).strip().casefold()
+                re.sub(r'\s+', ' ', text).strip().casefold()
             )
             if safe_title:
                 result = safe_title
 
         if result is None:
-            # Sama dengan Generator SNI: pertahankan sumber jika kedua request
-            # gagal, sehingga satu gangguan layanan tidak menjatuhkan pipeline.
-            # failed_texts tetap dicatat agar pemulihan 1 worker dapat mencoba
-            # sekali lagi secara aman.
-            preview = re.sub(r'\s+', ' ', original_text).strip()[:100]
+            preview = re.sub(r'\s+', ' ', text).strip()[:100]
+            # Jangan gagalkan seluruh pipeline karena satu request eksternal.
+            # Simpan teks sumber (token kamus tetap dipulihkan di bawah) dan
+            # laporkan sebagai peringatan pada ringkasan proses.
             self.failed_texts.append(preview)
             result = t
-
-        if token_map:
-            result = self.custom_dict._apply_post(result, token_map)
-
+        if token_map: result = self.custom_dict._apply_post(result, token_map)
         italic_terms_found = []
         if final_italic_map:
             _idict = self.italic_dict if self.italic_dict is not None else ItalicDictionary()
@@ -1764,37 +1746,40 @@ class DocxFinalTranslatorEngine:
             italic_count = 0
             failed_paras = []
 
-            # Generator SNI memproses terjemahan secara berurutan.
-            # RSNI sekarang mengikuti pola yang sama untuk mengurangi
-            # rate-limit dan menjaga peluang berhasil setinggi Generator SNI.
-            main_tr = _Translator(
-                self.source_lang, self.target_lang,
-                self.custom_dict, self.italic_dict,
-            )
-
-            for index, para in enumerate(translation_queue):
-                before = len(main_tr.failed_texts)
-                found = _translate_para(para, main_tr)
-                failed = len(main_tr.failed_texts) > before
-                done += 1
-                italic_count += len(found)
-
-                if failed:
-                    failed_paras.append((index, para))
-                else:
-                    translated_count += 1
-
-                pct = 10 + int(done / max(total, 1) * 80)
-                _notify(
-                    progress_callback, pct,
-                    f"[translate 1 worker] {done}/{total} | "
-                    f"berhasil={translated_count} | "
-                    f"tersisa={len(failed_paras)} | "
-                    f"[progres-total] {done}/{total + len(failed_paras)}",
+            def _translate_job(index_para):
+                index, para = index_para
+                worker_tr = _Translator(
+                    self.source_lang, self.target_lang,
+                    self.custom_dict, self.italic_dict,
                 )
+                found = _translate_para(para, worker_tr)
+                return index, para, found, bool(worker_tr.failed_texts)
 
-            # Pemulihan tetap 1 worker, tetapi memakai translator baru agar
-            # request yang sebelumnya gagal memperoleh sesi/request bersih.
+            # Tahap utama: tepat 4 worker translate.
+            with ThreadPoolExecutor(max_workers=4, thread_name_prefix='translate') as pool:
+                futures = [pool.submit(_translate_job, item)
+                           for item in enumerate(translation_queue)]
+                for future in as_completed(futures):
+                    index, para, found, failed = future.result()
+                    done += 1
+                    italic_count += len(found)
+                    if failed:
+                        failed_paras.append((index, para))
+                    else:
+                        translated_count += 1
+                    # Translate normal memakai rentang 10%--90%, dihitung
+                    # murni dari counter done/total (XXX/XXX).
+                    pct = 10 + int(done / max(total, 1) * 80)
+                    _notify(
+                        progress_callback, pct,
+                        f"[translate 4 worker] {done}/{total} | "
+                        f"berhasil={translated_count} | "
+                        f"tersisa={len(failed_paras)} | "
+                        f"[progres-total] {done}/{total + len(failed_paras)}",
+                    )
+
+            # Hanya bagian yang belum berhasil diterjemahkan yang diulang,
+            # secara berurutan dengan tepat 1 worker.
             recovery_total = len(failed_paras)
             still_failed = []
             recovery_success = 0
@@ -1802,20 +1787,19 @@ class DocxFinalTranslatorEngine:
                 self.source_lang, self.target_lang,
                 self.custom_dict, self.italic_dict,
             )
-
             for recovery_done, (index, para) in enumerate(
                     sorted(failed_paras, key=lambda item: item[0]), start=1):
                 before = len(recovery_tr.failed_texts)
                 found = _translate_para(para, recovery_tr)
                 failed = len(recovery_tr.failed_texts) > before
-
                 if failed:
                     still_failed.append(para)
                 else:
                     recovery_success += 1
                     translated_count += 1
                     italic_count += len(found)
-
+                # Pemulihan memakai rentang 90%--98%, dihitung murni dari
+                # counter recovery_done/recovery_total (YY/YY).
                 pct = 90 + int(recovery_done / max(recovery_total, 1) * 8)
                 _notify(
                     progress_callback, pct,
