@@ -16,87 +16,6 @@ from io import BytesIO
 from urllib.request import Request, urlopen
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SINGLE-USER GUARD — hanya satu proses Engine 1–9 yang boleh berjalan
-# ─────────────────────────────────────────────────────────────────────────────
-
-# V3: lock dikaitkan dengan thread Streamlit yang BENAR-BENAR sedang menjalankan
-# Engine 1–9. Ini mencegah "ghost lock" dari sesi/tab lama. Jika thread pemilik
-# sudah berhenti, lock langsung dianggap bebas tanpa harus menunggu 15 menit.
-_GENERATOR_LOCK_STALE_SECONDS = 15 * 60
-
-@st.cache_resource
-def _get_generator_usage_guard_v3():
-    return {
-        "mutex": threading.Lock(),
-        "owner": None,
-        "owner_thread": None,
-        "last_activity": 0.0,
-    }
-
-# ID sesi browser dibuat sekali dan dipertahankan oleh Streamlit session_state.
-_GENERATOR_SESSION_ID = st.session_state.setdefault('_sid', uuid.uuid4().hex[:8])
-
-def _clear_dead_generator_owner(guard, now: float) -> None:
-    """Bersihkan owner bila thread prosesnya sudah mati atau lease benar-benar stale."""
-    owner = guard.get("owner")
-    if owner is None:
-        return
-
-    owner_thread = guard.get("owner_thread")
-    thread_dead = owner_thread is not None and not owner_thread.is_alive()
-    stale = now - float(guard.get("last_activity", 0.0)) > _GENERATOR_LOCK_STALE_SECONDS
-
-    if thread_dead or stale:
-        guard["owner"] = None
-        guard["owner_thread"] = None
-        guard["last_activity"] = 0.0
-
-def _generator_busy_for_other_user() -> bool:
-    """True hanya bila sesi LAIN sedang menjalankan Engine 1–9 pada thread aktif."""
-    guard = _get_generator_usage_guard_v3()
-    now = time.monotonic()
-    with guard["mutex"]:
-        _clear_dead_generator_owner(guard, now)
-        owner = guard.get("owner")
-        return owner is not None and owner != _GENERATOR_SESSION_ID
-
-def _acquire_generator_usage() -> bool:
-    """Ambil hak penggunaan secara atomik untuk run Engine 1–9 saat ini."""
-    guard = _get_generator_usage_guard_v3()
-    now = time.monotonic()
-    current_thread = threading.current_thread()
-    with guard["mutex"]:
-        _clear_dead_generator_owner(guard, now)
-        owner = guard.get("owner")
-        if owner is None or owner == _GENERATOR_SESSION_ID:
-            guard["owner"] = _GENERATOR_SESSION_ID
-            guard["owner_thread"] = current_thread
-            guard["last_activity"] = now
-            return True
-        return False
-
-def _touch_generator_usage() -> None:
-    """Perbarui aktivitas lock milik sesi ini selama Engine 1–9 berjalan."""
-    guard = _get_generator_usage_guard_v3()
-    with guard["mutex"]:
-        if guard.get("owner") == _GENERATOR_SESSION_ID:
-            guard["owner_thread"] = threading.current_thread()
-            guard["last_activity"] = time.monotonic()
-
-def _release_generator_usage() -> None:
-    """Lepas hak penggunaan hanya jika sesi ini adalah pemiliknya."""
-    guard = _get_generator_usage_guard_v3()
-    with guard["mutex"]:
-        if guard.get("owner") == _GENERATOR_SESSION_ID:
-            guard["owner"] = None
-            guard["owner_thread"] = None
-            guard["last_activity"] = 0.0
-
-@st.dialog("Generator RSNI")
-def _show_generator_busy_popup():
-    st.warning("Aplikasi sedang digunakan oleh user lain. Tunggu beberapa saat lagi.")
-
-# ─────────────────────────────────────────────────────────────────────────────
 # AUTO-CLEANUP — pembersihan file temporer otomatis
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -1005,7 +924,7 @@ def _render_header_with_live_kamus():
 
     st.markdown(f"""
         <div class="app-header">
-            <div class="badge">Generator RSNI</div>
+            <div class="badge">Generator RSNI · Dashboard v9</div>
             <h1>📑 ISO to RSNI Converter</h1>
             <p>Memformat & Menerjemahan Dokumen Standar ISO Menjadi Draft RSNI Secara Otomatis</p>
             <div class="stats-row">
@@ -1099,7 +1018,6 @@ if st.session_state.get('_process_error'):
     _back_col, _download_col, _continue_col = st.columns(3)
     with _back_col:
         if st.button('↩ Kembali', key='error_back', use_container_width=True):
-            _release_generator_usage()
             _reset_to_start()
             st.rerun()
     with _download_col:
@@ -1130,20 +1048,8 @@ if st.session_state.get('_process_error'):
 # LOGIC EXECUTION
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Popup BUSY tidak diperiksa pada setiap rerun Streamlit.
-# Perubahan nilai input (No. SNI, ICS, upload, dll.) memicu rerun, sehingga
-# pengecekan global di sini sebelumnya membuat popup muncul meskipun user
-# belum menekan tombol Proses. Popup sekarang hanya dipanggil ketika user
-# benar-benar mencoba memulai/melanjutkan proses dan guard sedang dimiliki
-# oleh sesi lain.
-_generator_busy_popup_shown = False
-
 if btn_process:
     if uploaded_file:
-        # Jangan mengambil global lock di tahap persiapan/upload.
-        # Lock baru diambil pada blok eksekusi Engine 1–9 setelah rerun.
-        # Dengan begitu tab/sesi lama tidak meninggalkan ghost lock hanya karena
-        # user menekan Proses lalu halaman reload/iframe membuat sesi baru.
         try:
             st.session_state.pop('_process_error', None)
             st.session_state.pop('_last_engine', None)
@@ -1173,7 +1079,6 @@ if btn_process:
             st.session_state['_ics_number'] = ics_number
             st.rerun()
         except Exception as upload_error:
-            # Belum ada global lock pada tahap persiapan file.
             # Bahkan kegagalan sebelum Engine 1 tetap masuk ke UI recovery.
             st.session_state['_process_error'] = (
                 f'❌ Error menyiapkan proses: {upload_error}'
@@ -1190,10 +1095,6 @@ if btn_process:
 if (st.session_state.get('_run_process') and
         st.session_state.get('_target_file') and
         int(st.session_state.get('_resume_engine', 1) or 1) > 1):
-    if not _acquire_generator_usage():
-        if not _generator_busy_popup_shown:
-            _show_generator_busy_popup()
-        st.stop()
     _resume = int(st.session_state['_resume_engine'])
     _resume_input = st.session_state['_target_file']
     _sid = st.session_state.setdefault('_sid', uuid.uuid4().hex[:8])
@@ -1261,7 +1162,6 @@ if (st.session_state.get('_run_process') and
                 )
             st.session_state.pop('_resume_engine', None)
             st.session_state.pop('_force_continue', None)
-            _release_generator_usage()
             st.rerun()
     except Exception as _resume_error:
         if st.session_state.get('_force_continue'):
@@ -1298,10 +1198,8 @@ if (st.session_state.get('_run_process') and
                     st.session_state['_run_process'] = False
                     st.session_state.pop('_resume_engine', None)
                     st.session_state.pop('_force_continue', None)
-                    _release_generator_usage()
                     st.rerun()
         # Fallback bila mode paksa tidak aktif atau tidak ada output valid.
-        _release_generator_usage()
         st.session_state['_process_error'] = (
             f'❌ Error Proses Engine {_resume}: {_resume_error}'
         )
@@ -1312,10 +1210,6 @@ if (st.session_state.get('_run_process') and
     st.stop()
 
 if st.session_state.get('_run_process') and st.session_state.get('_target_file'):
-    if not _acquire_generator_usage():
-        if not _generator_busy_popup_shown:
-            _show_generator_busy_popup()
-        st.stop()
     target_file = st.session_state['_target_file']
     doc_title_val = st.session_state['_doc_title']
     ics_number_val = st.session_state.get('_ics_number', 'XX.XXX.XX').strip() or 'XX.XXX.XX'
@@ -1369,7 +1263,6 @@ if st.session_state.get('_run_process') and st.session_state.get('_target_file')
 
     # Helper Update UI — TIDAK menyentuh timer iframe, hanya status & progress
     def update_ui(pct, msg, skip_progress=False):
-        _touch_generator_usage()
         parts = msg.split("\n", 1)
         line1 = parts[0].strip()
         line2 = parts[1].strip() if len(parts) > 1 else ""
@@ -1651,11 +1544,8 @@ if st.session_state.get('_run_process') and st.session_state.get('_target_file')
         st.session_state['_final_time'] = final_elapsed
         st.session_state['_show_results'] = True
         st.session_state['_doc_sections'] = _parse_doc_structure(engine9_out)
-        _release_generator_usage()
 
     except Exception as e:
-        # Jangan biarkan lock tertinggal bila Engine mana pun gagal.
-        _release_generator_usage()
         st.session_state['_process_error'] = f"❌ Error Proses: {e}"
         st.session_state['_run_process'] = False
         st.session_state['_show_results'] = False
@@ -1701,7 +1591,6 @@ if st.session_state.get('_show_results'):
 
     st.markdown("<div style='height:10px'></div>", unsafe_allow_html=True)
     if st.button("🔄 Proses File Baru", key="reset", use_container_width=True):
-        _release_generator_usage()
         # Hapus file sesi ini segera sebelum reset
         _cleanup_session_files(st.session_state)
         for k in ['_show_results', '_final_opt_file', '_final_tr_file', '_final_time',
