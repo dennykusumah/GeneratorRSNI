@@ -23,6 +23,9 @@ import csv
 import os
 import random
 import threading
+import json
+import urllib.parse
+import urllib.request
 
 from docx import Document
 from docx.shared import Pt
@@ -75,8 +78,8 @@ _EM_DASH = '—'
 # dari satu IP publik Streamlit Cloud. Empat worker tetap dipakai, tetapi waktu
 # mulai request diatur global agar 4 thread tidak menghantam provider pada saat
 # yang sama. Ini sedikit lebih lambat, tetapi jauh lebih stabil.
-_GOOGLE_MIN_START_INTERVAL = 0.55
-_GOOGLE_MAX_ATTEMPTS = 6
+_GOOGLE_MIN_START_INTERVAL = 1.15
+_GOOGLE_MAX_ATTEMPTS = 4
 
 
 class _RequestPacer:
@@ -102,12 +105,110 @@ class _RequestPacer:
     def penalize(self, attempt: int) -> None:
         # Jika satu worker terkena throttling/error, SEMUA worker ikut menahan
         # request sesaat. Tanpa ini 3 worker lain biasanya memperparah blokir.
-        cooldown = min(12.0, 0.9 * (2 ** max(0, attempt - 1))) + random.uniform(0.1, 0.5)
+        cooldown = min(18.0, 2.0 * (2 ** max(0, attempt - 1))) + random.uniform(0.2, 0.8)
         with self._lock:
             self._cooldown_until = max(self._cooldown_until, time.monotonic() + cooldown)
 
 
 _GOOGLE_PACER = _RequestPacer()
+
+
+# Endpoint cadangan Google yang berbeda dari jalur deep-translator. Jalur ini
+# dipakai hanya jika provider utama gagal. Tujuannya bukan menambah burst,
+# melainkan memberi rute kedua yang lebih sederhana pada Streamlit Cloud.
+_DIRECT_GOOGLE_URL = 'https://translate.googleapis.com/translate_a/single'
+_DIRECT_GOOGLE_MAX_ATTEMPTS = 3
+_DIRECT_GOOGLE_TIMEOUT = 18
+
+
+def _direct_google_translate(text: str, source: str = 'en', target: str = 'id') -> str:
+    """Terjemahan cadangan via endpoint GTX, dengan pacer yang sama.
+
+    Menggunakan urllib (stdlib), jadi requirements.txt tidak perlu ditambah.
+    Fungsi melempar exception bila respons tidak valid agar caller dapat
+    melanjutkan ke strategi chunk/MyMemory.
+    """
+    sl = 'en' if source in ('auto', '', None) else source
+    params = urllib.parse.urlencode({
+        'client': 'gtx', 'sl': sl, 'tl': target, 'dt': 't', 'q': text,
+    })
+    url = _DIRECT_GOOGLE_URL + '?' + params
+    last_error = None
+    for attempt in range(1, _DIRECT_GOOGLE_MAX_ATTEMPTS + 1):
+        try:
+            _GOOGLE_PACER.wait_turn()
+            req = urllib.request.Request(
+                url,
+                headers={
+                    'User-Agent': (
+                        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+                        'AppleWebKit/537.36 Chrome/124.0 Safari/537.36'
+                    ),
+                    'Accept': 'application/json,text/plain,*/*',
+                },
+            )
+            with urllib.request.urlopen(req, timeout=_DIRECT_GOOGLE_TIMEOUT) as resp:
+                raw = resp.read().decode('utf-8', errors='replace')
+            data = json.loads(raw)
+            pieces = data[0] if isinstance(data, list) and data else None
+            if not isinstance(pieces, list):
+                raise ValueError('format respons GTX tidak dikenali')
+            result = ''.join(
+                str(item[0]) for item in pieces
+                if isinstance(item, list) and item and item[0] is not None
+            ).strip()
+            if not result:
+                raise ValueError('respons GTX kosong')
+            return result
+        except Exception as exc:
+            last_error = exc
+            _GOOGLE_PACER.penalize(attempt)
+            if attempt < _DIRECT_GOOGLE_MAX_ATTEMPTS:
+                time.sleep(random.uniform(0.35, 0.75))
+    raise RuntimeError(f'GTX gagal: {last_error}')
+
+
+def _smart_translation_chunks(text: str, max_chars: int = 420) -> list[str]:
+    """Pecah teks panjang pada batas kalimat/klausa tanpa membuang whitespace.
+
+    Unit yang lebih pendek jauh lebih stabil pada layanan gratis dan recovery.
+    Token proteksi tetap berada utuh karena token tidak mengandung spasi.
+    """
+    if len(text) <= max_chars:
+        return [text]
+    # Pertahankan separator sehingga hasil gabungan tidak merusak struktur.
+    pieces = re.split(r'(?<=[.!?;:])\s+|\s+(?=[—–-]\s)|(?<=,)\s+', text)
+    chunks, current = [], ''
+    for piece in pieces:
+        piece = piece.strip()
+        if not piece:
+            continue
+        if not current:
+            current = piece
+        elif len(current) + 1 + len(piece) <= max_chars:
+            current += ' ' + piece
+        else:
+            chunks.append(current)
+            current = piece
+    if current:
+        chunks.append(current)
+    # Hard split hanya jika satu segmen memang sangat panjang.
+    out = []
+    for chunk in chunks or [text]:
+        if len(chunk) <= max_chars:
+            out.append(chunk)
+            continue
+        words = chunk.split()
+        buf = ''
+        for word in words:
+            if buf and len(buf) + 1 + len(word) > max_chars:
+                out.append(buf)
+                buf = word
+            else:
+                buf = word if not buf else buf + ' ' + word
+        if buf:
+            out.append(buf)
+    return out or [text]
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 2 URL SPREADSHEET TERPISAH
@@ -1260,6 +1361,58 @@ class _Translator:
                     time.sleep(random.uniform(0.15, 0.45))
 
         if result is None:
+            # RUTE CADANGAN 1: endpoint Google GTX. Ini penting untuk Streamlit
+            # Cloud karena deep-translator dapat terkena throttling pada rute
+            # web-nya sementara endpoint ini masih merespons normal.
+            try:
+                candidate = _direct_google_translate(t, self.source, self.target)
+                if not _looks_like_error_response(t, candidate):
+                    returned_tokens = {
+                        token.casefold()
+                        for token in _RE_PROTECTION_TOKEN.findall(candidate)
+                    }
+                    if returned_tokens == expected_tokens:
+                        source_plain = _RE_PROTECTION_TOKEN.sub('', t)
+                        result_plain = _RE_PROTECTION_TOKEN.sub('', candidate)
+                        unchanged = (
+                            re.search(r'[A-Za-z]{3}', source_plain)
+                            and re.sub(r'\s+', ' ', source_plain).strip().casefold()
+                            == re.sub(r'\s+', ' ', result_plain).strip().casefold()
+                        )
+                        if not unchanged:
+                            result = candidate
+            except Exception as direct_error:
+                last_error = direct_error
+
+        if result is None and len(t) > 420:
+            # RUTE CADANGAN 2: paragraf panjang dipecah menjadi chunk pendek.
+            # Ini menghindari satu paragraf panjang menggagalkan satu unit penuh.
+            try:
+                chunk_results = []
+                for chunk in _smart_translation_chunks(t, 420):
+                    candidate = _direct_google_translate(
+                        chunk, self.source, self.target
+                    )
+                    chunk_expected = {
+                        token.casefold()
+                        for token in _RE_PROTECTION_TOKEN.findall(chunk)
+                    }
+                    chunk_returned = {
+                        token.casefold()
+                        for token in _RE_PROTECTION_TOKEN.findall(candidate)
+                    }
+                    if chunk_returned != chunk_expected:
+                        raise ValueError('token berubah pada terjemahan chunk')
+                    if _looks_like_error_response(chunk, candidate):
+                        raise ValueError('respons chunk tidak valid')
+                    chunk_results.append(candidate.strip())
+                candidate = ' '.join(chunk_results).strip()
+                if candidate:
+                    result = candidate
+            except Exception as chunk_error:
+                last_error = chunk_error
+
+        if result is None:
             # Judul standar lazim terdiri dari beberapa klausa yang dipisahkan
             # em dash. Jika layanan menolak judul panjang sebagai satu request,
             # coba setiap klausa secara mandiri lalu gabungkan kembali dengan
@@ -1296,9 +1449,18 @@ class _Translator:
                 # Provider cadangan juga diberi jeda; jika Google baru saja
                 # memicu cooldown, jangan langsung membuat burst baru.
                 _GOOGLE_PACER.wait_turn()
-                fallback = MyMemoryTranslator(
+                mm_client = MyMemoryTranslator(
                     source=fallback_source, target=fallback_target
-                ).translate(t)
+                )
+                mm_chunks = _smart_translation_chunks(t, 420)
+                mm_results = []
+                for mm_chunk in mm_chunks:
+                    _GOOGLE_PACER.wait_turn()
+                    mm_piece = mm_client.translate(mm_chunk)
+                    if not mm_piece or _looks_like_error_response(mm_chunk, mm_piece):
+                        raise ValueError('respons MyMemory tidak valid')
+                    mm_results.append(mm_piece.strip())
+                fallback = ' '.join(mm_results).strip()
                 if fallback and not _looks_like_error_response(t, fallback):
                     fallback_tokens = {
                         token.casefold()
