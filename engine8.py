@@ -78,8 +78,8 @@ _EM_DASH = '—'
 # dari satu IP publik Streamlit Cloud. Empat worker tetap dipakai, tetapi waktu
 # mulai request diatur global agar 4 thread tidak menghantam provider pada saat
 # yang sama. Ini sedikit lebih lambat, tetapi jauh lebih stabil.
-_GOOGLE_MIN_START_INTERVAL = 1.15
-_GOOGLE_MAX_ATTEMPTS = 4
+_GOOGLE_MIN_START_INTERVAL = 1.80
+_GOOGLE_MAX_ATTEMPTS = 5
 
 
 class _RequestPacer:
@@ -117,7 +117,7 @@ _GOOGLE_PACER = _RequestPacer()
 # dipakai hanya jika provider utama gagal. Tujuannya bukan menambah burst,
 # melainkan memberi rute kedua yang lebih sederhana pada Streamlit Cloud.
 _DIRECT_GOOGLE_URL = 'https://translate.googleapis.com/translate_a/single'
-_DIRECT_GOOGLE_MAX_ATTEMPTS = 3
+_DIRECT_GOOGLE_MAX_ATTEMPTS = 4
 _DIRECT_GOOGLE_TIMEOUT = 18
 
 
@@ -2009,62 +2009,75 @@ class DocxFinalTranslatorEngine:
                     )
 
             # Hanya bagian yang belum berhasil diterjemahkan yang diulang.
-            # Pemulihan hanya mempunyai SATU tahap dan menggunakan tepat 2 worker.
+            # Pemulihan hanya SATU tahap dan SATU worker. Mode serial sengaja
+            # dipilih agar provider mendapat jeda lebih panjang dan tidak
+            # terkena burst setelah tahap utama 4 worker selesai.
             recovery_total = len(failed_paras)
             still_failed = []
             recovery_success = 0
 
-            # Sama seperti tahap utama, setiap thread pemulihan menyimpan
-            # instance translator sendiri agar client tidak dibuat ulang untuk
-            # setiap paragraf. Maksimal hanya 2 client pemulihan aktif.
-            recovery_local = threading.local()
-
-            def _recovery_job(index_para):
-                index, para = index_para
-                recovery_tr = getattr(recovery_local, 'translator', None)
-                if recovery_tr is None:
-                    recovery_tr = _Translator(
-                        self.source_lang, self.target_lang,
-                        self.custom_dict, self.italic_dict,
-                    )
-                    recovery_local.translator = recovery_tr
-                before = len(recovery_tr.failed_texts)
-                found = _translate_para(para, recovery_tr)
-                failed = len(recovery_tr.failed_texts) > before
-                return index, para, found, failed
-
             if recovery_total > 0:
-                with ThreadPoolExecutor(
-                        max_workers=2, thread_name_prefix='recovery') as pool:
-                    recovery_futures = [
-                        pool.submit(_recovery_job, item)
-                        for item in sorted(failed_paras, key=lambda item: item[0])
-                    ]
-                    recovery_done = 0
-                    for future in as_completed(recovery_futures):
-                        index, para, found, failed = future.result()
-                        recovery_done += 1
-                        if failed:
-                            still_failed.append((index, para))
-                        else:
-                            recovery_success += 1
-                            translated_count += 1
-                            italic_count += len(found)
+                # Beri waktu provider pulih dari throttling tahap utama.
+                _notify(
+                    progress_callback, 90,
+                    f"[pemulihan 1 worker] 0/{recovery_total} | "
+                    "menunggu provider stabil...",
+                )
+                time.sleep(8.0)
 
-                        # Pemulihan memakai rentang 90%--98%, dihitung murni
-                        # dari counter recovery_done/recovery_total (YY/YY).
-                        pct = 90 + int(
-                            recovery_done / max(recovery_total, 1) * 8
+                recovery_done = 0
+                # Satu translator aktif pada satu waktu. Setiap paragraf boleh
+                # dicoba maksimal 3 putaran recovery. Pada putaran berikutnya
+                # client dibuat ulang sehingga koneksi/session lama yang mungkin
+                # sudah dibatasi tidak terus dipakai.
+                for index, para in sorted(failed_paras, key=lambda item: item[0]):
+                    final_failed = True
+                    found = []
+
+                    for recovery_attempt in range(1, 4):
+                        recovery_tr = _Translator(
+                            self.source_lang, self.target_lang,
+                            self.custom_dict, self.italic_dict,
                         )
-                        _notify(
-                            progress_callback, pct,
-                            f"[pemulihan 2 worker] "
-                            f"{recovery_done}/{recovery_total} | "
-                            f"berhasil={recovery_success} | "
-                            f"tersisa={recovery_total - recovery_done + len(still_failed)} "
-                            f"| [progres-total] {total + recovery_done}/"
-                            f"{total + recovery_total}",
-                        )
+                        before = len(recovery_tr.failed_texts)
+                        found = _translate_para(para, recovery_tr)
+                        final_failed = len(recovery_tr.failed_texts) > before
+
+                        if not final_failed:
+                            break
+
+                        # Backoff serial yang lebih panjang. Karena hanya ada
+                        # satu worker, tidak ada thread lain yang tetap menembak
+                        # provider saat kita sedang menunggu.
+                        if recovery_attempt < 3:
+                            wait_s = 3.5 * recovery_attempt + random.uniform(0.8, 1.8)
+                            _GOOGLE_PACER.penalize(recovery_attempt + 1)
+                            time.sleep(wait_s)
+
+                    recovery_done += 1
+                    if final_failed:
+                        still_failed.append((index, para))
+                    else:
+                        recovery_success += 1
+                        translated_count += 1
+                        italic_count += len(found)
+
+                    # Pemulihan memakai rentang 90%--98%. Angka gagal yang
+                    # ditampilkan adalah kegagalan FINAL setelah upaya recovery,
+                    # bukan kegagalan sementara dari percobaan sebelumnya.
+                    pct = 90 + int(
+                        recovery_done / max(recovery_total, 1) * 8
+                    )
+                    _notify(
+                        progress_callback, pct,
+                        f"[pemulihan 1 worker] "
+                        f"{recovery_done}/{recovery_total} | "
+                        f"berhasil={recovery_success} | "
+                        f"gagal-final={len(still_failed)} | "
+                        f"tersisa={recovery_total - recovery_done} | "
+                        f"[progres-total] {total + recovery_done}/"
+                        f"{total + recovery_total}",
+                    )
 
                 # Urutkan kembali agar pelabelan merah dan laporan tetap
                 # mengikuti urutan paragraf asli di dokumen.
@@ -2100,7 +2113,7 @@ class DocxFinalTranslatorEngine:
             if still_failed:
                 return False, (
                     f"{len(still_failed)} bagian masih belum berhasil "
-                    "diterjemahkan setelah pemulihan 2 worker. Dokumen parsial "
+                    "diterjemahkan setelah pemulihan 1 worker. Dokumen parsial "
                     "Engine 8 sudah disimpan; teks sumber yang gagal diberi "
                     "font merah dan dapat di-download atau "
                     "dipaksa lanjut ke Engine 9."
