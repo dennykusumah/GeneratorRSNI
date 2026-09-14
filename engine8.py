@@ -19,10 +19,9 @@ import time
 import uuid
 import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
 import csv
 import os
-import random
-import threading
 
 from docx import Document
 from docx.shared import Pt
@@ -66,32 +65,8 @@ _HEADING_STYLES_WITH_NUM = {
     'ANNEX', 'a2', 'a3',
     'Heading4', 'Heading5', 'Heading6',
 }
-_TRANSLATE_DELAY = 0.05
+_TRANSLATE_DELAY = 0.0
 _EM_DASH = '—'
-
-# Kontrol request bersama untuk 4 worker. Worker tetap benar-benar paralel,
-# tetapi awal request diberi jarak kecil agar tidak membuat burst ke provider.
-_REQUEST_START_GAP = 0.18
-_REQUEST_GATE_LOCK = threading.Lock()
-_REQUEST_LAST_START = 0.0
-_REQUEST_SEMAPHORE = threading.BoundedSemaphore(4)
-
-def _wait_request_slot() -> None:
-    """Batasi burst tanpa mengubah jumlah worker paralel."""
-    global _REQUEST_LAST_START
-    with _REQUEST_GATE_LOCK:
-        now = time.monotonic()
-        wait = _REQUEST_START_GAP - (now - _REQUEST_LAST_START)
-        if wait > 0:
-            time.sleep(wait)
-        _REQUEST_LAST_START = time.monotonic()
-
-def _provider_translate(translator_cls, source: str, target: str, text: str) -> str:
-    """Satu request = satu client baru; aman dipanggil dari banyak thread."""
-    _wait_request_slot()
-    with _REQUEST_SEMAPHORE:
-        client = translator_cls(source=source, target=target)
-        return client.translate(text)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 2 URL SPREADSHEET TERPISAH
@@ -1166,15 +1141,19 @@ class TranslationFailedError(RuntimeError):
 class _Translator:
     def __init__(self, source: str = 'auto', target: str = 'id', 
                  custom_dict: CustomDictionary | None = None,
-                 italic_dict: ItalicDictionary | None = None):
+                 italic_dict: ItalicDictionary | None = None,
+                 max_attempts: int = 2, use_fallback: bool = False):
         try: from deep_translator import GoogleTranslator
         except ImportError: raise ImportError("Jalankan: pip install deep-translator")
         self._cls = GoogleTranslator
         self.source = source; self.target = target
         self.custom_dict = custom_dict; self.italic_dict = italic_dict
-        # Jangan memakai satu client persisten. Deep-translator/requests lebih
-        # stabil untuk paralel bila setiap request mempunyai client sendiri.
-        self._client = None
+        # Client dipertahankan selama umur worker. Membuat GoogleTranslator baru
+        # untuk setiap paragraf menambah overhead besar dan membuat 4 worker
+        # terasa seperti satu worker.
+        self._client = self._cls(source=self.source, target=self.target)
+        self.max_attempts = max(1, int(max_attempts))
+        self.use_fallback = bool(use_fallback)
         self.failed_texts: list[str] = []
 
     def translate_one(self, text: str, italic_map: dict = None) -> tuple[str, list[str]]:
@@ -1206,11 +1185,9 @@ class _Translator:
         }
         result = None
         last_error = None
-        for attempt in range(1, 5):
+        for attempt in range(1, self.max_attempts + 1):
             try:
-                candidate = _provider_translate(
-                    self._cls, self.source, self.target, t
-                )
+                candidate = self._client.translate(t)
                 if not candidate or _looks_like_error_response(t, candidate):
                     raise ValueError('respons layanan terjemahan tidak valid')
                 returned_tokens = {
@@ -1232,10 +1209,10 @@ class _Translator:
                 break
             except Exception as exc:
                 last_error = exc
-                if attempt < 4:
-                    # Exponential backoff + jitter mencegah empat worker
-                    # mengulang request pada saat yang sama setelah rate-limit.
-                    time.sleep((0.65 * (2 ** (attempt - 1))) + random.uniform(0.10, 0.45))
+                if attempt < self.max_attempts:
+                    # Tahap normal hanya backoff singkat. Retry berat dilakukan
+                    # oleh pemulihan 1 worker agar empat worker utama tidak macet.
+                    time.sleep(0.12 * attempt)
 
         if result is None:
             # Judul standar lazim terdiri dari beberapa klausa yang dipisahkan
@@ -1259,7 +1236,9 @@ class _Translator:
                 except TranslationFailedError as split_error:
                     last_error = split_error
 
-        if result is None:
+        if result is None and self.use_fallback:
+            # Provider cadangan hanya dipakai pada tahap pemulihan. Menjalankannya
+            # di 4 worker utama membuat antrean tersendat saat Google sedang sibuk.
             # Provider cadangan untuk kondisi Google Translate sedang menolak
             # request/rate-limited. Deep-translator menyertakan MyMemory;
             # kegagalannya tetap ditangani tanpa merusak dokumen.
@@ -1316,7 +1295,7 @@ def _match_capitalization(original: str, translated: str) -> str:
     return tran
 
 
-def _translate_para(para, tr, past_bibliography: bool = False, apply_lock=None) -> list[str]:
+def _translate_para(para, tr, past_bibliography: bool = False) -> list[str]:
     """
     Terjemahkan paragraf biasa. Paragraf yang memiliki hyperlink sengaja
     dipertahankan utuh supaya teks, urutan run, relationship, dan URL asli
@@ -1369,42 +1348,31 @@ def _translate_para(para, tr, past_bibliography: bool = False, apply_lock=None) 
     # ikut terkirim dan diharapkan lolos utuh dari mesin terjemahan, sama
     # seperti token proteksi miring lain yang sudah terbukti aman).
     translated, italic_terms_found = tr.translate_one(combined, dict_italic_map)
-    time.sleep(_TRANSLATE_DELAY)
     if not translated or translated == combined: return []
     translated = _match_capitalization(original_for_case, translated)
 
-    def _apply_result():
-        # Semua perubahan XML DOCX diserialkan. Network translation tetap 4
-        # worker paralel; hanya penulisan ke python-docx yang satu-per-satu.
-        final_text, format_spans = _detokenize_with_formatting(
-            translated, format_token_map
-        )
-        if italic_terms_found or format_spans:
-            _apply_mixed_formatting_to_para(
-                para, final_text, italic_terms_found, font_name, font_size,
-                format_spans=format_spans
-            )
-        else:
-            if para.runs:
-                para.runs[0].text = final_text
-                for r in para.runs[1:]:
-                    r.text = ''
-            else:
-                para.add_run(final_text)
+    # Kembalikan token superscript/subscript/miring-sumber menjadi teks asli,
+    # sekaligus dapatkan posisi presisi untuk membangun ulang run.
+    translated, format_spans = _detokenize_with_formatting(translated, format_token_map)
 
-        _normalize_initial_clause_heading(para, original_for_case)
-        if source_note_upper or re.match(
-            r'^(?:NOTE|Note|note|CATATAN|Catatan|catatan)(?:\s|\t|:)',
-            para.text.strip(),
-        ):
-            _fix_note_para(para, force_upper=source_note_upper)
-
-    if apply_lock is None:
-        _apply_result()
+    # Apply formatting ke teks normal
+    if italic_terms_found or format_spans:
+        _apply_mixed_formatting_to_para(para, translated, italic_terms_found, font_name, font_size,
+                                         format_spans=format_spans)
     else:
-        with apply_lock:
-            _apply_result()
+        if para.runs:
+            para.runs[0].text = translated
+            for r in para.runs[1:]: r.text = ''
+        else:
+            para.add_run(translated)
 
+    _normalize_initial_clause_heading(para, original_for_case)
+    if source_note_upper or re.match(
+        r'^(?:NOTE|Note|note|CATATAN|Catatan|catatan)(?:\s|\t|:)',
+        para.text.strip(),
+    ):
+        _fix_note_para(para, force_upper=source_note_upper)
+    
     return italic_terms_found
 
 
@@ -1787,18 +1755,32 @@ class DocxFinalTranslatorEngine:
             done = translated_count = 0
             italic_count = 0
             failed_paras = []
-            docx_apply_lock = threading.Lock()
+
+            # Satu translator persisten untuk masing-masing thread. Dengan cara ini
+            # tetap ada tepat 4 client paralel, tetapi client tidak dibuat ulang
+            # ratusan kali. Ini memangkas overhead terbesar pada versi sebelumnya.
+            _worker_local = threading.local()
+
+            def _get_worker_translator():
+                worker_tr = getattr(_worker_local, 'translator', None)
+                if worker_tr is None:
+                    worker_tr = _Translator(
+                        self.source_lang, self.target_lang,
+                        self.custom_dict, self.italic_dict,
+                        max_attempts=2, use_fallback=False,
+                    )
+                    _worker_local.translator = worker_tr
+                return worker_tr
 
             def _translate_job(index_para):
                 index, para = index_para
-                worker_tr = _Translator(
-                    self.source_lang, self.target_lang,
-                    self.custom_dict, self.italic_dict,
-                )
-                found = _translate_para(para, worker_tr, apply_lock=docx_apply_lock)
-                return index, para, found, bool(worker_tr.failed_texts)
+                worker_tr = _get_worker_translator()
+                before = len(worker_tr.failed_texts)
+                found = _translate_para(para, worker_tr)
+                failed = len(worker_tr.failed_texts) > before
+                return index, para, found, failed
 
-            # Tahap utama: tepat 4 worker translate.
+            # Tahap utama: tepat 4 worker translate yang benar-benar paralel.
             with ThreadPoolExecutor(max_workers=4, thread_name_prefix='translate') as pool:
                 futures = [pool.submit(_translate_job, item)
                            for item in enumerate(translation_queue)]
@@ -1829,6 +1811,7 @@ class DocxFinalTranslatorEngine:
             recovery_tr = _Translator(
                 self.source_lang, self.target_lang,
                 self.custom_dict, self.italic_dict,
+                max_attempts=5, use_fallback=True,
             )
             for recovery_done, (index, para) in enumerate(
                     sorted(failed_paras, key=lambda item: item[0]), start=1):
