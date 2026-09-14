@@ -83,6 +83,12 @@ _GOOGLE_SUCCESS_STREAK = 0
 _GOOGLE_FAILURE_STREAK = 0
 _TRANSLATOR_THREAD_LOCAL = threading.local()
 
+# Pola request GeneratorSNI: client baru tiap request. Hanya waktu START request
+# yang diberi jarak tipis; empat request masih dapat berjalan bersamaan.
+_GENSNI_START_LOCK = threading.Lock()
+_GENSNI_LAST_START = 0.0
+_GENSNI_MIN_START_GAP = 0.12
+
 
 def _google_gate_feedback(success: bool, rate_limited: bool = False) -> None:
     global _GOOGLE_DYNAMIC_LIMIT, _GOOGLE_SUCCESS_STREAK, _GOOGLE_FAILURE_STREAK
@@ -1263,30 +1269,72 @@ def _google_gtx_translate(text: str, source: str = 'auto', target: str = 'id') -
 
 
 class _Translator:
-    def __init__(self, source: str = 'auto', target: str = 'id', 
+    """Translator RSNI dengan pola request yang meniru GeneratorSNI.
+
+    Perbedaan penting terhadap versi sebelumnya:
+      * GoogleTranslator dibuat BARU untuk setiap request, sama seperti
+        GeneratorSNI yang terbukti lebih stabil pada deployment pengguna.
+      * Tidak memakai session/client Google yang dipertahankan lintas banyak
+        paragraf. Session lama dapat ikut mempertahankan kondisi throttling.
+      * Retry normal hanya 2 kali (request + 1 retry setelah 0,8 s), lalu
+        elemen yang gagal ditangani oleh SATU tahap pemulihan 4 worker.
+      * Tidak memakai provider non-Google sehingga akurasi/karakter hasil
+        terjemahan tidak berubah karena fallback provider lain.
+    """
+    def __init__(self, source: str = 'auto', target: str = 'id',
                  custom_dict: CustomDictionary | None = None,
                  italic_dict: ItalicDictionary | None = None):
-        try: from deep_translator import GoogleTranslator
-        except ImportError: raise ImportError("Jalankan: pip install deep-translator")
+        try:
+            from deep_translator import GoogleTranslator
+        except ImportError:
+            raise ImportError("Jalankan: pip install deep-translator")
         self._cls = GoogleTranslator
-        self.source = source; self.target = target
-        self.custom_dict = custom_dict; self.italic_dict = italic_dict
-        self._client = self._cls(source=self.source, target=self.target)
+        self.source = source
+        self.target = target
+        self.custom_dict = custom_dict
+        self.italic_dict = italic_dict
         self.failed_texts: list[str] = []
+
+    def _google_once(self, text: str) -> str:
+        # Pola ini sengaja sama dengan GeneratorSNI: instance baru setiap
+        # request. Empat worker tetap paralel, tetapi start request diberi
+        # jarak tipis supaya tidak menjadi burst empat request pada milidetik
+        # yang sama. Karena request jaringan umumnya jauh > 0,1 s, dampak
+        # terhadap throughput sangat kecil.
+        with _GENSNI_START_LOCK:
+            global _GENSNI_LAST_START
+            now = time.monotonic()
+            wait = _GENSNI_MIN_START_GAP - (now - _GENSNI_LAST_START)
+            if wait > 0:
+                time.sleep(wait)
+            _GENSNI_LAST_START = time.monotonic()
+        client = self._cls(source=self.source, target=self.target)
+        return client.translate(text)
+
+    @staticmethod
+    def _tokens_preserved(source_text: str, translated_text: str) -> bool:
+        """Validasi token tanpa membuat false-failure karena perubahan case.
+
+        Token RSNI hanya dianggap hilang bila benar-benar tidak ditemukan.
+        Spasi zero-width yang kadang disisipkan provider dibuang sebelum cek.
+        """
+        def clean(x: str) -> str:
+            return re.sub(r'[\u200b\u200c\u200d\ufeff]', '', x or '')
+        src = {x.casefold() for x in _RE_PROTECTION_TOKEN.findall(clean(source_text))}
+        dst = {x.casefold() for x in _RE_PROTECTION_TOKEN.findall(clean(translated_text))}
+        return src == dst
 
     def translate_one(self, text: str, italic_map: dict = None) -> tuple[str, list[str]]:
         t = text.strip()
-        if not t or _skip_text(t): return text, []
+        if not t or _skip_text(t):
+            return text, []
+
         token_map = {}
         if self.custom_dict and len(self.custom_dict) > 0:
             t, token_map = self.custom_dict._apply_pre(t)
         final_italic_map = italic_map or {}
 
-        # Jika seluruh teks sudah dicakup Kamus SNI, hasil kamus adalah hasil
-        # final. Ini berlaku untuk satu token ("Introduction") maupun beberapa
-        # token yang hanya dipisahkan tanda baca, angka bagian, atau em dash
-        # (judul Cover). Rangkaian token semacam itu tidak memiliki bahasa
-        # alami untuk diterjemahkan dan sering ditolak Google Translate.
+        # Bila seluruh teks sudah tercakup kamus, jangan kirim ke provider.
         uncovered = _RE_PROTECTION_TOKEN.sub('', t)
         uncovered_words = re.findall(r'[A-Za-zÀ-ÿ]{2,}', uncovered)
         if token_map and not uncovered_words:
@@ -1298,89 +1346,42 @@ class _Translator:
                 )
             return result, italic_terms_found
 
-        expected_tokens = {
-            token.casefold() for token in _RE_PROTECTION_TOKEN.findall(t)
-        }
         result = None
         last_error = None
-        for attempt in range(1, 5):
+
+        # Mengikuti GeneratorSNI: satu request normal + satu retry 0,8 detik.
+        # Pemulihan 4-worker di luar fungsi ini menjadi kesempatan berikutnya.
+        for attempt in range(2):
             try:
-                # Batasi burst request dari 4 worker. Ini bukan mengubah
-                # jumlah worker; hanya mencegah endpoint gratis Google menerima
-                # terlalu banyak request pada saat yang persis bersamaan.
-                primary_error = None
-                try:
-                    with _google_request_gate():
-                        candidate = self._client.translate(t)
-                    if not candidate or _looks_like_error_response(t, candidate):
-                        raise ValueError('respons layanan terjemahan tidak valid')
-                    _google_gate_feedback(True)
-                except Exception as gate_exc:
-                    primary_error = gate_exc
-                    _google_gate_feedback(False, _is_rate_limit_error(gate_exc))
-                    # Jalur kedua tetap backend Google, tetapi tidak melalui
-                    # wrapper deep-translator. Ini sangat membantu bila yang
-                    # bermasalah adalah session/parser deep-translator, tanpa
-                    # menurunkan akurasi dengan provider berbeda. Karena hanya
-                    # dipanggil setelah primary gagal, performa saat sehat tidak
-                    # berubah.
-                    try:
-                        with _google_request_gate():
-                            candidate = _google_gtx_translate(
-                                t, self.source, self.target
-                            )
-                        if (not candidate or
-                                _looks_like_error_response(t, candidate)):
-                            raise ValueError('respons Google GTX tidak valid')
-                        _google_gate_feedback(True)
-                    except Exception as gtx_exc:
-                        _google_gate_feedback(
-                            False, _is_rate_limit_error(gtx_exc)
-                        )
-                        # Pertahankan error yang paling informatif untuk
-                        # mekanisme backoff/retry di bawah.
-                        raise gtx_exc from primary_error
-                returned_tokens = {
-                    token.casefold()
-                    for token in _RE_PROTECTION_TOKEN.findall(candidate)
-                }
-                if returned_tokens != expected_tokens:
+                candidate = self._google_once(t)
+                if not candidate or _looks_like_error_response(t, candidate):
+                    raise ValueError('respons Google Translate tidak valid')
+                if not self._tokens_preserved(t, candidate):
                     raise ValueError('token kamus/format berubah atau hilang')
 
                 source_plain = _RE_PROTECTION_TOKEN.sub('', t)
                 result_plain = _RE_PROTECTION_TOKEN.sub('', candidate)
+                # Paragraf bahasa Inggris yang identik dianggap belum berhasil.
+                # Pemeriksaan ini tidak diterapkan pada teks pendek/teknis yang
+                # memang secara sah dapat tidak berubah.
                 if (
-                    re.search(r'[A-Za-z]{3}', source_plain)
+                    len(re.findall(r'[A-Za-z]{3,}', source_plain)) >= 3
                     and re.sub(r'\s+', ' ', source_plain).strip().casefold()
                     == re.sub(r'\s+', ' ', result_plain).strip().casefold()
                 ):
                     raise ValueError('teks dikembalikan tanpa diterjemahkan')
+
                 result = candidate
                 break
             except Exception as exc:
                 last_error = exc
-                if attempt < 4:
-                    # Backoff lebih panjang bila terindikasi throttle/network.
-                    # Jitter mencegah 4 worker mencoba ulang pada saat yang sama.
-                    # Retry cepat untuk error biasa; untuk throttle beri jeda
-                    # secukupnya agar request berikutnya tidak ikut diblokir.
-                    base = (1.15 if _is_rate_limit_error(exc) else 0.45) * attempt
-                    time.sleep(base + random.uniform(0.08, 0.28))
-                    # Client baru pada retry untuk memulihkan session yang
-                    # mungkin sudah menerima halaman blok/error dari provider.
-                    try:
-                        self._client = self._cls(
-                            source=self.source, target=self.target
-                        )
-                    except Exception:
-                        pass
+                if attempt == 0:
+                    time.sleep(0.8)
 
+        # Judul dengan em dash dapat dicoba per segmen hanya setelah dua
+        # request Google di atas gagal. Tetap GoogleTranslator, sehingga tidak
+        # mengorbankan konsistensi/akurasi provider.
         if result is None:
-            # Judul standar lazim terdiri dari beberapa klausa yang dipisahkan
-            # em dash. Jika layanan menolak judul panjang sebagai satu request,
-            # coba setiap klausa secara mandiri lalu gabungkan kembali dengan
-            # tanda pisah asli. Ini juga membuat bagian yang sudah dicakup
-            # kamus langsung diselesaikan lokal per klausa.
             title_parts = re.split(r'(\s*[—–]\s*)', t)
             if len(title_parts) > 1:
                 translated_parts = []
@@ -1390,37 +1391,19 @@ class _Translator:
                             continue
                         if re.fullmatch(r'\s*[—–]\s*', part):
                             translated_parts.append(part)
-                        else:
-                            part_result, _ = self.translate_one(part, {})
-                            translated_parts.append(part_result)
-                    result = ''.join(translated_parts)
-                except TranslationFailedError as split_error:
+                            continue
+                        # Satu percobaan per segmen; jangan rekursif berulang.
+                        seg = self._google_once(part)
+                        if not seg or _looks_like_error_response(part, seg):
+                            raise ValueError('segmen judul gagal diterjemahkan')
+                        if not self._tokens_preserved(part, seg):
+                            raise ValueError('token segmen judul berubah/hilang')
+                        translated_parts.append(seg)
+                    candidate = ''.join(translated_parts)
+                    if candidate and self._tokens_preserved(t, candidate):
+                        result = candidate
+                except Exception as split_error:
                     last_error = split_error
-
-        if result is None:
-            # Provider cadangan untuk kondisi Google Translate sedang menolak
-            # request/rate-limited. Deep-translator menyertakan MyMemory;
-            # kegagalannya tetap ditangani tanpa merusak dokumen.
-            try:
-                from deep_translator import MyMemoryTranslator
-                fallback_source = (
-                    'english' if self.source in ('auto', 'en') else self.source
-                )
-                fallback_target = (
-                    'indonesian' if self.target == 'id' else self.target
-                )
-                fallback = MyMemoryTranslator(
-                    source=fallback_source, target=fallback_target
-                ).translate(t)
-                if fallback and not _looks_like_error_response(t, fallback):
-                    fallback_tokens = {
-                        token.casefold()
-                        for token in _RE_PROTECTION_TOKEN.findall(fallback)
-                    }
-                    if fallback_tokens == expected_tokens:
-                        result = fallback
-            except Exception as fallback_error:
-                last_error = fallback_error
 
         if result is None:
             safe_title = _TITLE_SAFE_FALLBACKS.get(
@@ -1431,12 +1414,12 @@ class _Translator:
 
         if result is None:
             preview = re.sub(r'\s+', ' ', text).strip()[:100]
-            # Jangan gagalkan seluruh pipeline karena satu request eksternal.
-            # Simpan teks sumber (token kamus tetap dipulihkan di bawah) dan
-            # laporkan sebagai peringatan pada ringkasan proses.
             self.failed_texts.append(preview)
             result = t
-        if token_map: result = self.custom_dict._apply_post(result, token_map)
+
+        if token_map:
+            result = self.custom_dict._apply_post(result, token_map)
+
         italic_terms_found = []
         if final_italic_map:
             _idict = self.italic_dict if self.italic_dict is not None else ItalicDictionary()
@@ -1931,9 +1914,9 @@ class DocxFinalTranslatorEngine:
 
             def _translate_job(index_para):
                 index, para = index_para
-                # PENTING: jangan membuat GoogleTranslator baru untuk setiap
-                # paragraf. Empat thread masing-masing memiliki satu client
-                # yang dipakai ulang. Ini jauh lebih stabil terhadap throttle.
+                # Worker tetap 4. _Translator mengikuti pola GeneratorSNI:
+                # GoogleTranslator baru untuk setiap request agar session yang
+                # terkena throttle tidak diwariskan ke paragraf berikutnya.
                 worker_tr = _get_worker_translator(
                     self.source_lang, self.target_lang,
                     self.custom_dict, self.italic_dict,
@@ -1978,8 +1961,8 @@ class DocxFinalTranslatorEngine:
 
             def _recovery_job(index_para):
                 index, para = index_para
-                # Instance per-thread dari executor pemulihan. Karena pool baru,
-                # session/client tidak berbagi state dengan pekerjaan normal.
+                # Satu pemulihan, tetap 4 worker. Setiap request membuat client
+                # GoogleTranslator baru seperti GeneratorSNI.
                 recovery_tr = _get_worker_translator(
                     self.source_lang, self.target_lang,
                     self.custom_dict, self.italic_dict,
