@@ -21,6 +21,8 @@ import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import csv
 import os
+import random
+import threading
 
 from docx import Document
 from docx.shared import Pt
@@ -64,8 +66,32 @@ _HEADING_STYLES_WITH_NUM = {
     'ANNEX', 'a2', 'a3',
     'Heading4', 'Heading5', 'Heading6',
 }
-_TRANSLATE_DELAY = 0.15
+_TRANSLATE_DELAY = 0.05
 _EM_DASH = '—'
+
+# Kontrol request bersama untuk 4 worker. Worker tetap benar-benar paralel,
+# tetapi awal request diberi jarak kecil agar tidak membuat burst ke provider.
+_REQUEST_START_GAP = 0.18
+_REQUEST_GATE_LOCK = threading.Lock()
+_REQUEST_LAST_START = 0.0
+_REQUEST_SEMAPHORE = threading.BoundedSemaphore(4)
+
+def _wait_request_slot() -> None:
+    """Batasi burst tanpa mengubah jumlah worker paralel."""
+    global _REQUEST_LAST_START
+    with _REQUEST_GATE_LOCK:
+        now = time.monotonic()
+        wait = _REQUEST_START_GAP - (now - _REQUEST_LAST_START)
+        if wait > 0:
+            time.sleep(wait)
+        _REQUEST_LAST_START = time.monotonic()
+
+def _provider_translate(translator_cls, source: str, target: str, text: str) -> str:
+    """Satu request = satu client baru; aman dipanggil dari banyak thread."""
+    _wait_request_slot()
+    with _REQUEST_SEMAPHORE:
+        client = translator_cls(source=source, target=target)
+        return client.translate(text)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 2 URL SPREADSHEET TERPISAH
@@ -1146,7 +1172,9 @@ class _Translator:
         self._cls = GoogleTranslator
         self.source = source; self.target = target
         self.custom_dict = custom_dict; self.italic_dict = italic_dict
-        self._client = self._cls(source=self.source, target=self.target)
+        # Jangan memakai satu client persisten. Deep-translator/requests lebih
+        # stabil untuk paralel bila setiap request mempunyai client sendiri.
+        self._client = None
         self.failed_texts: list[str] = []
 
     def translate_one(self, text: str, italic_map: dict = None) -> tuple[str, list[str]]:
@@ -1180,7 +1208,9 @@ class _Translator:
         last_error = None
         for attempt in range(1, 5):
             try:
-                candidate = self._client.translate(t)
+                candidate = _provider_translate(
+                    self._cls, self.source, self.target, t
+                )
                 if not candidate or _looks_like_error_response(t, candidate):
                     raise ValueError('respons layanan terjemahan tidak valid')
                 returned_tokens = {
@@ -1203,7 +1233,9 @@ class _Translator:
             except Exception as exc:
                 last_error = exc
                 if attempt < 4:
-                    time.sleep(0.8 * attempt)
+                    # Exponential backoff + jitter mencegah empat worker
+                    # mengulang request pada saat yang sama setelah rate-limit.
+                    time.sleep((0.65 * (2 ** (attempt - 1))) + random.uniform(0.10, 0.45))
 
         if result is None:
             # Judul standar lazim terdiri dari beberapa klausa yang dipisahkan
@@ -1284,7 +1316,7 @@ def _match_capitalization(original: str, translated: str) -> str:
     return tran
 
 
-def _translate_para(para, tr, past_bibliography: bool = False) -> list[str]:
+def _translate_para(para, tr, past_bibliography: bool = False, apply_lock=None) -> list[str]:
     """
     Terjemahkan paragraf biasa. Paragraf yang memiliki hyperlink sengaja
     dipertahankan utuh supaya teks, urutan run, relationship, dan URL asli
@@ -1341,28 +1373,38 @@ def _translate_para(para, tr, past_bibliography: bool = False) -> list[str]:
     if not translated or translated == combined: return []
     translated = _match_capitalization(original_for_case, translated)
 
-    # Kembalikan token superscript/subscript/miring-sumber menjadi teks asli,
-    # sekaligus dapatkan posisi presisi untuk membangun ulang run.
-    translated, format_spans = _detokenize_with_formatting(translated, format_token_map)
-
-    # Apply formatting ke teks normal
-    if italic_terms_found or format_spans:
-        _apply_mixed_formatting_to_para(para, translated, italic_terms_found, font_name, font_size,
-                                         format_spans=format_spans)
-    else:
-        if para.runs:
-            para.runs[0].text = translated
-            for r in para.runs[1:]: r.text = ''
+    def _apply_result():
+        # Semua perubahan XML DOCX diserialkan. Network translation tetap 4
+        # worker paralel; hanya penulisan ke python-docx yang satu-per-satu.
+        final_text, format_spans = _detokenize_with_formatting(
+            translated, format_token_map
+        )
+        if italic_terms_found or format_spans:
+            _apply_mixed_formatting_to_para(
+                para, final_text, italic_terms_found, font_name, font_size,
+                format_spans=format_spans
+            )
         else:
-            para.add_run(translated)
+            if para.runs:
+                para.runs[0].text = final_text
+                for r in para.runs[1:]:
+                    r.text = ''
+            else:
+                para.add_run(final_text)
 
-    _normalize_initial_clause_heading(para, original_for_case)
-    if source_note_upper or re.match(
-        r'^(?:NOTE|Note|note|CATATAN|Catatan|catatan)(?:\s|\t|:)',
-        para.text.strip(),
-    ):
-        _fix_note_para(para, force_upper=source_note_upper)
-    
+        _normalize_initial_clause_heading(para, original_for_case)
+        if source_note_upper or re.match(
+            r'^(?:NOTE|Note|note|CATATAN|Catatan|catatan)(?:\s|\t|:)',
+            para.text.strip(),
+        ):
+            _fix_note_para(para, force_upper=source_note_upper)
+
+    if apply_lock is None:
+        _apply_result()
+    else:
+        with apply_lock:
+            _apply_result()
+
     return italic_terms_found
 
 
@@ -1745,6 +1787,7 @@ class DocxFinalTranslatorEngine:
             done = translated_count = 0
             italic_count = 0
             failed_paras = []
+            docx_apply_lock = threading.Lock()
 
             def _translate_job(index_para):
                 index, para = index_para
@@ -1752,7 +1795,7 @@ class DocxFinalTranslatorEngine:
                     self.source_lang, self.target_lang,
                     self.custom_dict, self.italic_dict,
                 )
-                found = _translate_para(para, worker_tr)
+                found = _translate_para(para, worker_tr, apply_lock=docx_apply_lock)
                 return index, para, found, bool(worker_tr.failed_texts)
 
             # Tahap utama: tepat 4 worker translate.
