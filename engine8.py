@@ -1675,102 +1675,46 @@ class DocxFinalTranslatorEngine:
             # wajib mengambil kedua spreadsheet sendiri pada setiap proses,
             # sehingga perubahan Google Sheet langsung dipakai dan bukan hanya
             # ditampilkan sebagai angka pada dashboard.
-            # Kamus online penting untuk konsistensi istilah, tetapi gangguan
-            # DNS/Google Sheet sesaat tidak boleh menggagalkan seluruh Engine 8.
-            # Muat ke objek kandidat terlebih dahulu. Kamus aktif baru diganti
-            # setelah unduhan sukses; jika gagal, pakai cache proses sebelumnya.
-            # Pada cold-start tanpa cache, gunakan minimal safety fallback untuk
-            # istilah yang memang diwajibkan oleh pipeline.
-            dictionary_warnings = []
-
             if not self._custom_dict_provided:
-                previous_custom = self.custom_dict
-                candidate_custom = CustomDictionary()
-                try:
-                    sni_count = candidate_custom.load_from_google_sheet(
-                        KAMUS_SPREADSHEET_URL
-                    )
-                    self.custom_dict = candidate_custom
-                except Exception as exc:
-                    if previous_custom is not None and len(previous_custom) > 0:
-                        self.custom_dict = previous_custom
-                        sni_count = len(self.custom_dict)
-                        dictionary_warnings.append(
-                            'Google Sheet Kamus SNI tidak dapat diakses; '
-                            'menggunakan cache kamus terakhir.'
-                        )
-                    else:
-                        self.custom_dict = CustomDictionary()
-                        self.custom_dict.add_term('Introduction', 'Pendahuluan')
-                        sni_count = len(self.custom_dict)
-                        dictionary_warnings.append(
-                            'Google Sheet Kamus SNI tidak dapat diakses dan cache '
-                            'belum tersedia; memakai kamus minimum bawaan.'
-                        )
+                self.custom_dict = CustomDictionary()
+                sni_count = self.custom_dict.load_from_google_sheet(
+                    KAMUS_SPREADSHEET_URL
+                )
             else:
-                if self.custom_dict is None:
-                    self.custom_dict = CustomDictionary()
                 sni_count = len(self.custom_dict)
-
             if not self._italic_dict_provided:
-                previous_italic = self.italic_dict
-                candidate_italic = ItalicDictionary()
-                try:
-                    italic_count_loaded = candidate_italic.load_from_google_sheet(
-                        ITALIC_SPREADSHEET_URL
-                    )
-                    self.italic_dict = candidate_italic
-                except Exception as exc:
-                    if previous_italic is not None and len(previous_italic) > 0:
-                        self.italic_dict = previous_italic
-                        italic_count_loaded = len(self.italic_dict)
-                        dictionary_warnings.append(
-                            'Google Sheet istilah asing tidak dapat diakses; '
-                            'menggunakan cache kamus terakhir.'
-                        )
-                    else:
-                        self.italic_dict = ItalicDictionary()
-                        self.italic_dict.add_term('ISO Online browsing platform')
-                        self.italic_dict.add_term('IEC Electropedia')
-                        italic_count_loaded = len(self.italic_dict)
-                        dictionary_warnings.append(
-                            'Google Sheet istilah asing tidak dapat diakses dan '
-                            'cache belum tersedia; memakai daftar minimum bawaan.'
-                        )
+                self.italic_dict = ItalicDictionary()
+                italic_count_loaded = self.italic_dict.load_from_google_sheet(
+                    ITALIC_SPREADSHEET_URL
+                )
             else:
-                if self.italic_dict is None:
-                    self.italic_dict = ItalicDictionary()
                 italic_count_loaded = len(self.italic_dict)
 
-            # Dua entri ini adalah invariant pipeline. Jika spreadsheet diedit
-            # keliru, pulihkan secara lokal alih-alih menghentikan dokumen.
             intro_entry = self.custom_dict._entries.get('introduction')
             if not intro_entry or intro_entry[1].strip().casefold() != 'pendahuluan':
-                self.custom_dict.add_term('Introduction', 'Pendahuluan')
-                sni_count = len(self.custom_dict)
-                dictionary_warnings.append(
-                    'Entri wajib Introduction → Pendahuluan dipulihkan otomatis.'
+                raise ValueError(
+                    'Kamus SNI tidak memuat pasangan '
+                    'Introduction → Pendahuluan.'
                 )
-
-            for required_term in (
-                'ISO Online browsing platform',
-                'IEC Electropedia',
-            ):
-                if required_term.casefold() not in self.italic_dict._entries:
-                    self.italic_dict.add_term(required_term)
-                    dictionary_warnings.append(
-                        f'Istilah asing wajib "{required_term}" dipulihkan otomatis.'
-                    )
-            italic_count_loaded = len(self.italic_dict)
+            required_italic = {
+                'iso online browsing platform', 'iec electropedia'
+            }
+            missing_italic = sorted(
+                term for term in required_italic
+                if term not in self.italic_dict._entries
+            )
+            if missing_italic:
+                raise ValueError(
+                    'Kamus istilah asing belum memuat: '
+                    + ', '.join(missing_italic)
+                )
 
             info = f"{len(self.custom_dict) if self.custom_dict else 0} kamus"
             if self.italic_dict: info += f", {len(self.italic_dict)} miring"
-            status_message = (
+            _notify(
+                progress_callback, 2,
                 f"Kamus siap: SNI={sni_count}, istilah asing={italic_count_loaded}"
             )
-            if dictionary_warnings:
-                status_message += ' | ' + ' '.join(dictionary_warnings)
-            _notify(progress_callback, 2, status_message)
             
             _notify(progress_callback, 5, "Init translator...")
             # Satu instance translator tidak dibagi lintas thread. Setiap worker
