@@ -1094,10 +1094,13 @@ if st.session_state.get('_process_error'):
 # LOGIC EXECUTION
 # ─────────────────────────────────────────────────────────────────────────────
 
+# Popup BUSY tidak diperiksa pada setiap rerun Streamlit.
+# Perubahan nilai input (No. SNI, ICS, upload, dll.) memicu rerun, sehingga
+# pengecekan global di sini sebelumnya membuat popup muncul meskipun user
+# belum menekan tombol Proses. Popup sekarang hanya dipanggil ketika user
+# benar-benar mencoba memulai/melanjutkan proses dan guard sedang dimiliki
+# oleh sesi lain.
 _generator_busy_popup_shown = False
-if _generator_busy_for_other_user():
-    _show_generator_busy_popup()
-    _generator_busy_popup_shown = True
 
 if btn_process:
     if uploaded_file:
