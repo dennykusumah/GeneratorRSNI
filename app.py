@@ -16,6 +16,51 @@ from io import BytesIO
 from urllib.request import Request, urlopen
 
 # ─────────────────────────────────────────────────────────────────────────────
+# SINGLE-USER GUARD — hanya satu sesi yang boleh memakai Generator RSNI
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Resource ini bersifat global untuk seluruh sesi pada satu proses Streamlit.
+# Engine dan alur aplikasi tidak diubah; guard hanya menentukan sesi mana yang
+# sedang berhak menjalankan pipeline Generator RSNI.
+@st.cache_resource
+def _get_generator_usage_guard():
+    return {
+        "mutex": threading.Lock(),
+        "owner": None,
+    }
+
+# ID sesi sudah digunakan aplikasi untuk nama file; dibuat lebih awal agar guard
+# dan penamaan file memakai identitas sesi yang sama.
+_GENERATOR_SESSION_ID = st.session_state.setdefault('_sid', uuid.uuid4().hex[:8])
+
+def _generator_busy_for_other_user() -> bool:
+    guard = _get_generator_usage_guard()
+    with guard["mutex"]:
+        owner = guard["owner"]
+        return owner is not None and owner != _GENERATOR_SESSION_ID
+
+def _acquire_generator_usage() -> bool:
+    """Ambil hak penggunaan Generator RSNI secara atomik."""
+    guard = _get_generator_usage_guard()
+    with guard["mutex"]:
+        owner = guard["owner"]
+        if owner is None or owner == _GENERATOR_SESSION_ID:
+            guard["owner"] = _GENERATOR_SESSION_ID
+            return True
+        return False
+
+def _release_generator_usage() -> None:
+    """Lepas hak penggunaan hanya jika sesi ini adalah pemiliknya."""
+    guard = _get_generator_usage_guard()
+    with guard["mutex"]:
+        if guard["owner"] == _GENERATOR_SESSION_ID:
+            guard["owner"] = None
+
+@st.dialog("Generator RSNI")
+def _show_generator_busy_popup():
+    st.warning("Aplikasi sedang digunakan oleh user lain. Tunggu beberapa saat lagi.")
+
+# ─────────────────────────────────────────────────────────────────────────────
 # AUTO-CLEANUP — pembersihan file temporer otomatis
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -1018,6 +1063,7 @@ if st.session_state.get('_process_error'):
     _back_col, _download_col, _continue_col = st.columns(3)
     with _back_col:
         if st.button('↩ Kembali', key='error_back', use_container_width=True):
+            _release_generator_usage()
             _reset_to_start()
             st.rerun()
     with _download_col:
@@ -1048,8 +1094,17 @@ if st.session_state.get('_process_error'):
 # LOGIC EXECUTION
 # ─────────────────────────────────────────────────────────────────────────────
 
+_generator_busy_popup_shown = False
+if _generator_busy_for_other_user():
+    _show_generator_busy_popup()
+    _generator_busy_popup_shown = True
+
 if btn_process:
     if uploaded_file:
+        if not _acquire_generator_usage():
+            if not _generator_busy_popup_shown:
+                _show_generator_busy_popup()
+            st.stop()
         try:
             st.session_state.pop('_process_error', None)
             st.session_state.pop('_last_engine', None)
@@ -1079,6 +1134,7 @@ if btn_process:
             st.session_state['_ics_number'] = ics_number
             st.rerun()
         except Exception as upload_error:
+            _release_generator_usage()
             # Bahkan kegagalan sebelum Engine 1 tetap masuk ke UI recovery.
             st.session_state['_process_error'] = (
                 f'❌ Error menyiapkan proses: {upload_error}'
@@ -1095,6 +1151,10 @@ if btn_process:
 if (st.session_state.get('_run_process') and
         st.session_state.get('_target_file') and
         int(st.session_state.get('_resume_engine', 1) or 1) > 1):
+    if not _acquire_generator_usage():
+        if not _generator_busy_popup_shown:
+            _show_generator_busy_popup()
+        st.stop()
     _resume = int(st.session_state['_resume_engine'])
     _resume_input = st.session_state['_target_file']
     _sid = st.session_state.setdefault('_sid', uuid.uuid4().hex[:8])
@@ -1162,6 +1222,7 @@ if (st.session_state.get('_run_process') and
                 )
             st.session_state.pop('_resume_engine', None)
             st.session_state.pop('_force_continue', None)
+            _release_generator_usage()
             st.rerun()
     except Exception as _resume_error:
         if st.session_state.get('_force_continue'):
@@ -1198,6 +1259,7 @@ if (st.session_state.get('_run_process') and
                     st.session_state['_run_process'] = False
                     st.session_state.pop('_resume_engine', None)
                     st.session_state.pop('_force_continue', None)
+                    _release_generator_usage()
                     st.rerun()
         # Fallback bila mode paksa tidak aktif atau tidak ada output valid.
         st.session_state['_process_error'] = (
@@ -1210,6 +1272,10 @@ if (st.session_state.get('_run_process') and
     st.stop()
 
 if st.session_state.get('_run_process') and st.session_state.get('_target_file'):
+    if not _acquire_generator_usage():
+        if not _generator_busy_popup_shown:
+            _show_generator_busy_popup()
+        st.stop()
     target_file = st.session_state['_target_file']
     doc_title_val = st.session_state['_doc_title']
     ics_number_val = st.session_state.get('_ics_number', 'XX.XXX.XX').strip() or 'XX.XXX.XX'
@@ -1544,6 +1610,7 @@ if st.session_state.get('_run_process') and st.session_state.get('_target_file')
         st.session_state['_final_time'] = final_elapsed
         st.session_state['_show_results'] = True
         st.session_state['_doc_sections'] = _parse_doc_structure(engine9_out)
+        _release_generator_usage()
 
     except Exception as e:
         st.session_state['_process_error'] = f"❌ Error Proses: {e}"
@@ -1591,6 +1658,7 @@ if st.session_state.get('_show_results'):
 
     st.markdown("<div style='height:10px'></div>", unsafe_allow_html=True)
     if st.button("🔄 Proses File Baru", key="reset", use_container_width=True):
+        _release_generator_usage()
         # Hapus file sesi ini segera sebelum reset
         _cleanup_session_files(st.session_state)
         for k in ['_show_results', '_final_opt_file', '_final_tr_file', '_final_time',
