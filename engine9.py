@@ -61,6 +61,7 @@ Deteksi batas bahasa Indonesia vs Inggris:
   berbahasa Indonesia.
 """
 
+from pipeline_utils import validate_docx, atomic_save_docx
 import os
 import re
 import copy
@@ -685,8 +686,7 @@ class StyleFinalizerEngine:
             #    supaya tidak mengubah bagian lain dari engine ini.
             _enforce_italic_terms(doc, ['Red Green Blue'])
 
-            doc.save(output_docx)
-
+            atomic_save_docx(doc, output_docx)
             msg = (
                 f'OK: {len(judul_targets)} heading/Lampiran -> "Judul", '
                 f'{len(pasal_targets)} pasal/subpasal -> "Pasal".'
@@ -869,8 +869,7 @@ class TableOfContentsEngine:
         node = settings.find(qn('w:updateFields'))
         if node is not None:
             node.set(qn('w:val'), 'false')
-        doc.save(docx_path)
-
+        atomic_save_docx(doc, docx_path)
     @staticmethod
     def _collect_entries(doc: Document, toc_title: Paragraph):
         entries = []
@@ -1288,8 +1287,7 @@ finally {{
             paragraph._p.set(qn('w:rsidRPr'), 'E9000001')
             paragraph.add_run(title)
             paragraph.add_run('\t' + page_label)
-        doc.save(docx_path)
-
+        atomic_save_docx(doc, docx_path)
     @staticmethod
     def _update_toc_page_numbers_on_linux(docx_path: str) -> None:
         """Hitung TOC secara deterministik di Streamlit Cloud/Linux.
@@ -1360,6 +1358,7 @@ finally {{
     def insert_toc(self, input_docx: str, output_docx: str) -> str:
         if not input_docx or not os.path.isfile(input_docx):
             raise FileNotFoundError(f'File input tidak ditemukan: {input_docx}')
+        validate_docx(input_docx)
         ok, message = StyleFinalizerEngine().apply(input_docx, output_docx)
         if not ok:
             raise RuntimeError(message)
@@ -1373,8 +1372,7 @@ finally {{
         anchor = self._toc_anchor_after_three_blank_paragraphs(title)
         anchor.addnext(toc._p)
         self._force_update_fields(doc)
-        doc.save(output_docx)
-
+        atomic_save_docx(doc, output_docx)
         # Jangan sediakan file untuk download sebelum Word benar-benar selesai
         # menghitung pagination dan menjalankan "Update page numbers only".
         self._update_toc_page_numbers_with_word(output_docx)
