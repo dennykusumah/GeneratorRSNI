@@ -1423,6 +1423,57 @@ p, li, span, div { color: inherit; }
     transition: all 0.2s ease !important;
     width: 100% !important;
 }
+
+
+/* === FINAL CENTERED FILE METADATA OVERRIDE ===
+   Center filename + size vertically inside the same white card, while reserving
+   safe space for the file icon on the left and round X on the right. */
+.uploaded-file-inline-meta {
+    position: relative !important;
+    z-index: 30 !important;
+    height: 0 !important;
+    overflow: visible !important;
+    pointer-events: none !important;
+    margin: 0 !important;
+    padding: 0 !important;
+    background: transparent !important;
+    border: 0 !important;
+    box-shadow: none !important;
+    transform: translate(66px, -42px) !important;
+    width: 142px !important;
+    display: flex !important;
+    flex-direction: column !important;
+    align-items: flex-start !important;
+    justify-content: center !important;
+    gap: 2px !important;
+    line-height: 1.05 !important;
+}
+.uploaded-file-inline-meta .uf-name {
+    display: block !important;
+    width: 142px !important;
+    max-width: 142px !important;
+    margin: 0 !important;
+    padding: 0 !important;
+    color: #000000 !important;
+    -webkit-text-fill-color: #000000 !important;
+    font-size: 0.78rem !important;
+    font-weight: 800 !important;
+    line-height: 1.08 !important;
+    white-space: nowrap !important;
+    overflow: hidden !important;
+    text-overflow: ellipsis !important;
+}
+.uploaded-file-inline-meta .uf-size {
+    display: block !important;
+    margin: 2px 0 0 0 !important;
+    padding: 0 !important;
+    color: #4b5563 !important;
+    -webkit-text-fill-color: #4b5563 !important;
+    font-size: 0.67rem !important;
+    font-weight: 600 !important;
+    line-height: 1.05 !important;
+    white-space: nowrap !important;
+}
 </style>
 """, unsafe_allow_html=True)
 
