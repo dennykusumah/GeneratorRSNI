@@ -1407,6 +1407,22 @@ p, li, span, div { color: inherit; }
     transition: all 0.2s ease !important;
     width: 100% !important;
 }
+
+/* FINAL — sembunyikan ukuran file pada kartu upload; nama file tetap tampil */
+div[data-testid="stFileUploader"] [data-testid="stFileUploaderFileSize"],
+div[data-testid="stFileUploader"] [data-testid="stFileUploaderFileSize"] *,
+div[data-testid="stFileUploader"] [data-testid*="FileSize"],
+div[data-testid="stFileUploader"] [data-testid*="FileSize"] * {
+    display: none !important;
+    visibility: hidden !important;
+}
+
+
+.uploaded-file-inline-meta .uf-size {
+    display: none !important;
+    visibility: hidden !important;
+}
+
 </style>
 """, unsafe_allow_html=True)
 
@@ -1681,7 +1697,7 @@ if uploaded_file is not None:
     _meta_html = (
         '<div class="uploaded-file-inline-meta" title="' + _uploaded_name + '">'
         '<span class="uf-name">' + _uploaded_name + '</span>'
-        '<span class="uf-size">' + _uploaded_size_text + '</span></div>'
+        '</div>'
     )
     st.markdown(_meta_html, unsafe_allow_html=True)
 
