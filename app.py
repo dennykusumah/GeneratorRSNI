@@ -522,9 +522,28 @@ div[data-testid="stFileUploaderFile"] span {
     visibility: visible !important;
 }
 
-/* Jangan mengubah warna ikon tombol hapus file. */
-div[data-testid="stFileUploaderFile"] button,
-div[data-testid="stFileUploaderFile"] button * {
+/* FIX FINAL UPLOADER — Streamlit 1.4x/1.5x dapat memakai wrapper metadata
+   tanpa data-testid khusus. Terapkan warna hitam ke SEMUA descendant kartu file. */
+div[data-testid="stFileUploaderFile"],
+div[data-testid="stFileUploaderFile"] * {
+    color: #111111 !important;
+    -webkit-text-fill-color: #111111 !important;
+    opacity: 1 !important;
+    visibility: visible !important;
+}
+
+/* Nama dan ukuran file biasanya berada pada area data uploader. */
+div[data-testid="stFileUploaderFile"] [data-testid*="FileData"],
+div[data-testid="stFileUploaderFile"] [data-testid*="FileData"] *,
+div[data-testid="stFileUploaderFile"] [class*="fileData"],
+div[data-testid="stFileUploaderFile"] [class*="fileData"] * {
+    color: #000000 !important;
+    -webkit-text-fill-color: #000000 !important;
+    opacity: 1 !important;
+}
+
+/* Tombol hapus tetap mempertahankan tampilan tombolnya sendiri. */
+div[data-testid="stFileUploaderFile"] button {
     -webkit-text-fill-color: initial !important;
 }
 
@@ -1217,7 +1236,7 @@ with col_set2:
     )
 
 # --- PENGATURAN KECEPATAN ENGINE 8 ---
-st.markdown('<div class="section-label speed-label">⚡ Kecepatan</div>', unsafe_allow_html=True)
+st.markdown('<div class="section-label speed-label">⏱️ Kecepatan</div>', unsafe_allow_html=True)
 if '_engine8_workers' not in st.session_state:
     st.session_state['_engine8_workers'] = 2
 
