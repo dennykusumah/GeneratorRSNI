@@ -1774,7 +1774,7 @@ class DocxFinalTranslatorEngine:
                         progress_callback, pct,
                         f"[translate 4 worker] {done}/{total} | "
                         f"berhasil={translated_count} | "
-                        f"tersisa={len(failed_paras)} | "
+                        f"gagal={len(failed_paras)} | "
                         f"[progres-total] {done}/{total + len(failed_paras)}",
                     )
 
@@ -1783,29 +1783,47 @@ class DocxFinalTranslatorEngine:
             recovery_total = len(failed_paras)
             still_failed = []
             recovery_success = 0
-            recovery_tr = _Translator(
-                self.source_lang, self.target_lang,
-                self.custom_dict, self.italic_dict,
-            )
+            # Pemulihan tetap TEPAT 1 worker (sekuensial), tetapi setiap
+            # paragraf mendapat client GoogleTranslator baru pada tiap retry.
+            # Ini penting karena client yang sudah terkena rate-limit/error
+            # sering terus gagal walaupun request berikutnya sebenarnya valid.
+            # Retry dilakukan di dalam worker yang sama, jadi TIDAK menambah
+            # paralelisme dan tetap aman terhadap pembatasan provider.
+            recovery_retry_per_item = 3
             for recovery_done, (index, para) in enumerate(
                     sorted(failed_paras, key=lambda item: item[0]), start=1):
-                before = len(recovery_tr.failed_texts)
-                found = _translate_para(para, recovery_tr)
-                failed = len(recovery_tr.failed_texts) > before
+                found = []
+                failed = True
+                for recovery_attempt in range(1, recovery_retry_per_item + 1):
+                    recovery_tr = _Translator(
+                        self.source_lang, self.target_lang,
+                        self.custom_dict, self.italic_dict,
+                    )
+                    found = _translate_para(para, recovery_tr)
+                    failed = bool(recovery_tr.failed_texts)
+                    if not failed:
+                        break
+                    if recovery_attempt < recovery_retry_per_item:
+                        # Backoff hanya pada pemulihan. Worker tetap 1.
+                        time.sleep(1.25 * recovery_attempt)
+
                 if failed:
                     still_failed.append(para)
                 else:
                     recovery_success += 1
                     translated_count += 1
                     italic_count += len(found)
-                # Pemulihan memakai rentang 90%--98%, dihitung murni dari
-                # counter recovery_done/recovery_total (YY/YY).
+
+                # Pemulihan memakai rentang 90%--98%. Label worker diambil
+                # dari jumlah worker yang benar-benar aktif pada fase ini.
+                recovery_workers = 1
                 pct = 90 + int(recovery_done / max(recovery_total, 1) * 8)
                 _notify(
                     progress_callback, pct,
-                    f"[pemulihan 1 worker] {recovery_done}/{recovery_total} | "
+                    f"[pemulihan {recovery_workers} worker] "
+                    f"{recovery_done}/{recovery_total} | "
                     f"berhasil={recovery_success} | "
-                    f"tersisa={recovery_total - recovery_done + len(still_failed)} "
+                    f"gagal={len(still_failed)} "
                     f"| [progres-total] {total + recovery_done}/"
                     f"{total + recovery_total}",
                 )
