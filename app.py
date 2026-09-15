@@ -926,16 +926,16 @@ div[data-testid="stFileUploader"] div[data-testid="stFileUploaderFile"] button >
     transform: translate(66px, -37px) !important;
     width: 138px !important;
     display: flex !important;
-    flex-direction: row !important;
-    align-items: center !important;
-    justify-content: flex-start !important;
-    gap: 7px !important;
-    line-height: 1 !important;
+    flex-direction: column !important;
+    align-items: flex-start !important;
+    justify-content: center !important;
+    gap: 2px !important;
+    line-height: 1.05 !important;
 }
 .uploaded-file-inline-meta .uf-name {
     display: block !important;
-    width: auto !important;
-    max-width: 82px !important;
+    width: 138px !important;
+    max-width: 138px !important;
     color: #000000 !important;
     -webkit-text-fill-color: #000000 !important;
     font-family: 'Outfit', sans-serif !important;
@@ -947,7 +947,7 @@ div[data-testid="stFileUploader"] div[data-testid="stFileUploaderFile"] button >
 }
 .uploaded-file-inline-meta .uf-size {
     display: block !important;
-    margin-top: 0 !important;
+    margin-top: 1px !important;
     color: #374151 !important;
     -webkit-text-fill-color: #4b5563 !important;
     font-family: 'Outfit', sans-serif !important;
