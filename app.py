@@ -556,6 +556,7 @@ div[data-testid="stFileUploaderFile"] {
 .speed-label {
     margin-top: 0.2rem !important;
     margin-bottom: 0 !important;
+    padding-bottom: 0 !important;
 }
 
 /* Samakan jarak label Kecepatan -> tombol dengan label No. SNI -> input.
@@ -1189,8 +1190,14 @@ st.markdown("""
 <style>
 div.st-key-speed_worker_row,
 div[class~="st-key-speed_worker_row"] {
-    margin-top: -0.55rem !important;
+    /* Geser row tombol secara nyata ke atas. Margin saja tidak cukup karena
+       Streamlit menambahkan gap pada parent vertical-block. */
+    position: relative !important;
+    top: -1.25rem !important;
+    margin-top: 0 !important;
+    margin-bottom: -1.25rem !important;
     padding-top: 0 !important;
+    padding-bottom: 0 !important;
 }
 </style>
 """, unsafe_allow_html=True)
