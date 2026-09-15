@@ -909,9 +909,81 @@ div[data-testid="stFileUploader"] button[aria-label*="delete" i],
 div[data-testid="stFileUploader"] button[aria-label*="remove" i] { background:transparent!important; background-image:none!important; border:0!important; outline:0!important; box-shadow:none!important; padding:0!important; width:24px!important; min-width:24px!important; max-width:24px!important; height:24px!important; min-height:24px!important; max-height:24px!important; border-radius:999px!important; }
 div[data-testid="stFileUploader"] div[data-testid="stFileUploaderFile"] button:hover, div[data-testid="stFileUploader"] div[data-testid="stFileUploaderFile"] button:focus, div[data-testid="stFileUploader"] div[data-testid="stFileUploaderFile"] button:active { background:transparent!important; border:0!important; outline:0!important; box-shadow:none!important; }
 div[data-testid="stFileUploader"] div[data-testid="stFileUploaderFile"] button > div, div[data-testid="stFileUploader"] div[data-testid="stFileUploaderFile"] button > span { background:transparent!important; border:0!important; outline:0!important; box-shadow:none!important; }
-.uploaded-file-guaranteed-meta { margin-top:-0.45rem!important; margin-bottom:0.35rem!important; padding:0.48rem 0.75rem!important; max-width:100%!important; display:flex!important; align-items:center!important; gap:0.55rem!important; background:#fff!important; border:0!important; border-radius:8px!important; box-shadow:none!important; }
-.uploaded-file-guaranteed-meta .uf-name { color:#111827!important; -webkit-text-fill-color:#111827!important; font-size:0.84rem!important; font-weight:700!important; max-width:430px!important; overflow:hidden!important; text-overflow:ellipsis!important; white-space:nowrap!important; }
-.uploaded-file-guaranteed-meta .uf-size { color:#374151!important; -webkit-text-fill-color:#374151!important; font-size:0.76rem!important; font-weight:600!important; white-space:nowrap!important; }
+/* Metadata fallback ditempel DI DALAM kartu file putih bawaan Streamlit.
+   Elemen ini tidak membuat kartu/kotak baru: tinggi layout = 0 dan background transparan. */
+.uploaded-file-inline-meta {
+    position: relative !important;
+    z-index: 20 !important;
+    height: 0 !important;
+    overflow: visible !important;
+    pointer-events: none !important;
+    margin: 0 !important;
+    padding: 0 !important;
+    background: transparent !important;
+    border: 0 !important;
+    box-shadow: none !important;
+    /* Naik tepat ke baris file uploader. */
+    transform: translate(66px, -37px) !important;
+    width: 138px !important;
+    display: flex !important;
+    flex-direction: column !important;
+    align-items: flex-start !important;
+    justify-content: center !important;
+    line-height: 1.05 !important;
+}
+.uploaded-file-inline-meta .uf-name {
+    display: block !important;
+    width: 138px !important;
+    color: #111827 !important;
+    -webkit-text-fill-color: #111827 !important;
+    font-family: 'Outfit', sans-serif !important;
+    font-size: 0.78rem !important;
+    font-weight: 700 !important;
+    overflow: hidden !important;
+    text-overflow: ellipsis !important;
+    white-space: nowrap !important;
+}
+.uploaded-file-inline-meta .uf-size {
+    display: block !important;
+    margin-top: 3px !important;
+    color: #4b5563 !important;
+    -webkit-text-fill-color: #4b5563 !important;
+    font-family: 'Outfit', sans-serif !important;
+    font-size: 0.67rem !important;
+    font-weight: 600 !important;
+    white-space: nowrap !important;
+}
+
+/* X FINAL: jangan gunakan SVG bawaan karena pada sebagian versi Streamlit
+   glyph SVG membawa frame persegi. Sembunyikan SVG lalu gambar sendiri X bulat. */
+div[data-testid="stFileUploader"] div[data-testid="stFileUploaderFile"] button svg,
+div[data-testid="stFileUploader"] [data-testid="stFileUploaderDeleteBtn"] svg,
+div[data-testid="stFileUploader"] button[aria-label*="delete" i] svg,
+div[data-testid="stFileUploader"] button[aria-label*="remove" i] svg {
+    display: none !important;
+}
+div[data-testid="stFileUploader"] div[data-testid="stFileUploaderFile"] button::before,
+div[data-testid="stFileUploader"] [data-testid="stFileUploaderDeleteBtn"] button::before,
+div[data-testid="stFileUploader"] button[aria-label*="delete" i]::before,
+div[data-testid="stFileUploader"] button[aria-label*="remove" i]::before {
+    content: "×" !important;
+    display: flex !important;
+    align-items: center !important;
+    justify-content: center !important;
+    width: 19px !important;
+    height: 19px !important;
+    border-radius: 50% !important;
+    background: #1f2937 !important;
+    color: #ffffff !important;
+    -webkit-text-fill-color: #ffffff !important;
+    border: 0 !important;
+    outline: 0 !important;
+    box-shadow: none !important;
+    font-family: Arial, sans-serif !important;
+    font-size: 15px !important;
+    font-weight: 400 !important;
+    line-height: 19px !important;
+}
 
 /* ══════════════════════════════════════════
    INPUT FIELDS
@@ -1607,7 +1679,7 @@ if uploaded_file is not None:
     else:
         _uploaded_size_text = f"{_uploaded_size} B"
     _meta_html = (
-        '<div class="uploaded-file-guaranteed-meta" title="' + _uploaded_name + '">'
+        '<div class="uploaded-file-inline-meta" title="' + _uploaded_name + '">'
         '<span class="uf-name">' + _uploaded_name + '</span>'
         '<span class="uf-size">' + _uploaded_size_text + '</span></div>'
     )
