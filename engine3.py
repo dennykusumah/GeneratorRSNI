@@ -12,6 +12,8 @@ dan nomor halaman milik section 3/4 dari Engine 2 tetap dipertahankan.
 
 from __future__ import annotations
 
+from pipeline_utils import validate_docx, atomic_save_docx
+
 import os
 import re
 from datetime import datetime
@@ -190,8 +192,7 @@ class DaftarIsiEngine:
 
         out_dir = os.path.dirname(os.path.abspath(output_docx))
         os.makedirs(out_dir, exist_ok=True)
-        doc.save(output_docx)
-
+        atomic_save_docx(doc, output_docx)
         # Pemeriksaan akhir: penyisipan tidak boleh mengubah jumlah section.
         checked = Document(output_docx)
         if len(checked.sections) != input_section_count:
@@ -260,7 +261,7 @@ class DaftarIsiEngine:
         self._new_title_paragraph(doc)
         out_dir = os.path.dirname(os.path.abspath(output_docx))
         os.makedirs(out_dir, exist_ok=True)
-        doc.save(output_docx)
+        atomic_save_docx(doc, output_docx)
         return output_docx
 
     def process(
