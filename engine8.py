@@ -527,16 +527,36 @@ def _run_vertalign(run) -> str | None:
     return None
 
 
-def _extract_source_format_map(text_runs, para_style_italic: bool) -> tuple[str, dict]:
+def _vertical_unicode(text: str, vtype: str) -> str | None:
+    """Representasikan pangkat/indeks dengan Unicode alami saat dikirim ke translator.
+
+    Ini jauh lebih stabil daripada token acak ZXQSRC... untuk satu/dua karakter
+    seperti −2 atau 2. Google Translate kadang mengubah/memisahkan token panjang,
+    lalu validasi Engine 8 menganggap seluruh paragraf gagal. Unicode superscript/
+    subscript biasanya dipertahankan verbatim oleh provider.
     """
-    Versi gabungan dari _extract_source_italic_map yang JUGA melindungi
-    superscript/subscript. Menggabungkan run menjadi satu teks, tapi:
-      - Segmen superscript/subscript SELALU dilindungi token (berapa pun
-        panjangnya — bisa cuma 1 karakter seperti pangkat "2"), supaya
-        teks & formatnya persis sama setelah diterjemahkan.
-      - Segmen miring (tanpa superscript/subscript) tetap memakai aturan
-        lama (istilah/judul asing yang sudah miring di sumber).
-    token_map: token -> {'text': teks asli, 'italic': bool, 'vtype': str|None}
+    supers = str.maketrans({
+        '0':'⁰','1':'¹','2':'²','3':'³','4':'⁴','5':'⁵','6':'⁶','7':'⁷','8':'⁸','9':'⁹',
+        '+':'⁺','-':'⁻','−':'⁻','=':'⁼','(':'⁽',')':'⁾',
+    })
+    subs = str.maketrans({
+        '0':'₀','1':'₁','2':'₂','3':'₃','4':'₄','5':'₅','6':'₆','7':'₇','8':'₈','9':'₉',
+        '+':'₊','-':'₋','−':'₋','=':'₌','(':'₍',')':'₎',
+    })
+    table = supers if vtype == 'superscript' else subs
+    converted = text.translate(table)
+    # Hanya pakai cara ini bila seluruh karakter non-spasi memang berhasil
+    # direpresentasikan berbeda; selain itu kembali ke token proteksi lama.
+    return converted if converted != text else None
+
+
+def _extract_source_format_map(text_runs, para_style_italic: bool) -> tuple[str, dict]:
+    """Lindungi italic dan vertAlign tanpa membuat paragraf ilmiah mudah gagal.
+
+    Khusus superscript/subscript numerik (mis. kWm−2 dan m2), kirim sebagai
+    Unicode ⁻²/² ke translator. Setelah terjemahan, glyph itu dikembalikan ke
+    teks asli dan run diberi w:vertAlign lagi. Untuk format lain tetap gunakan
+    token ZXQSRC lama.
     """
     segments = []
     for _, r in text_runs:
@@ -556,11 +576,21 @@ def _extract_source_format_map(text_runs, para_style_italic: bool) -> tuple[str,
         if not stripped:
             out_parts.append(seg_text)
             continue
-        protect = False
+
         if vtype is not None:
-            protect = True
-        elif is_ital and len(stripped) >= 3 and not _RE_PURE_NUMBER.fullmatch(stripped):
-            protect = True
+            marker = _vertical_unicode(seg_text, vtype)
+            if marker:
+                # Marker Unicode dapat berulang (⁻² muncul beberapa kali);
+                # format dan teks aslinya sama, sehingga aman memakai satu map.
+                token_map[marker] = {
+                    'text': seg_text, 'italic': is_ital, 'vtype': vtype
+                }
+                out_parts.append(marker)
+                continue
+
+        protect = bool(vtype is not None) or (
+            is_ital and len(stripped) >= 3 and not _RE_PURE_NUMBER.fullmatch(stripped)
+        )
         if protect:
             token = f'ZXQSRC{uuid.uuid4().hex[:12].upper()}QXZ'
             token_map[token] = {'text': seg_text, 'italic': is_ital, 'vtype': vtype}
@@ -568,7 +598,6 @@ def _extract_source_format_map(text_runs, para_style_italic: bool) -> tuple[str,
         else:
             out_parts.append(seg_text)
     return ''.join(out_parts), token_map
-
 
 def _detokenize_with_formatting(text: str, token_map: dict) -> tuple[str, list]:
     """
