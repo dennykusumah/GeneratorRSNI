@@ -23,6 +23,9 @@ import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import csv
 import os
+import sqlite3
+import hashlib
+import json
 
 from docx import Document
 from docx.shared import Pt
@@ -1138,30 +1141,184 @@ _TITLE_SAFE_FALLBACKS = {
 class TranslationFailedError(RuntimeError):
     """Mencegah dokumen setengah diterjemahkan tetap disimpan."""
 
+# ─────────────────────────────────────────────────────────────────────────────
+# TRANSLATION CACHE
+# ─────────────────────────────────────────────────────────────────────────────
+_TRANSLATION_CACHE_PATH = os.getenv(
+    'TRANSLATION_CACHE_PATH',
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), 'engine8_translation_cache.sqlite3'),
+)
+_CACHE_INIT_LOCK = threading.Lock()
+_CACHE_READY = False
 
-# Pembatas adaptif bersama untuk mencegah lonjakan request dari 4 worker.
-# Empat worker tetap aktif, tetapi awal request dijarakkan agar provider web
-# tidak menerima burst yang biasanya memicu rate-limit di tengah dokumen.
+
+def _cache_init() -> None:
+    global _CACHE_READY
+    if _CACHE_READY:
+        return
+    with _CACHE_INIT_LOCK:
+        if _CACHE_READY:
+            return
+        try:
+            con = sqlite3.connect(_TRANSLATION_CACHE_PATH, timeout=10)
+            try:
+                con.execute('PRAGMA journal_mode=WAL')
+                con.execute('PRAGMA synchronous=NORMAL')
+                con.execute("""CREATE TABLE IF NOT EXISTS translation_cache (
+                    cache_key TEXT PRIMARY KEY,
+                    translated TEXT NOT NULL,
+                    italic_terms TEXT NOT NULL DEFAULT '[]',
+                    created_at INTEGER NOT NULL,
+                    hits INTEGER NOT NULL DEFAULT 0
+                )""")
+                con.commit()
+                _CACHE_READY = True
+            finally:
+                con.close()
+        except Exception:
+            _CACHE_READY = False
+
+
+def _dictionary_fingerprint(custom_dict) -> str:
+    if not custom_dict or not getattr(custom_dict, '_entries', None):
+        return '-'
+    pairs = sorted((k, v[1]) for k, v in custom_dict._entries.items())
+    raw = json.dumps(pairs, ensure_ascii=False, separators=(',', ':'))
+    return hashlib.sha256(raw.encode('utf-8')).hexdigest()[:16]
+
+
+def _canonicalize_source_tokens(text: str) -> tuple[str, list[str]]:
+    tokens = []
+    def repl(m):
+        tokens.append(m.group(0))
+        return f'ZXQCACHE{len(tokens)-1:04d}QXZ'
+    canonical = re.sub(r'ZXQSRC[A-F0-9]{12}QXZ', repl, text, flags=re.IGNORECASE)
+    return canonical, tokens
+
+
+def _restore_source_tokens(text: str, current_tokens: list[str]) -> str:
+    for i, token in enumerate(current_tokens):
+        text = re.sub(re.escape(f'ZXQCACHE{i:04d}QXZ'), token, text, flags=re.IGNORECASE)
+    return text
+
+
+def _cache_identity(text: str, italic_map: dict, source: str, target: str,
+                    custom_dict) -> tuple[str, list[str]]:
+    stable = text
+    for token, original in (italic_map or {}).items():
+        stable = re.sub(re.escape(token), original, stable, flags=re.IGNORECASE)
+    stable, src_tokens = _canonicalize_source_tokens(stable)
+    stable = re.sub(r'\s+', ' ', stable).strip()
+    payload = '\x1f'.join((source, target, _dictionary_fingerprint(custom_dict), stable))
+    key = hashlib.sha256(payload.encode('utf-8')).hexdigest()
+    return key, src_tokens
+
+
+def _cache_get(cache_key: str, src_tokens: list[str]):
+    _cache_init()
+    if not _CACHE_READY:
+        return None
+    try:
+        con = sqlite3.connect(_TRANSLATION_CACHE_PATH, timeout=5)
+        try:
+            row = con.execute(
+                'SELECT translated, italic_terms FROM translation_cache WHERE cache_key=?',
+                (cache_key,),
+            ).fetchone()
+            if not row:
+                return None
+            con.execute('UPDATE translation_cache SET hits=hits+1 WHERE cache_key=?', (cache_key,))
+            con.commit()
+            translated = _restore_source_tokens(row[0], src_tokens)
+            try:
+                terms = json.loads(row[1])
+            except Exception:
+                terms = []
+            return translated, terms
+        finally:
+            con.close()
+    except Exception:
+        return None
+
+
+def _cache_put(cache_key: str, translated: str, italic_terms: list[str]) -> None:
+    _cache_init()
+    if not _CACHE_READY:
+        return
+    try:
+        canonical, _ = _canonicalize_source_tokens(translated)
+        con = sqlite3.connect(_TRANSLATION_CACHE_PATH, timeout=5)
+        try:
+            con.execute("""INSERT INTO translation_cache(cache_key, translated, italic_terms, created_at, hits)
+                   VALUES(?,?,?,?,0)
+                   ON CONFLICT(cache_key) DO UPDATE SET
+                     translated=excluded.translated,
+                     italic_terms=excluded.italic_terms,
+                     created_at=excluded.created_at""",
+                (cache_key, canonical, json.dumps(italic_terms, ensure_ascii=False), int(time.time())),
+            )
+            con.commit()
+        finally:
+            con.close()
+    except Exception:
+        pass
+
+
+# Adaptive request controller: fast by default, slows only after provider/network
+# failures, then automatically returns to fast mode after successful requests.
 _TRANSLATE_GATE_LOCK = threading.Lock()
 _TRANSLATE_NEXT_REQUEST = 0.0
-_TRANSLATE_MIN_INTERVAL = 0.80
-_TRANSLATE_ERROR_COOLDOWN = 4.0
+_TRANSLATE_FAST_INTERVAL = 0.06
+_TRANSLATE_ADAPTIVE_INTERVAL = 0.55
+_TRANSLATE_ADAPTIVE_UNTIL = 0.0
+_TRANSLATE_SUCCESS_STREAK = 0
 
 def _translation_gate_wait(extra_delay: float = 0.0) -> None:
     global _TRANSLATE_NEXT_REQUEST
     with _TRANSLATE_GATE_LOCK:
         now = time.monotonic()
+        adaptive = now < _TRANSLATE_ADAPTIVE_UNTIL
+        interval = _TRANSLATE_ADAPTIVE_INTERVAL if adaptive else _TRANSLATE_FAST_INTERVAL
         wait = max(0.0, _TRANSLATE_NEXT_REQUEST - now)
         if wait:
             time.sleep(wait)
-        jitter = random.uniform(0.0, 0.06)
-        _TRANSLATE_NEXT_REQUEST = time.monotonic() + _TRANSLATE_MIN_INTERVAL + extra_delay + jitter
+        # In fast mode four workers can run almost concurrently. In adaptive
+        # mode requests are deliberately spaced to let the provider recover.
+        jitter = random.uniform(0.0, 0.025 if not adaptive else 0.08)
+        _TRANSLATE_NEXT_REQUEST = time.monotonic() + interval + extra_delay + jitter
 
-def _translation_gate_penalize(attempt: int) -> None:
-    global _TRANSLATE_NEXT_REQUEST
-    penalty = min(6.0, _TRANSLATE_ERROR_COOLDOWN * max(1, attempt))
+def _is_provider_failure(exc: Exception) -> bool:
+    msg = str(exc).casefold()
+    # Validation failures caused by document/token content must not throttle
+    # every other worker. Only network/provider/rate-limit symptoms do.
+    provider_terms = (
+        '429', 'too many', 'rate', 'timeout', 'timed out', 'connection',
+        'remote', 'temporar', '503', '502', 'service unavailable',
+        'request exception', 'proxy', 'ssl', 'captcha', 'blocked'
+    )
+    return any(term in msg for term in provider_terms)
+
+def _translation_gate_penalize(attempt: int, exc: Exception | None = None) -> None:
+    global _TRANSLATE_ADAPTIVE_UNTIL, _TRANSLATE_SUCCESS_STREAK, _TRANSLATE_NEXT_REQUEST
+    if exc is not None and not _is_provider_failure(exc):
+        return
+    # Short adaptive window instead of permanently slowing the whole document.
+    penalty = min(4.0, 0.9 + (0.65 * max(0, attempt - 1)))
     with _TRANSLATE_GATE_LOCK:
-        _TRANSLATE_NEXT_REQUEST = max(_TRANSLATE_NEXT_REQUEST, time.monotonic() + penalty)
+        now = time.monotonic()
+        _TRANSLATE_ADAPTIVE_UNTIL = max(_TRANSLATE_ADAPTIVE_UNTIL, now + penalty)
+        _TRANSLATE_NEXT_REQUEST = max(_TRANSLATE_NEXT_REQUEST, now + 0.30)
+        _TRANSLATE_SUCCESS_STREAK = 0
+
+def _translation_gate_success() -> None:
+    global _TRANSLATE_ADAPTIVE_UNTIL, _TRANSLATE_SUCCESS_STREAK, _TRANSLATE_NEXT_REQUEST
+    with _TRANSLATE_GATE_LOCK:
+        _TRANSLATE_SUCCESS_STREAK += 1
+        # As soon as normal responses are stable again, immediately restore
+        # fast mode rather than waiting for a long fixed cooldown.
+        if _TRANSLATE_SUCCESS_STREAK >= 4:
+            _TRANSLATE_ADAPTIVE_UNTIL = 0.0
+            _TRANSLATE_NEXT_REQUEST = min(_TRANSLATE_NEXT_REQUEST, time.monotonic() + _TRANSLATE_FAST_INTERVAL)
 
 class _Translator:
     def __init__(self, source: str = 'auto', target: str = 'id', 
@@ -1178,6 +1335,16 @@ class _Translator:
     def translate_one(self, text: str, italic_map: dict = None) -> tuple[str, list[str]]:
         t = text.strip()
         if not t or _skip_text(t): return text, []
+
+        # CACHE FIRST: hasil sukses yang pernah diterjemahkan tidak dikirim
+        # ulang ke provider. Token proteksi acak dinormalisasi pada cache key.
+        cache_key, cache_src_tokens = _cache_identity(
+            t, italic_map or {}, self.source, self.target, self.custom_dict
+        )
+        cached = _cache_get(cache_key, cache_src_tokens)
+        if cached is not None:
+            return cached
+
         token_map = {}
         if self.custom_dict and len(self.custom_dict) > 0:
             t, token_map = self.custom_dict._apply_pre(t)
@@ -1197,6 +1364,7 @@ class _Translator:
                 result, italic_terms_found = self.italic_dict._apply_post(
                     result, final_italic_map
                 )
+            _cache_put(cache_key, result, italic_terms_found)
             return result, italic_terms_found
 
         expected_tokens = {
@@ -1226,10 +1394,11 @@ class _Translator:
                 ):
                     raise ValueError('teks dikembalikan tanpa diterjemahkan')
                 result = candidate
+                _translation_gate_success()
                 break
             except Exception as exc:
                 last_error = exc
-                _translation_gate_penalize(attempt)
+                _translation_gate_penalize(attempt, exc)
                 # Buat ulang client setelah respons gagal/rate-limit agar
                 # koneksi/session bermasalah tidak dipakai terus-menerus.
                 try:
@@ -1237,7 +1406,12 @@ class _Translator:
                 except Exception:
                     pass
                 if attempt < 7:
-                    time.sleep(min(12.0, 1.25 * (2 ** (attempt - 1))) + random.uniform(0.15, 0.65))
+                    if _is_provider_failure(exc):
+                        time.sleep(min(3.5, 0.45 * (2 ** (attempt - 1))) + random.uniform(0.05, 0.25))
+                    else:
+                        # Content/token validation error: retry quickly and do
+                        # not punish unrelated workers.
+                        time.sleep(0.08 + random.uniform(0.0, 0.08))
 
         if result is None:
             # Judul standar lazim terdiri dari beberapa klausa yang dipisahkan
@@ -1293,6 +1467,7 @@ class _Translator:
             if safe_title:
                 result = safe_title
 
+        translation_succeeded = result is not None
         if result is None:
             preview = re.sub(r'\s+', ' ', text).strip()[:100]
             # Jangan gagalkan seluruh pipeline karena satu request eksternal.
@@ -1305,6 +1480,10 @@ class _Translator:
         if final_italic_map:
             _idict = self.italic_dict if self.italic_dict is not None else ItalicDictionary()
             result, italic_terms_found = _idict._apply_post(result, final_italic_map)
+        # Cache hanya menyimpan hasil sukses; fallback sumber/gagal tidak pernah
+        # dimasukkan agar cache tidak tercemar.
+        if translation_succeeded:
+            _cache_put(cache_key, result, italic_terms_found)
         return result, italic_terms_found
 
 def _match_capitalization(original: str, translated: str) -> str:
