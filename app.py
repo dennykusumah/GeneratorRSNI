@@ -227,10 +227,59 @@ def _show_busy_popup() -> None:
         st.markdown(
             """
             <style>
-            div[data-testid="stDialog"] div[role="dialog"] h2 {
+            /* Streamlit menaruh judul dialog di header tersendiri.
+               Selector lama hanya mengenai h2 di body sehingga WARNING!!!
+               tetap rata kiri. Targetkan header + heading secara langsung. */
+            div[data-testid="stDialog"] div[role="dialog"] header,
+            div[data-testid="stDialog"] div[role="dialog"] [data-testid="stDialogHeader"],
+            div[data-testid="stDialog"] [data-testid="stDialogHeader"] {
+                position: relative !important;
+                display: flex !important;
+                align-items: center !important;
+                justify-content: center !important;
                 width: 100% !important;
+            }
+
+            div[data-testid="stDialog"] div[role="dialog"] header h2,
+            div[data-testid="stDialog"] div[role="dialog"] header h3,
+            div[data-testid="stDialog"] div[role="dialog"] [data-testid="stDialogHeader"] h2,
+            div[data-testid="stDialog"] div[role="dialog"] [data-testid="stDialogHeader"] h3,
+            div[data-testid="stDialog"] [data-testid="stDialogHeader"] h2,
+            div[data-testid="stDialog"] [data-testid="stDialogHeader"] h3 {
+                display: block !important;
+                width: 100% !important;
+                margin-left: 0 !important;
+                margin-right: 0 !important;
+                padding-left: 48px !important;
+                padding-right: 48px !important;
                 text-align: center !important;
                 font-weight: 800 !important;
+            }
+
+            /* Fallback untuk DOM Streamlit yang tidak memberi test-id pada header. */
+            div[data-testid="stDialog"] div[role="dialog"] > div:first-child:has(button) {
+                position: relative !important;
+                display: flex !important;
+                justify-content: center !important;
+                align-items: center !important;
+            }
+            div[data-testid="stDialog"] div[role="dialog"] > div:first-child:has(button) h2,
+            div[data-testid="stDialog"] div[role="dialog"] > div:first-child:has(button) h3 {
+                width: 100% !important;
+                padding-left: 48px !important;
+                padding-right: 48px !important;
+                text-align: center !important;
+                font-weight: 800 !important;
+            }
+
+            /* Tombol X tetap di kanan dan tidak ikut menggeser titik tengah judul. */
+            div[data-testid="stDialog"] div[role="dialog"] header button,
+            div[data-testid="stDialog"] [data-testid="stDialogHeader"] button,
+            div[data-testid="stDialog"] div[role="dialog"] > div:first-child:has(button) > button {
+                position: absolute !important;
+                right: 16px !important;
+                top: 50% !important;
+                transform: translateY(-50%) !important;
             }
             </style>
             """,
