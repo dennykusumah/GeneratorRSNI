@@ -746,6 +746,160 @@ div[data-testid="stFileUploader"] button[aria-label*="Remove" i] svg {
     opacity: 1 !important;
 }
 
+/* ── UPLOADER DEFINITIVE FIX — metadata + round X only ───────────────────
+   Streamlit memakai DOM berbeda antar versi. Selector berikut sengaja tidak
+   bergantung hanya pada FileData/FileName agar metadata tidak mendapat width 0. */
+
+/* Kartu file: beri ruang nyata untuk ikon + metadata + tombol hapus. */
+div[data-testid="stFileUploader"] div[data-testid="stFileUploaderFile"] {
+    display: grid !important;
+    grid-template-columns: 36px minmax(150px, 1fr) 28px !important;
+    column-gap: 10px !important;
+    align-items: center !important;
+    box-sizing: border-box !important;
+    width: min(100%, 520px) !important;
+    min-width: min(100%, 360px) !important;
+    padding: 7px 8px !important;
+    background: #ffffff !important;
+    overflow: visible !important;
+}
+
+/* Ikon dokumen tetap di kolom pertama. */
+div[data-testid="stFileUploader"] div[data-testid="stFileUploaderFile"] > svg,
+div[data-testid="stFileUploader"] div[data-testid="stFileUploaderFile"] > div:first-child:has(svg) {
+    grid-column: 1 !important;
+    min-width: 32px !important;
+}
+
+/* PENTING: elemen tengah apa pun yang bukan tombol/ikon diberi kolom metadata.
+   Ini menangani Streamlit lama maupun baru walau data-testid berubah. */
+div[data-testid="stFileUploader"] div[data-testid="stFileUploaderFile"] > div:not(:first-child):not(:last-child),
+div[data-testid="stFileUploader"] div[data-testid="stFileUploaderFile"] > div:has([data-testid*="FileName"]),
+div[data-testid="stFileUploader"] div[data-testid="stFileUploaderFile"] > div:has([data-testid*="FileSize"]),
+div[data-testid="stFileUploader"] div[data-testid="stFileUploaderFile"] > div:has(p),
+div[data-testid="stFileUploader"] div[data-testid="stFileUploaderFile"] > div:has(small) {
+    grid-column: 2 !important;
+    display: block !important;
+    width: 100% !important;
+    min-width: 150px !important;
+    max-width: none !important;
+    height: auto !important;
+    overflow: visible !important;
+    opacity: 1 !important;
+    visibility: visible !important;
+}
+
+/* FileData eksplisit jika tersedia. */
+div[data-testid="stFileUploader"] [data-testid*="FileData"] {
+    grid-column: 2 !important;
+    display: flex !important;
+    flex-direction: column !important;
+    align-items: flex-start !important;
+    justify-content: center !important;
+    width: 100% !important;
+    min-width: 150px !important;
+    max-width: none !important;
+    overflow: visible !important;
+    opacity: 1 !important;
+    visibility: visible !important;
+}
+
+/* Nama + ukuran: jangan biarkan rule global membuat teks transparan/hilang. */
+div[data-testid="stFileUploader"] div[data-testid="stFileUploaderFile"] p,
+div[data-testid="stFileUploader"] div[data-testid="stFileUploaderFile"] span,
+div[data-testid="stFileUploader"] div[data-testid="stFileUploaderFile"] small,
+div[data-testid="stFileUploader"] [data-testid*="FileName"],
+div[data-testid="stFileUploader"] [data-testid*="FileName"] *,
+div[data-testid="stFileUploader"] [data-testid*="FileSize"],
+div[data-testid="stFileUploader"] [data-testid*="FileSize"] * {
+    position: static !important;
+    display: block !important;
+    width: auto !important;
+    max-width: 100% !important;
+    height: auto !important;
+    margin: 0 !important;
+    padding: 0 !important;
+    color: #111827 !important;
+    -webkit-text-fill-color: #111827 !important;
+    text-shadow: none !important;
+    opacity: 1 !important;
+    visibility: visible !important;
+    clip: auto !important;
+    clip-path: none !important;
+}
+
+div[data-testid="stFileUploader"] [data-testid*="FileName"],
+div[data-testid="stFileUploader"] [data-testid*="FileName"] *,
+div[data-testid="stFileUploader"] div[data-testid="stFileUploaderFile"] p {
+    font-weight: 600 !important;
+    white-space: nowrap !important;
+    overflow: hidden !important;
+    text-overflow: ellipsis !important;
+}
+
+div[data-testid="stFileUploader"] [data-testid*="FileSize"],
+div[data-testid="stFileUploader"] [data-testid*="FileSize"] *,
+div[data-testid="stFileUploader"] div[data-testid="stFileUploaderFile"] small {
+    color: #4b5563 !important;
+    -webkit-text-fill-color: #4b5563 !important;
+    font-size: 0.75rem !important;
+    font-weight: 500 !important;
+}
+
+/* Tombol delete selalu di kolom kanan dan SELURUH kotak tombol dihapus. */
+div[data-testid="stFileUploader"] div[data-testid="stFileUploaderFile"] > button,
+div[data-testid="stFileUploader"] div[data-testid="stFileUploaderFile"] > div:last-child:has(button),
+div[data-testid="stFileUploader"] [data-testid*="DeleteBtn"],
+div[data-testid="stFileUploader"] [data-testid*="DeleteBtn"] button,
+div[data-testid="stFileUploader"] button[aria-label*="delete" i],
+div[data-testid="stFileUploader"] button[aria-label*="remove" i] {
+    grid-column: 3 !important;
+}
+
+div[data-testid="stFileUploader"] div[data-testid="stFileUploaderFile"] button,
+div[data-testid="stFileUploader"] div[data-testid="stFileUploaderFile"] button:hover,
+div[data-testid="stFileUploader"] div[data-testid="stFileUploaderFile"] button:focus,
+div[data-testid="stFileUploader"] div[data-testid="stFileUploaderFile"] button:focus-visible,
+div[data-testid="stFileUploader"] div[data-testid="stFileUploaderFile"] button:active {
+    width: 24px !important;
+    min-width: 24px !important;
+    max-width: 24px !important;
+    height: 24px !important;
+    min-height: 24px !important;
+    max-height: 24px !important;
+    padding: 0 !important;
+    margin: 0 !important;
+    background: transparent !important;
+    background-color: transparent !important;
+    background-image: none !important;
+    border: none !important;
+    outline: none !important;
+    box-shadow: none !important;
+    border-radius: 50% !important;
+    transform: none !important;
+}
+
+/* Hilangkan border persegi sampai ke wrapper dan SVG. Hanya glyph bulat-X tersisa. */
+div[data-testid="stFileUploader"] div[data-testid="stFileUploaderFile"] button *,
+div[data-testid="stFileUploader"] div[data-testid="stFileUploaderFile"] button svg,
+div[data-testid="stFileUploader"] div[data-testid="stFileUploaderFile"] button svg * {
+    border: none !important;
+    outline: none !important;
+    box-shadow: none !important;
+}
+
+div[data-testid="stFileUploader"] div[data-testid="stFileUploaderFile"] button svg {
+    display: block !important;
+    width: 20px !important;
+    height: 20px !important;
+    margin: auto !important;
+    padding: 0 !important;
+    background: transparent !important;
+    color: #111827 !important;
+    stroke: #111827 !important;
+    opacity: 1 !important;
+}
+
 /* ══════════════════════════════════════════
    INPUT FIELDS
 ══════════════════════════════════════════ */
