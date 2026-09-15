@@ -816,6 +816,7 @@ def _translate_paragraph_segments(text_runs, tr, para_style_italic: bool):
 
         before_fail = len(tr.failed_texts)
         block_result, block_italic_terms = tr.translate_one(pre_text, dict_italic_map)
+        block_result = _restore_plain_block_whitespace(block_text, block_result)
         if len(tr.failed_texts) > before_fail:
             # Satu blok gagal -> seluruh paragraf dianggap gagal ronde ini
             # (bukan hasil campuran sebagian bahasa Inggris/Indonesia),
@@ -1589,6 +1590,67 @@ def _match_capitalization(original: str, translated: str) -> str:
     return tran
 
 
+_SOURCE_CLAUSE_NUMBER_RE = re.compile(
+    r'^(?P<number>(?:\d+(?:\.\d+)*|[A-Z]\.\d+(?:\.\d+)*))(?P<gap>[ \t\u00A0]+)(?P<body>.+)$'
+)
+
+
+def _restore_source_clause_number(source: str, translated: str) -> str:
+    """Pertahankan nomor pasal sumber secara literal (termasuk A.1/A.2).
+
+    Mesin terjemahan kadang mengubah ``A.1 General`` menjadi ``1 Umum``.
+    Nomor pasal adalah metadata struktur, bukan materi yang boleh diterjemahkan.
+    """
+    m = _SOURCE_CLAUSE_NUMBER_RE.match(source or '')
+    if not m or not translated:
+        return translated
+    number = m.group('number')
+    body = translated.strip()
+    # Buang nomor apa pun yang diciptakan/diubah provider di awal hasil.
+    body = re.sub(r'^(?:[A-Z]\.)?\d+(?:\.\d+)*[ \t\u00A0]+', '', body).lstrip()
+    return f'{number}    {body}' if body else number
+
+
+_HYPHENATED_DUP_RE = re.compile(r'(?<!\w)([A-Za-zÀ-ÖØ-öø-ÿ]+)\s+-\s+([A-Za-zÀ-ÖØ-öø-ÿ]+)(?!\w)', re.IGNORECASE)
+
+
+def _normalize_indonesian_reduplication_text(text: str) -> str:
+    """Normalisasi kata ulang hasil MT: ``langkah - langkah`` -> ``langkah-langkah``."""
+    if not text:
+        return text
+    return _HYPHENATED_DUP_RE.sub(lambda m: f'{m.group(1)}-{m.group(2)}' if m.group(1).casefold() == m.group(2).casefold() else m.group(0), text)
+
+
+def _normalize_reduplication_in_para(para) -> None:
+    """Hilangkan spasi di sekitar tanda hubung kata ulang tanpa meratakan format run."""
+    # Kasus umum hasil Engine 8 berada dalam satu run.
+    for run in para.runs:
+        if run.text:
+            run.text = _normalize_indonesian_reduplication_text(run.text)
+    # Fallback bila pola terbelah antar-run: ganti hanya bila seluruh run tidak
+    # membawa superscript/subscript sehingga aman direkonstruksi.
+    full = para.text or ''
+    fixed = _normalize_indonesian_reduplication_text(full)
+    if fixed != full and not any(_run_vertalign(r) for r in para.runs):
+        if para.runs:
+            para.runs[0].text = fixed
+            for r in para.runs[1:]:
+                r.text = ''
+
+
+def _restore_plain_block_whitespace(source: str, translated: str) -> str:
+    """Pertahankan whitespace batas blok di sekitar run pangkat/indeks.
+
+    Provider lazim melakukan strip pada request per-segmen; tanpa ini hasil
+    seperti ``kWm⁻²hingga`` atau ``m²dengan`` dapat terbentuk.
+    """
+    if not translated:
+        return translated
+    lead = re.match(r'^[ \t\u00A0]+', source or '')
+    trail = re.search(r'[ \t\u00A0]+$', source or '')
+    core = translated.strip(' \t\u00A0')
+    return (lead.group(0) if lead else '') + core + (trail.group(0) if trail else '')
+
 def _translate_para(para, tr, past_bibliography: bool = False) -> list[str]:
     """
     Terjemahkan paragraf biasa. Paragraf yang memiliki hyperlink sengaja
@@ -1667,6 +1729,10 @@ def _translate_para(para, tr, past_bibliography: bool = False) -> list[str]:
         # dapatkan posisi presisi untuk membangun ulang run.
         translated, format_spans = _detokenize_with_formatting(translated, format_token_map)
 
+    # Nomor pasal/lampiran adalah struktur dan harus identik dengan sumber.
+    translated = _restore_source_clause_number(original_for_case, translated)
+    translated = _normalize_indonesian_reduplication_text(translated)
+
     # Apply formatting ke teks normal
     if italic_terms_found or format_spans:
         _apply_mixed_formatting_to_para(para, translated, italic_terms_found, font_name, font_size,
@@ -1684,6 +1750,7 @@ def _translate_para(para, tr, past_bibliography: bool = False) -> list[str]:
         para.text.strip(),
     ):
         _fix_note_para(para, force_upper=source_note_upper)
+    _normalize_reduplication_in_para(para)
     
     return italic_terms_found
 
