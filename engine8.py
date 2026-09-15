@@ -21,6 +21,12 @@ import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import csv
 import os
+import json
+import hashlib
+import sqlite3
+import tempfile
+import threading
+from collections import OrderedDict
 
 from docx import Document
 from docx.shared import Pt
@@ -66,6 +72,104 @@ _HEADING_STYLES_WITH_NUM = {
 }
 _TRANSLATE_DELAY = 0.15
 _EM_DASH = '—'
+
+ENGINE8_POLICY_VERSION = "2026.09-cache-v1"
+ENGINE8_PROVIDER_VERSION = "deep-translator-google+mymemory-v1"
+_ENGINE8_L1_MAX_ENTRIES = 5000
+_ENGINE8_L2_MAX_ENTRIES = 100000
+_ENGINE8_CACHE_PATH = os.getenv("ENGINE8_CACHE_PATH", os.path.join(tempfile.gettempdir(), "rsni_engine8_translation_cache.sqlite3"))
+
+
+def _canonical_dictionary_fingerprint(custom_dict, italic_dict):
+    custom = sorted((str(k), str(v[0]), str(v[1])) for k, v in (custom_dict._entries.items() if custom_dict else []))
+    italic = sorted((str(k), str(v)) for k, v in (italic_dict._entries.items() if italic_dict else []))
+    raw = json.dumps({"custom": custom, "italic": italic}, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _stable_cache_source(text, italic_map=None):
+    value = str(text or "")
+    if italic_map:
+        folded = {str(k).casefold(): str(v) for k, v in italic_map.items()}
+        def _repl(m): return "[[ITALIC:" + folded.get(m.group(0).casefold(), "") + "]]"
+        value = _RE_PROTECTION_TOKEN.sub(_repl, value)
+    return re.sub(r"\s+", " ", value).strip()
+
+
+class _Engine8TranslationCache:
+    def __init__(self, path):
+        self.path = path
+        self._l1 = OrderedDict()
+        self._lock = threading.RLock()
+        self._inflight = {}
+        self._init_db()
+
+    def _connect(self):
+        c = sqlite3.connect(self.path, timeout=5.0)
+        c.execute("PRAGMA journal_mode=WAL")
+        c.execute("PRAGMA synchronous=NORMAL")
+        c.execute("PRAGMA temp_store=MEMORY")
+        c.execute("PRAGMA busy_timeout=5000")
+        return c
+
+    def _init_db(self):
+        try:
+            os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
+            with self._connect() as c:
+                c.execute("CREATE TABLE IF NOT EXISTS translation_cache (cache_key TEXT PRIMARY KEY, translated_text TEXT NOT NULL, italic_terms TEXT NOT NULL DEFAULT '[]', created_at INTEGER NOT NULL, last_used INTEGER NOT NULL, hits INTEGER NOT NULL DEFAULT 0)")
+                c.execute("CREATE INDEX IF NOT EXISTS idx_translation_cache_last_used ON translation_cache(last_used)")
+        except Exception:
+            pass
+
+    def make_key(self, text, source, target, fingerprint, italic_map=None):
+        payload = "\x1f".join((_stable_cache_source(text, italic_map), str(source), str(target), fingerprint, ENGINE8_POLICY_VERSION, ENGINE8_PROVIDER_VERSION))
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+    def get(self, key):
+        with self._lock:
+            if key in self._l1:
+                item = self._l1[key]; self._l1.move_to_end(key); return item
+        try:
+            now = int(time.time())
+            with self._connect() as c:
+                row = c.execute("SELECT translated_text, italic_terms FROM translation_cache WHERE cache_key=?", (key,)).fetchone()
+                if row: c.execute("UPDATE translation_cache SET last_used=?, hits=hits+1 WHERE cache_key=?", (now, key))
+            if row:
+                item = (row[0], json.loads(row[1] or "[]")); self._put_l1(key, item); return item
+        except Exception:
+            pass
+        return None
+
+    def _put_l1(self, key, item):
+        with self._lock:
+            self._l1[key] = item; self._l1.move_to_end(key)
+            while len(self._l1) > _ENGINE8_L1_MAX_ENTRIES: self._l1.popitem(last=False)
+
+    def put(self, key, text, italic_terms):
+        item = (text, list(italic_terms or [])); self._put_l1(key, item)
+        try:
+            now = int(time.time())
+            with self._connect() as c:
+                c.execute("INSERT INTO translation_cache(cache_key,translated_text,italic_terms,created_at,last_used,hits) VALUES(?,?,?,?,?,0) ON CONFLICT(cache_key) DO UPDATE SET translated_text=excluded.translated_text, italic_terms=excluded.italic_terms, last_used=excluded.last_used", (key, text, json.dumps(item[1], ensure_ascii=False), now, now))
+                count = c.execute("SELECT COUNT(*) FROM translation_cache").fetchone()[0]
+                if count > _ENGINE8_L2_MAX_ENTRIES:
+                    c.execute("DELETE FROM translation_cache WHERE cache_key IN (SELECT cache_key FROM translation_cache ORDER BY last_used ASC LIMIT ?)", (count-_ENGINE8_L2_MAX_ENTRIES,))
+        except Exception:
+            pass
+
+    def acquire(self, key):
+        with self._lock:
+            ev = self._inflight.get(key)
+            if ev is None:
+                ev = threading.Event(); self._inflight[key] = ev; return True, ev
+            return False, ev
+
+    def finish(self, key):
+        with self._lock:
+            ev = self._inflight.pop(key, None)
+            if ev: ev.set()
+
+_ENGINE8_TRANSLATION_CACHE = _Engine8TranslationCache(_ENGINE8_CACHE_PATH)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 2 URL SPREADSHEET TERPISAH
@@ -1265,7 +1369,8 @@ class TranslationFailedError(RuntimeError):
 class _Translator:
     def __init__(self, source: str = 'auto', target: str = 'id', 
                  custom_dict: CustomDictionary | None = None,
-                 italic_dict: ItalicDictionary | None = None):
+                 italic_dict: ItalicDictionary | None = None,
+                 dictionary_fingerprint: str = ''):
         try: from deep_translator import GoogleTranslator
         except ImportError: raise ImportError("Jalankan: pip install deep-translator")
         self._cls = GoogleTranslator
@@ -1273,10 +1378,23 @@ class _Translator:
         self.custom_dict = custom_dict; self.italic_dict = italic_dict
         self._client = self._cls(source=self.source, target=self.target)
         self.failed_texts: list[str] = []
+        self.dictionary_fingerprint = dictionary_fingerprint or _canonical_dictionary_fingerprint(custom_dict, italic_dict)
 
     def translate_one(self, text: str, italic_map: dict = None) -> tuple[str, list[str]]:
         t = text.strip()
         if not t or _skip_text(t): return text, []
+        cache_key = _ENGINE8_TRANSLATION_CACHE.make_key(t, self.source, self.target, self.dictionary_fingerprint, italic_map)
+        cached = _ENGINE8_TRANSLATION_CACHE.get(cache_key)
+        if cached is not None:
+            return cached
+        owner, event = _ENGINE8_TRANSLATION_CACHE.acquire(cache_key)
+        owns_flight = owner
+        if not owner:
+            event.wait(timeout=45.0)
+            cached = _ENGINE8_TRANSLATION_CACHE.get(cache_key)
+            if cached is not None:
+                return cached
+            # Owner gagal: jangan menunggu selamanya; request ini lanjut normal.
         token_map = {}
         if self.custom_dict and len(self.custom_dict) > 0:
             t, token_map = self.custom_dict._apply_pre(t)
@@ -1296,6 +1414,9 @@ class _Translator:
                 result, italic_terms_found = self.italic_dict._apply_post(
                     result, final_italic_map
                 )
+            _ENGINE8_TRANSLATION_CACHE.put(cache_key, result, italic_terms_found)
+            if owns_flight:
+                _ENGINE8_TRANSLATION_CACHE.finish(cache_key)
             return result, italic_terms_found
 
         expected_tokens = {
@@ -1406,12 +1527,17 @@ class _Translator:
             # membiarkan paragraf 100% utuh (termasuk semua run/format)
             # untuk diulang di tahap pemulihan.
             self.failed_texts.append(preview)
+            if owns_flight:
+                _ENGINE8_TRANSLATION_CACHE.finish(cache_key)
             return text, []
         if token_map: result = self.custom_dict._apply_post(result, token_map)
         italic_terms_found = []
         if final_italic_map:
             _idict = self.italic_dict if self.italic_dict is not None else ItalicDictionary()
             result, italic_terms_found = _idict._apply_post(result, final_italic_map)
+        _ENGINE8_TRANSLATION_CACHE.put(cache_key, result, italic_terms_found)
+        if owns_flight:
+            _ENGINE8_TRANSLATION_CACHE.finish(cache_key)
         return result, italic_terms_found
 
 def _match_capitalization(original: str, translated: str) -> str:
@@ -1867,6 +1993,8 @@ class DocxFinalTranslatorEngine:
                     + ', '.join(missing_italic)
                 )
 
+            dictionary_fingerprint = _canonical_dictionary_fingerprint(self.custom_dict, self.italic_dict)
+
             info = f"{len(self.custom_dict) if self.custom_dict else 0} kamus"
             if self.italic_dict: info += f", {len(self.italic_dict)} miring"
             _notify(
@@ -1877,7 +2005,7 @@ class DocxFinalTranslatorEngine:
             _notify(progress_callback, 5, "Init translator...")
             # Satu instance translator tidak dibagi lintas thread. Setiap worker
             # memiliki client sendiri agar aman dan benar-benar berjalan paralel.
-            tr = _Translator(self.source_lang, self.target_lang, self.custom_dict, self.italic_dict)
+            tr = _Translator(self.source_lang, self.target_lang, self.custom_dict, self.italic_dict, dictionary_fingerprint)
             doc = Document(input_docx)
 
             scan_started = time.perf_counter()
@@ -1908,7 +2036,7 @@ class DocxFinalTranslatorEngine:
                 index, para = index_para
                 worker_tr = _Translator(
                     self.source_lang, self.target_lang,
-                    self.custom_dict, self.italic_dict,
+                    self.custom_dict, self.italic_dict, dictionary_fingerprint,
                 )
                 found = _translate_para(para, worker_tr)
                 return index, para, found, bool(worker_tr.failed_texts)
@@ -1948,7 +2076,7 @@ class DocxFinalTranslatorEngine:
             recovery_success = 0
             recovery_tr = _Translator(
                 self.source_lang, self.target_lang,
-                self.custom_dict, self.italic_dict,
+                self.custom_dict, self.italic_dict, dictionary_fingerprint,
             )
             for recovery_done, (index, para) in enumerate(
                     sorted(failed_paras, key=lambda item: item[0]), start=1):
