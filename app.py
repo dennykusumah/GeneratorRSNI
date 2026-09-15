@@ -1623,7 +1623,7 @@ def _render_header_with_live_kamus():
 
     st.markdown(f"""
         <div class="app-header">
-            <div class="badge">Generator RSNI · Dashboard v9</div>
+            <div class="badge">Generator RSNI</div>
             <h1>📑 ISO to RSNI Converter</h1>
             <p>Memformat & Menerjemahan Dokumen Standar ISO Menjadi Draft RSNI Secara Otomatis</p>
             <div class="stats-row">
