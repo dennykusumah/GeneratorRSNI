@@ -1683,6 +1683,32 @@ div[data-testid="stElementContainer"]:has(.uploaded-file-inline-meta) {
     overflow: visible !important;
 }
 
+
+/* FINAL MICRO-ADJUSTMENT — turunkan nama file + ukuran 3px */
+.uploaded-file-inline-meta {
+    transform: translateY(-33px) !important;
+}
+
+
+/* FINAL — pusatkan vertikal teks 200MB per file • DOC, DOCX */
+div[class*="st-key-upl_main"] [data-testid="stFileUploaderDropzoneInstructions"] {
+    display: flex !important;
+    flex-direction: column !important;
+    justify-content: center !important;
+    align-self: center !important;
+    height: 100% !important;
+    min-height: 52px !important;
+    margin: 0 !important;
+    padding: 0 !important;
+}
+div[class*="st-key-upl_main"] [data-testid="stFileUploaderDropzoneInstructions"] small {
+    margin: 0 !important;
+    padding: 0 !important;
+    line-height: 1.2 !important;
+    display: flex !important;
+    align-items: center !important;
+}
+
 </style>
 """, unsafe_allow_html=True)
 
