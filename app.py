@@ -926,32 +926,44 @@ div[data-testid="stFileUploader"] div[data-testid="stFileUploaderFile"] button >
     transform: translate(66px, -37px) !important;
     width: 138px !important;
     display: flex !important;
-    flex-direction: column !important;
-    align-items: flex-start !important;
-    justify-content: center !important;
-    line-height: 1.05 !important;
+    flex-direction: row !important;
+    align-items: center !important;
+    justify-content: flex-start !important;
+    gap: 7px !important;
+    line-height: 1 !important;
 }
 .uploaded-file-inline-meta .uf-name {
     display: block !important;
-    width: 138px !important;
-    color: #111827 !important;
-    -webkit-text-fill-color: #111827 !important;
+    width: auto !important;
+    max-width: 82px !important;
+    color: #000000 !important;
+    -webkit-text-fill-color: #000000 !important;
     font-family: 'Outfit', sans-serif !important;
     font-size: 0.78rem !important;
-    font-weight: 700 !important;
+    font-weight: 800 !important;
     overflow: hidden !important;
     text-overflow: ellipsis !important;
     white-space: nowrap !important;
 }
 .uploaded-file-inline-meta .uf-size {
     display: block !important;
-    margin-top: 3px !important;
-    color: #4b5563 !important;
+    margin-top: 0 !important;
+    color: #374151 !important;
     -webkit-text-fill-color: #4b5563 !important;
     font-family: 'Outfit', sans-serif !important;
     font-size: 0.67rem !important;
     font-weight: 600 !important;
     white-space: nowrap !important;
+}
+
+/* Nama file FINAL: override aturan global .stApp span agar tidak kembali putih/transparan. */
+div[data-testid="stMarkdownContainer"] .uploaded-file-inline-meta .uf-name,
+.stApp .uploaded-file-inline-meta .uf-name {
+    color: #000000 !important;
+    -webkit-text-fill-color: #000000 !important;
+    opacity: 1 !important;
+    visibility: visible !important;
+    text-shadow: none !important;
 }
 
 /* X FINAL: jangan gunakan SVG bawaan karena pada sebagian versi Streamlit
