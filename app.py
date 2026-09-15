@@ -12,6 +12,7 @@ import shutil
 import subprocess
 import csv
 import io
+import json
 from io import BytesIO
 from urllib.request import Request, urlopen
 
@@ -25,6 +26,65 @@ from urllib.request import Request, urlopen
 _TEMP_PATTERNS = ["temp_main_*", "converted_*", "engine1_*", "engine2_*", "engine3_*", "engine4_*", "engine5_*", "engine6_*", "engine7_*", "engine8_*", "engine9_*", "opt_*", "cover_*", "di_*", "pp_*", "ip_*", "ID_*"]
 # Hapus file lebih lama dari N menit
 _MAX_AGE_MINUTES = 30
+
+# Satu proses konversi untuk seluruh instance aplikasi pada satu filesystem.
+# Lock dibuat atomik saat tombol Proses/Lanjutkan ditekan, sehingga dua sesi
+# yang menekan hampir bersamaan tidak dapat sama-sama masuk pipeline.
+_APP_LOCK_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.rsni_process.lock')
+_APP_LOCK_STALE_SECONDS = 3 * 60 * 60
+_BUSY_MESSAGE = 'Aplikasi sedang digunakan oleh user lain. Mohon menunggu beberapa saat lagi.'
+
+def _read_app_lock():
+    try:
+        with open(_APP_LOCK_FILE, 'r', encoding='utf-8') as fh:
+            return json.load(fh)
+    except Exception:
+        return {}
+
+def _acquire_app_lock(owner_sid: str) -> bool:
+    """Ambil lock lintas-session secara atomik. True jika sesi ini pemiliknya."""
+    owner_sid = str(owner_sid or '')
+    for _ in range(2):
+        try:
+            fd = os.open(_APP_LOCK_FILE, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            try:
+                payload = json.dumps({'owner': owner_sid, 'created_at': time.time()})
+                os.write(fd, payload.encode('utf-8'))
+            finally:
+                os.close(fd)
+            return True
+        except FileExistsError:
+            info = _read_app_lock()
+            if info.get('owner') == owner_sid:
+                return True
+            try:
+                age = time.time() - float(info.get('created_at', 0) or 0)
+            except Exception:
+                age = _APP_LOCK_STALE_SECONDS + 1
+            if age <= _APP_LOCK_STALE_SECONDS:
+                return False
+            # Lock yatim (mis. proses server mati) boleh dibersihkan.
+            try:
+                os.remove(_APP_LOCK_FILE)
+            except FileNotFoundError:
+                pass
+            except Exception:
+                return False
+    return False
+
+def _release_app_lock(owner_sid: str) -> None:
+    """Lepas lock hanya jika lock memang dimiliki sesi ini."""
+    try:
+        info = _read_app_lock()
+        if info.get('owner') == str(owner_sid or ''):
+            os.remove(_APP_LOCK_FILE)
+    except FileNotFoundError:
+        pass
+    except Exception:
+        pass
+
+def _show_busy_popup() -> None:
+    st.toast(_BUSY_MESSAGE, icon='⏳')
 
 def _cleanup_temp_files(max_age_minutes: int = _MAX_AGE_MINUTES, silent: bool = True):
     """Hapus semua file temporer yang lebih lama dari max_age_minutes."""
@@ -1007,6 +1067,23 @@ with col_set2:
         help="Format Nomor ICS, contoh: 45.060.01"
     )
 
+# --- PENGATURAN KECEPATAN ENGINE 8 ---
+st.markdown('<div class="section-label">⚡ Kecepatan (worker Engine 8)</div>', unsafe_allow_html=True)
+if '_engine8_workers' not in st.session_state:
+    st.session_state['_engine8_workers'] = 2
+_worker_cols = st.columns(4)
+for _worker_no, _worker_col in enumerate(_worker_cols, start=1):
+    with _worker_col:
+        if st.button(
+            str(_worker_no),
+            key=f'worker_{_worker_no}',
+            type='primary' if st.session_state['_engine8_workers'] == _worker_no else 'secondary',
+            use_container_width=True,
+            help=f'Gunakan {_worker_no} worker untuk penerjemahan Engine 8',
+        ):
+            st.session_state['_engine8_workers'] = _worker_no
+            st.rerun()
+
 # --- TOMBOL PROSES ---
 btn_process = st.button("🚀 Proses", key="btn_main", use_container_width=True)
 
@@ -1035,6 +1112,10 @@ if st.session_state.get('_process_error'):
         if st.button('▶ Lanjutkan', key='error_continue',
                      disabled=not (_last_path and os.path.isfile(_last_path)),
                      use_container_width=True):
+            _sid = st.session_state.setdefault('_sid', uuid.uuid4().hex[:8])
+            if not _acquire_app_lock(_sid):
+                _show_busy_popup()
+                st.stop()
             st.session_state['_target_file'] = _last_path
             st.session_state['_resume_engine'] = min(_last_engine + 1, 9)
             st.session_state['_force_continue'] = True
@@ -1050,6 +1131,10 @@ if st.session_state.get('_process_error'):
 
 if btn_process:
     if uploaded_file:
+        _sid = st.session_state.setdefault('_sid', uuid.uuid4().hex[:8])
+        if not _acquire_app_lock(_sid):
+            _show_busy_popup()
+            st.stop()
         try:
             st.session_state.pop('_process_error', None)
             st.session_state.pop('_last_engine', None)
@@ -1079,6 +1164,7 @@ if btn_process:
             st.session_state['_ics_number'] = ics_number
             st.rerun()
         except Exception as upload_error:
+            _release_app_lock(_sid)
             # Bahkan kegagalan sebelum Engine 1 tetap masuk ke UI recovery.
             st.session_state['_process_error'] = (
                 f'❌ Error menyiapkan proses: {upload_error}'
@@ -1129,7 +1215,7 @@ if (st.session_state.get('_run_process') and
                 sni_number=_sni,
             )
         elif _resume == 8:
-            _ok, _unused, _msg = engine8.process(_resume_input, _resume_output)
+            _ok, _unused, _msg = engine8.process(_resume_input, _resume_output, worker_count=st.session_state.get('_engine8_workers', 2))
         elif _resume == 9:
             _ok, _unused, _msg = engine9.process(_resume_input, _resume_output)
         else:
@@ -1162,6 +1248,7 @@ if (st.session_state.get('_run_process') and
                 )
             st.session_state.pop('_resume_engine', None)
             st.session_state.pop('_force_continue', None)
+            _release_app_lock(_sid)
             st.rerun()
     except Exception as _resume_error:
         if st.session_state.get('_force_continue'):
@@ -1198,6 +1285,7 @@ if (st.session_state.get('_run_process') and
                     st.session_state['_run_process'] = False
                     st.session_state.pop('_resume_engine', None)
                     st.session_state.pop('_force_continue', None)
+                    _release_app_lock(_sid)
                     st.rerun()
         # Fallback bila mode paksa tidak aktif atau tidak ada output valid.
         st.session_state['_process_error'] = (
@@ -1206,6 +1294,7 @@ if (st.session_state.get('_run_process') and
         st.session_state['_run_process'] = False
         st.session_state.pop('_resume_engine', None)
         st.session_state.pop('_force_continue', None)
+        _release_app_lock(_sid)
         st.rerun()
     st.stop()
 
@@ -1511,6 +1600,7 @@ if st.session_state.get('_run_process') and st.session_state.get('_target_file')
             input_docx=engine7_out,
             output_docx=engine8_out,
             progress_callback=_engine8_progress,
+            worker_count=st.session_state.get('_engine8_workers', 2),
         )
         if not ok_e8:
             _remember_engine_output(8, engine8_out)
@@ -1551,6 +1641,7 @@ if st.session_state.get('_run_process') and st.session_state.get('_target_file')
         st.session_state['_show_results'] = False
         st.rerun()
     finally:
+        _release_app_lock(st.session_state.get('_sid', ''))
         if st.session_state.get('_show_results'):
             st.session_state['_run_process'] = False
             st.rerun()
