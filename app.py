@@ -547,6 +547,27 @@ div[data-testid="stFileUploaderFile"] {
     box-shadow: 0 2px 10px rgba(99,102,241,0.3) !important;
 }
 
+
+/* ── RAPATKAN UPLOAD -> PENGATURAN ──
+   Kurangi ruang bawaan di bawah seluruh widget uploader, termasuk file list. */
+div[class*="st-key-upl_main"] {
+    margin-bottom: -1.05rem !important;
+    padding-bottom: 0 !important;
+}
+div[class*="st-key-upl_main"] + div[data-testid="stElementContainer"] {
+    margin-top: 0 !important;
+}
+
+/* Label Kecepatan dibuat identik dengan label input ICS/No. SNI. */
+.speed-label {
+    font-size: 0.82rem !important;
+    font-weight: 500 !important;
+    letter-spacing: 0.3px !important;
+    text-transform: none !important;
+    color: rgba(255,255,255,0.55) !important;
+    line-height: 1.25 !important;
+}
+
 /* ══════════════════════════════════════════
    KONTROL KECEPATAN ENGINE 8
    - kotak kecil ± 2x ikon globe pada badge glosarium
@@ -554,25 +575,15 @@ div[data-testid="stFileUploaderFile"] {
    - angka tetap kontras pada kondisi normal/hover/aktif
 ══════════════════════════════════════════ */
 .speed-label {
-    /* Tipografi disamakan dengan label ICS / No. SNI. */
+    margin-top: 0.2rem !important;
+    margin-bottom: 0 !important;
+    padding-bottom: 0 !important;
     font-size: 0.82rem !important;
     font-weight: 500 !important;
     letter-spacing: 0.3px !important;
     text-transform: none !important;
     color: rgba(255,255,255,0.55) !important;
-    margin-top: 0.2rem !important;
-    margin-bottom: 0 !important;
-    padding-bottom: 0 !important;
-}
-
-/* Pengaturan dibuat dekat dengan kotak uploader. */
-.settings-label {
-    margin-top: 0.25rem !important;
-    margin-bottom: 0.8rem !important;
-}
-div[data-testid="stMarkdownContainer"]:has(.settings-label) {
-    margin-top: 0 !important;
-    padding-top: 0 !important;
+    line-height: 1.25 !important;
 }
 
 /* Samakan jarak label Kecepatan -> tombol dengan label No. SNI -> input.
@@ -639,11 +650,9 @@ div[class*="st-key-worker_"] button[data-testid="baseButton-primary"]:focus {
     transform: none !important;
 }
 
-/* Tombol Proses dibuat rapat dengan deretan tombol worker. */
+/* Ruang sesudah deretan kecepatan dibuat lebih lebar menuju tombol Proses. */
 div[class*="st-key-btn_main"] {
-    position: relative !important;
-    top: -0.85rem !important;
-    margin-top: -0.85rem !important;
+    margin-top: 1.35rem !important;
 }
 
 /* ══════════════════════════════════════════
@@ -1154,7 +1163,7 @@ uploaded_file = st.file_uploader(
     type=["doc", "docx"], key="upl_main", label_visibility="collapsed"
 )
 
-st.markdown('<div class="section-label settings-label">⚙️ Pengaturan</div>', unsafe_allow_html=True)
+st.markdown('<div class="section-label">⚙️ Pengaturan</div>', unsafe_allow_html=True)
 col_set1, col_set2 = st.columns([2, 3])
 with col_set1:
     doc_title = st.text_input("📄 No. SNI", value="SNI ISO XXXXX-X:XXXX", key="title_main")
@@ -1211,9 +1220,9 @@ div[class~="st-key-speed_worker_row"] {
     /* Geser row tombol secara nyata ke atas. Margin saja tidak cukup karena
        Streamlit menambahkan gap pada parent vertical-block. */
     position: relative !important;
-    top: -2.95rem !important;
+    top: -2.70rem !important;
     margin-top: 0 !important;
-    margin-bottom: -2.95rem !important;
+    margin-bottom: -2.70rem !important;
     padding-top: 0 !important;
     padding-bottom: 0 !important;
 }
