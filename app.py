@@ -555,7 +555,7 @@ div[data-testid="stFileUploaderFile"] {
 ══════════════════════════════════════════ */
 .speed-label {
     margin-top: 0.2rem !important;
-    margin-bottom: 0.45rem !important;
+    margin-bottom: 0.25rem !important;
 }
 
 /* Streamlit memberi class st-key-<key> pada container widget. */
@@ -1137,7 +1137,7 @@ with col_set2:
     )
 
 # --- PENGATURAN KECEPATAN ENGINE 8 ---
-st.markdown('<div class="section-label speed-label">⚡ Kecepatan (worker Engine 8)</div>', unsafe_allow_html=True)
+st.markdown('<div class="section-label speed-label">⚡ Kecepatan</div>', unsafe_allow_html=True)
 if '_engine8_workers' not in st.session_state:
     st.session_state['_engine8_workers'] = 2
 
