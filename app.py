@@ -548,6 +548,75 @@ div[data-testid="stFileUploaderFile"] {
 }
 
 /* ══════════════════════════════════════════
+   KONTROL KECEPATAN ENGINE 8
+   - kotak kecil ± 2x ikon globe pada badge glosarium
+   - tombol aktif selalu biru, bukan merah
+   - angka tetap kontras pada kondisi normal/hover/aktif
+══════════════════════════════════════════ */
+.speed-label {
+    margin-top: 0.8rem !important;
+    margin-bottom: 0.45rem !important;
+}
+
+/* Streamlit memberi class st-key-<key> pada container widget. */
+div[class*="st-key-worker_"] {
+    width: 42px !important;
+    min-width: 42px !important;
+    max-width: 42px !important;
+}
+div[class*="st-key-worker_"] .stButton,
+div[class*="st-key-worker_"] .stButton > button {
+    width: 42px !important;
+    min-width: 42px !important;
+    max-width: 42px !important;
+}
+div[class*="st-key-worker_"] .stButton > button {
+    height: 42px !important;
+    min-height: 42px !important;
+    padding: 0 !important;
+    border-radius: 9px !important;
+    font-size: 0.95rem !important;
+    font-weight: 800 !important;
+    line-height: 1 !important;
+    letter-spacing: 0 !important;
+    box-shadow: none !important;
+    transform: none !important;
+}
+
+/* Belum dipilih: gelap/netral dengan angka terang. */
+div[class*="st-key-worker_"] button[data-testid="baseButton-secondary"] {
+    background: rgba(30,41,59,0.95) !important;
+    border: 1.5px solid rgba(148,163,184,0.45) !important;
+    color: #f8fafc !important;
+}
+div[class*="st-key-worker_"] button[data-testid="baseButton-secondary"]:hover {
+    background: rgba(51,65,85,1) !important;
+    border-color: rgba(129,140,248,0.9) !important;
+    color: #ffffff !important;
+}
+
+/* Dipilih: biru tegas (tidak merah) dengan angka putih. */
+div[class*="st-key-worker_"] button[data-testid="baseButton-primary"] {
+    background: linear-gradient(135deg, #3b82f6 0%, #2563eb 55%, #1d4ed8 100%) !important;
+    border: 1.5px solid #60a5fa !important;
+    color: #ffffff !important;
+    box-shadow: 0 0 0 2px rgba(59,130,246,0.18), 0 4px 12px rgba(37,99,235,0.28) !important;
+}
+div[class*="st-key-worker_"] button[data-testid="baseButton-primary"]:hover,
+div[class*="st-key-worker_"] button[data-testid="baseButton-primary"]:active,
+div[class*="st-key-worker_"] button[data-testid="baseButton-primary"]:focus {
+    background: linear-gradient(135deg, #60a5fa 0%, #3b82f6 55%, #2563eb 100%) !important;
+    border-color: #93c5fd !important;
+    color: #ffffff !important;
+    transform: none !important;
+}
+
+/* Ruang sesudah deretan kecepatan dibuat lebih lebar menuju tombol Proses. */
+div[class*="st-key-btn_main"] {
+    margin-top: 1.35rem !important;
+}
+
+/* ══════════════════════════════════════════
    PROGRESS
 ══════════════════════════════════════════ */
 .stProgress > div {
@@ -1068,18 +1137,19 @@ with col_set2:
     )
 
 # --- PENGATURAN KECEPATAN ENGINE 8 ---
-st.markdown('<div class="section-label">⚡ Kecepatan (worker Engine 8)</div>', unsafe_allow_html=True)
+st.markdown('<div class="section-label speed-label">⚡ Kecepatan (worker Engine 8)</div>', unsafe_allow_html=True)
 if '_engine8_workers' not in st.session_state:
     st.session_state['_engine8_workers'] = 2
-_worker_cols = st.columns(4)
+
+# Empat kolom kecil di kiri + satu spacer fleksibel. Ukuran tombol dikunci 42x42 px via CSS.
+_worker_cols = st.columns([0.48, 0.48, 0.48, 0.48, 5.6], gap="small")[:4]
 for _worker_no, _worker_col in enumerate(_worker_cols, start=1):
     with _worker_col:
         if st.button(
             str(_worker_no),
             key=f'worker_{_worker_no}',
             type='primary' if st.session_state['_engine8_workers'] == _worker_no else 'secondary',
-            use_container_width=True,
-            help=f'Gunakan {_worker_no} worker untuk penerjemahan Engine 8',
+            use_container_width=False,
         ):
             st.session_state['_engine8_workers'] = _worker_no
             st.rerun()
