@@ -1387,15 +1387,7 @@ def _translation_gate_success() -> None:
             _TRANSLATE_NEXT_REQUEST = min(_TRANSLATE_NEXT_REQUEST, time.monotonic() + _TRANSLATE_FAST_INTERVAL)
 
 class _Translator:
-    """Translator dengan pola request tran1/tran2.
-
-    Perbedaan penting dari versi adaptive:
-    - GoogleTranslator dibuat BARU pada setiap request, sama seperti tran1/tran2.
-    - Tidak ada global request gate / adaptive throttling.
-    - Maksimal 2 request: percobaan awal + 1 retry setelah 0,8 detik.
-    - Cache RAM + SQLite tetap dipertahankan agar request berulang lebih cepat.
-    - Kamus/italic tetap diproses sebelum/sesudah request.
-    """
+    """Jalur translator disamakan dengan Generator SNI engine9."""
     def __init__(self, source: str = 'auto', target: str = 'id',
                  custom_dict: CustomDictionary | None = None,
                  italic_dict: ItalicDictionary | None = None):
@@ -1410,68 +1402,37 @@ class _Translator:
         self.italic_dict = italic_dict
         self.failed_texts: list[str] = []
 
-    def _google_once(self, text: str):
-        # Sengaja instantiate per request: ini mengikuti tran1/tran2 persis
-        # dan menghindari session/client lama yang dapat membawa state buruk.
-        return self._cls(source=self.source, target=self.target).translate(text)
-
     def translate_one(self, text: str, italic_map: dict = None) -> tuple[str, list[str]]:
         original = text
         t = text.strip()
         if not t or _skip_text(t):
             return text, []
 
-        # Cache tetap menjadi lapisan pertama.
-        cache_key, cache_src_tokens = _cache_identity(
-            t, italic_map or {}, self.source, self.target, self.custom_dict
-        )
-        cached = _cache_get(cache_key, cache_src_tokens)
-        if cached is not None:
-            return cached
-
         token_map = {}
         if self.custom_dict and len(self.custom_dict) > 0:
             t, token_map = self.custom_dict._apply_pre(t)
 
         final_italic_map = italic_map or {}
+        failed = False
 
-        # Jika seluruh isi sudah ditentukan oleh Kamus SNI, tidak perlu Google.
-        uncovered = _RE_PROTECTION_TOKEN.sub('', t)
-        uncovered_words = re.findall(r'[A-Za-zÀ-ÿ]{2,}', uncovered)
-        if token_map and not uncovered_words:
-            result = self.custom_dict._apply_post(t, token_map)
-            italic_terms_found = []
-            if final_italic_map:
-                _idict = self.italic_dict if self.italic_dict is not None else ItalicDictionary()
-                result, italic_terms_found = _idict._apply_post(result, final_italic_map)
-            _cache_put(cache_key, result, italic_terms_found)
-            return result, italic_terms_found
-
-        # PERSIS FILOSOFI TRAN1/TRAN2:
-        # request sekali; bila exception tunggu 0,8 detik; request sekali lagi.
-        provider_ok = False
-        result = None
-        for attempt in (1, 2):
+        # PERSIS Generator SNI engine9:
+        # GoogleTranslator baru -> request; exception -> sleep 0.8 -> request sekali lagi.
+        try:
+            result = self._cls(source=self.source, target=self.target).translate(t)
+            if not result or _looks_like_error_response(t, result):
+                result = t
+                failed = True
+        except Exception:
+            time.sleep(0.8)
             try:
-                candidate = self._google_once(t)
-                if candidate and not _looks_like_error_response(t, candidate):
-                    result = candidate
-                    provider_ok = True
-                    break
+                result = self._cls(source=self.source, target=self.target).translate(t)
+                if not result or _looks_like_error_response(t, result):
+                    result = t
+                    failed = True
             except Exception:
-                pass
+                result = t
+                failed = True
 
-            if attempt == 1:
-                time.sleep(0.8)
-
-        if not provider_ok:
-            preview = re.sub(r'\s+', ' ', original).strip()[:100]
-            self.failed_texts.append(preview)
-            result = t
-
-        # Tidak memakai validasi token equality yang agresif. tran2 juga
-        # mengembalikan token secara post-process tanpa menggagalkan seluruh
-        # paragraf hanya karena validator internal.
         if token_map:
             result = self.custom_dict._apply_post(result, token_map)
 
@@ -1480,9 +1441,9 @@ class _Translator:
             _idict = self.italic_dict if self.italic_dict is not None else ItalicDictionary()
             result, italic_terms_found = _idict._apply_post(result, final_italic_map)
 
-        # Cache hanya hasil provider yang benar-benar sukses.
-        if provider_ok:
-            _cache_put(cache_key, result, italic_terms_found)
+        if failed:
+            preview = re.sub(r'\s+', ' ', original).strip()[:100]
+            self.failed_texts.append(preview)
 
         return result, italic_terms_found
 
@@ -1959,48 +1920,33 @@ class DocxFinalTranslatorEngine:
             italic_count = 0
             failed_paras = []
 
-            worker_local = threading.local()
+            # Jalur utama dibuat benar-benar SEQUENTIAL seperti Generator SNI.
+            # Tidak memakai ThreadPoolExecutor walaupun max_workers=1.
+            tr = _Translator(
+                self.source_lang, self.target_lang,
+                self.custom_dict, self.italic_dict,
+            )
 
-            def _translate_job(index_para):
-                index, para = index_para
-                # Satu client persisten per worker: tetap thread-safe, tetapi
-                # tidak membuat ratusan koneksi/client baru sepanjang dokumen.
-                if not hasattr(worker_local, 'translator'):
-                    worker_local.translator = _Translator(
-                        self.source_lang, self.target_lang,
-                        self.custom_dict, self.italic_dict,
-                    )
-                worker_tr = worker_local.translator
-                before_failed = len(worker_tr.failed_texts)
-                found = _translate_para(para, worker_tr)
-                failed = len(worker_tr.failed_texts) > before_failed
-                return index, para, found, failed
+            for index, para in enumerate(translation_queue):
+                before_failed = len(tr.failed_texts)
+                found = _translate_para(para, tr)
+                failed = len(tr.failed_texts) > before_failed
 
-            # Tahap utama provider-safe: tepat 1 worker seperti pola tran1/tran2.
-            # Pada shared IP Streamlit Cloud, dua request paralel terbukti pada
-            # dashboard dapat menghasilkan burst kegagalan. Cache RAM/SQLite
-            # tetap membuat teks yang sudah pernah sukses selesai instan.
-            with ThreadPoolExecutor(max_workers=1, thread_name_prefix='translate') as pool:
-                futures = [pool.submit(_translate_job, item)
-                           for item in enumerate(translation_queue)]
-                for future in as_completed(futures):
-                    index, para, found, failed = future.result()
-                    done += 1
-                    italic_count += len(found)
-                    if failed:
-                        failed_paras.append((index, para))
-                    else:
-                        translated_count += 1
-                    # Translate normal memakai rentang 10%--90%, dihitung
-                    # murni dari counter done/total (XXX/XXX).
-                    pct = 10 + int(done / max(total, 1) * 80)
-                    _notify(
-                        progress_callback, pct,
-                        f"[translate tran1/tran2] {done}/{total} | "
-                        f"berhasil={translated_count} | "
-                        f"gagal={len(failed_paras)} | "
-                        f"[progres-total] {done}/{total + len(failed_paras)}",
-                    )
+                done += 1
+                italic_count += len(found)
+                if failed:
+                    failed_paras.append((index, para))
+                else:
+                    translated_count += 1
+
+                pct = 10 + int(done / max(total, 1) * 80)
+                _notify(
+                    progress_callback, pct,
+                    f"[translate Generator-SNI] {done}/{total} | "
+                    f"berhasil={translated_count} | "
+                    f"gagal={len(failed_paras)} | "
+                    f"[progres-total] {done}/{total + len(failed_paras)}",
+                )
 
             # Hanya bagian yang belum berhasil diterjemahkan yang diulang,
             # secara berurutan dengan tepat 1 worker.
@@ -2036,7 +1982,7 @@ class DocxFinalTranslatorEngine:
                 pct = 90 + int(recovery_done / max(recovery_total, 1) * 8)
                 _notify(
                     progress_callback, pct,
-                    f"[pemulihan 1 worker] {recovery_done}/{recovery_total} | "
+                    f"[pemulihan Generator-SNI] {recovery_done}/{recovery_total} | "
                     f"berhasil={recovery_success} | "
                     f"gagal={len(still_failed)} "
                     f"| [progres-total] {total + recovery_done}/"
