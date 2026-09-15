@@ -11,6 +11,8 @@ Fitur utama:
     1. KAMUS_SPREADSHEET_URL → untuk terjemahan istilah
     2. ITALIC_SPREADSHEET_URL → daftar kata yang TIDAK diterjemahkan, OUTPUT MIRING
   - Dual Title Sync, Note/Catatan, Annex fix, dll.
+  - Stabilitas tran1/tran2: 2 worker, request pacing ringan, retry sekali 0,8 s.
+  - Hybrid cache: RAM LRU (L1) + SQLite (L2).
 """
 
 import re
@@ -26,6 +28,7 @@ import os
 import sqlite3
 import hashlib
 import json
+from collections import OrderedDict
 
 from docx import Document
 from docx.shared import Pt
@@ -1180,6 +1183,13 @@ _TRANSLATION_CACHE_PATH = os.getenv(
 _CACHE_INIT_LOCK = threading.Lock()
 _CACHE_READY = False
 
+# L1 RAM cache: hasil terjemahan yang sering dipakai disimpan di memori proses.
+# SQLite tetap menjadi L2 cache. OrderedDict dipakai sebagai LRU sederhana agar
+# penggunaan RAM tidak tumbuh tanpa batas pada Streamlit Cloud.
+_RAM_CACHE_MAX = max(100, int(os.getenv('ENGINE8_RAM_CACHE_MAX', '5000')))
+_RAM_CACHE = OrderedDict()
+_RAM_CACHE_LOCK = threading.RLock()
+
 
 def _cache_init() -> None:
     global _CACHE_READY
@@ -1244,6 +1254,16 @@ def _cache_identity(text: str, italic_map: dict, source: str, target: str,
 
 
 def _cache_get(cache_key: str, src_tokens: list[str]):
+    # L1: RAM. Nilai disimpan dalam bentuk token-kanonik supaya aman walaupun
+    # token format pada paragraf yang sama berbeda UUID di proses berikutnya.
+    with _RAM_CACHE_LOCK:
+        row = _RAM_CACHE.get(cache_key)
+        if row is not None:
+            _RAM_CACHE.move_to_end(cache_key)
+            translated = _restore_source_tokens(row[0], src_tokens)
+            return translated, list(row[1])
+
+    # L2: SQLite.
     _cache_init()
     if not _CACHE_READY:
         return None
@@ -1263,6 +1283,11 @@ def _cache_get(cache_key: str, src_tokens: list[str]):
                 terms = json.loads(row[1])
             except Exception:
                 terms = []
+            with _RAM_CACHE_LOCK:
+                _RAM_CACHE[cache_key] = (row[0], tuple(terms))
+                _RAM_CACHE.move_to_end(cache_key)
+                while len(_RAM_CACHE) > _RAM_CACHE_MAX:
+                    _RAM_CACHE.popitem(last=False)
             return translated, terms
         finally:
             con.close()
@@ -1271,11 +1296,17 @@ def _cache_get(cache_key: str, src_tokens: list[str]):
 
 
 def _cache_put(cache_key: str, translated: str, italic_terms: list[str]) -> None:
+    canonical, _ = _canonicalize_source_tokens(translated)
+    with _RAM_CACHE_LOCK:
+        _RAM_CACHE[cache_key] = (canonical, tuple(italic_terms or []))
+        _RAM_CACHE.move_to_end(cache_key)
+        while len(_RAM_CACHE) > _RAM_CACHE_MAX:
+            _RAM_CACHE.popitem(last=False)
+
     _cache_init()
     if not _CACHE_READY:
         return
     try:
-        canonical, _ = _canonicalize_source_tokens(translated)
         con = sqlite3.connect(_TRANSLATION_CACHE_PATH, timeout=5)
         try:
             con.execute("""INSERT INTO translation_cache(cache_key, translated, italic_terms, created_at, hits)
@@ -1297,7 +1328,7 @@ def _cache_put(cache_key: str, translated: str, italic_terms: list[str]) -> None
 # failures, then automatically returns to fast mode after successful requests.
 _TRANSLATE_GATE_LOCK = threading.Lock()
 _TRANSLATE_NEXT_REQUEST = 0.0
-_TRANSLATE_FAST_INTERVAL = 0.035
+_TRANSLATE_FAST_INTERVAL = 0.12
 _TRANSLATE_ADAPTIVE_INTERVAL = 0.35
 _TRANSLATE_ADAPTIVE_UNTIL = 0.0
 _TRANSLATE_SUCCESS_STREAK = 0
@@ -1312,10 +1343,11 @@ def _translation_gate_wait(extra_delay: float = 0.0) -> None:
     global _TRANSLATE_NEXT_REQUEST
     with _TRANSLATE_GATE_LOCK:
         now = time.monotonic()
-        adaptive = now < _TRANSLATE_ADAPTIVE_UNTIL
-        interval = _TRANSLATE_ADAPTIVE_INTERVAL if adaptive else _TRANSLATE_FAST_INTERVAL
+        # Pola stabil ala tran1/tran2: request dimulai berjarak tetap. Dua
+        # worker boleh overlap pada waktu tunggu jaringan, tetapi tidak burst.
+        interval = _TRANSLATE_FAST_INTERVAL
         slot = max(now, _TRANSLATE_NEXT_REQUEST)
-        jitter = random.uniform(0.0, 0.012 if not adaptive else 0.06)
+        jitter = random.uniform(0.0, 0.025)
         _TRANSLATE_NEXT_REQUEST = slot + interval + extra_delay + jitter
     wait = max(0.0, slot - time.monotonic())
     if wait:
@@ -1406,7 +1438,7 @@ class _Translator:
         }
         result = None
         last_error = None
-        for attempt in range(1, 5):
+        for attempt in range(1, 3):
             try:
                 _translation_gate_wait()
                 candidate = self._client.translate(t)
@@ -1432,20 +1464,15 @@ class _Translator:
                 break
             except Exception as exc:
                 last_error = exc
-                _translation_gate_penalize(attempt, exc)
-                # Buat ulang client setelah respons gagal/rate-limit agar
-                # koneksi/session bermasalah tidak dipakai terus-menerus.
+                # Filosofi tran1/tran2: jangan memperlambat seluruh dokumen
+                # karena satu kegagalan. Buat ulang client, tunggu singkat, lalu
+                # retry sekali. Recovery khusus dilakukan kemudian dengan 1 worker.
                 try:
                     self._client = self._cls(source=self.source, target=self.target)
                 except Exception:
                     pass
-                if attempt < 4:
-                    if _is_provider_failure(exc):
-                        time.sleep(min(3.5, 0.45 * (2 ** (attempt - 1))) + random.uniform(0.05, 0.25))
-                    else:
-                        # Content/token validation error: retry quickly and do
-                        # not punish unrelated workers.
-                        time.sleep(0.08 + random.uniform(0.0, 0.08))
+                if attempt < 2:
+                    time.sleep(0.8 + random.uniform(0.0, 0.15))
 
         if result is None:
             # Judul standar lazim terdiri dari beberapa klausa yang dipisahkan
@@ -1469,8 +1496,8 @@ class _Translator:
                 except TranslationFailedError as split_error:
                     last_error = split_error
 
-        if result is None:
-            # Provider cadangan untuk kondisi Google Translate sedang menolak
+        if False and result is None:
+            # Provider cadangan dinonaktifkan: satu provider menjaga konsistensi
             # request/rate-limited. Deep-translator menyertakan MyMemory;
             # kegagalannya tetap ditangani tanpa merusak dokumen.
             try:
@@ -2010,9 +2037,9 @@ class DocxFinalTranslatorEngine:
                 failed = len(worker_tr.failed_texts) > before_failed
                 return index, para, found, failed
 
-            # Tahap utama: tepat 4 worker translate. Request tetap dipacing
+            # Tahap utama: 2 worker translate yang stabil. Request tetap dipacing
             # adaptif untuk menghindari burst/rate-limit di tengah dokumen.
-            with ThreadPoolExecutor(max_workers=4, thread_name_prefix='translate') as pool:
+            with ThreadPoolExecutor(max_workers=2, thread_name_prefix='translate') as pool:
                 futures = [pool.submit(_translate_job, item)
                            for item in enumerate(translation_queue)]
                 for future in as_completed(futures):
@@ -2028,7 +2055,7 @@ class DocxFinalTranslatorEngine:
                     pct = 10 + int(done / max(total, 1) * 80)
                     _notify(
                         progress_callback, pct,
-                        f"[translate 4 worker] {done}/{total} | "
+                        f"[translate 2 worker] {done}/{total} | "
                         f"berhasil={translated_count} | "
                         f"gagal={len(failed_paras)} | "
                         f"[progres-total] {done}/{total + len(failed_paras)}",
@@ -2045,21 +2072,18 @@ class DocxFinalTranslatorEngine:
             )
             for recovery_done, (index, para) in enumerate(
                     sorted(failed_paras, key=lambda item: item[0]), start=1):
-                found = []
-                failed = True
-                # Tetap tepat 1 worker; tiga retry ini berlangsung sekuensial.
-                for recovery_attempt in range(1, 4):
-                    before = len(recovery_tr.failed_texts)
-                    found = _translate_para(para, recovery_tr)
-                    failed = len(recovery_tr.failed_texts) > before
-                    if not failed:
-                        break
-                    if recovery_attempt < 3:
-                        time.sleep(min(4.0, 0.8 * recovery_attempt) + random.uniform(0.1, 0.3))
-                        recovery_tr = _Translator(
-                            self.source_lang, self.target_lang,
-                            self.custom_dict, self.italic_dict,
-                        )
+                # Recovery tetap 1 worker. translate_one sudah mempunyai satu
+                # retry internal (0,8 s), jadi tidak dibuat retry bertingkat lagi.
+                before = len(recovery_tr.failed_texts)
+                found = _translate_para(para, recovery_tr)
+                failed = len(recovery_tr.failed_texts) > before
+                if failed:
+                    # Client berikutnya dibuat baru agar session gagal tidak
+                    # terbawa ke paragraf recovery selanjutnya.
+                    recovery_tr = _Translator(
+                        self.source_lang, self.target_lang,
+                        self.custom_dict, self.italic_dict,
+                    )
                 if failed:
                     still_failed.append(para)
                 else:
