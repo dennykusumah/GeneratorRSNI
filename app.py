@@ -554,7 +554,7 @@ div[data-testid="stFileUploaderFile"] {
    - angka tetap kontras pada kondisi normal/hover/aktif
 ══════════════════════════════════════════ */
 .speed-label {
-    margin-top: 0.4rem !important;
+    margin-top: 0.2rem !important;
     margin-bottom: 0.45rem !important;
 }
 
@@ -1140,6 +1140,37 @@ with col_set2:
 st.markdown('<div class="section-label speed-label">⚡ Kecepatan (worker Engine 8)</div>', unsafe_allow_html=True)
 if '_engine8_workers' not in st.session_state:
     st.session_state['_engine8_workers'] = 2
+
+# Warna tombol worker dibuat eksplisit berdasarkan session_state.
+# Ini sengaja tidak bergantung pada data-testid Streamlit karena nama test-id
+# dapat berubah antarversi dan sebelumnya membuat semua tombol tampak biru.
+_selected_worker = int(st.session_state.get('_engine8_workers', 2))
+_worker_css = []
+for _n in range(1, 5):
+    if _n == _selected_worker:
+        _worker_css.append(f'''
+        div.st-key-worker_{_n} button, div[class~="st-key-worker_{_n}"] button {{
+            background: linear-gradient(135deg, #6366f1 0%, #4f46e5 50%, #4338ca 100%) !important;
+            border: none !important;
+            color: #ffffff !important;
+            box-shadow: 0 4px 20px rgba(99,102,241,0.4), 0 1px 0 rgba(255,255,255,0.1) inset !important;
+        }}
+        ''')
+    else:
+        _worker_css.append(f'''
+        div.st-key-worker_{_n} button, div[class~="st-key-worker_{_n}"] button {{
+            background: rgba(99,102,241,0.12) !important;
+            border: 1.5px solid rgba(99,102,241,0.35) !important;
+            color: rgba(165,180,252,0.85) !important;
+            box-shadow: none !important;
+        }}
+        div.st-key-worker_{_n} button:hover, div[class~="st-key-worker_{_n}"] button:hover {{
+            background: rgba(99,102,241,0.22) !important;
+            border-color: rgba(99,102,241,0.6) !important;
+            color: #c7d2fe !important;
+        }}
+        ''')
+st.markdown('<style>' + ''.join(_worker_css) + '</style>', unsafe_allow_html=True)
 
 # Empat kolom kecil di kiri + satu spacer fleksibel. Ukuran tombol dikunci 42x42 px via CSS.
 _worker_cols = st.columns([0.48, 0.48, 0.48, 0.48, 5.6], gap="small")[:4]
