@@ -29,11 +29,16 @@ _TEMP_PATTERNS = ["temp_main_*", "converted_*", "engine1_*", "engine2_*", "engin
 _MAX_AGE_MINUTES = 30
 
 # Satu proses konversi untuk seluruh instance aplikasi pada satu filesystem.
-# Lock dibuat atomik saat tombol Proses/Lanjutkan ditekan, sehingga dua sesi
-# yang menekan hampir bersamaan tidak dapat sama-sama masuk pipeline.
+# Lock memakai lease/heartbeat: selama pipeline benar-benar hidup, heartbeat
+# diperbarui. Jika worker mati/terputus, lock yatim otomatis kedaluwarsa.
 _APP_LOCK_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.rsni_process.lock')
-_APP_LOCK_STALE_SECONDS = 3 * 60 * 60
-_BUSY_MESSAGE = 'Aplikasi sedang digunakan oleh user lain. Mohon menunggu beberapa saat lagi.'
+_APP_LOCK_STALE_SECONDS = 2 * 60          # lock yatim dibersihkan setelah 2 menit
+_APP_LOCK_HEARTBEAT_SECONDS = 20          # heartbeat setiap 20 detik
+_BUSY_MESSAGE = 'Aplikasi sedang digunakan oleh user lain.\n\nMohon menunggu beberapa saat lagi.'
+
+# Event heartbeat per owner. Thread daemon berhenti sendiri bila lock dilepas/berubah.
+_APP_HEARTBEAT_EVENTS = {}
+_APP_HEARTBEAT_GUARD = threading.Lock()
 
 def _read_app_lock():
     try:
@@ -42,29 +47,93 @@ def _read_app_lock():
     except Exception:
         return {}
 
-def _acquire_app_lock(owner_sid: str) -> bool:
-    """Ambil lock lintas-session secara atomik. True jika sesi ini pemiliknya."""
+def _write_lock_payload(owner_sid: str, created_at=None) -> None:
+    """Tulis payload lock secara atomik tanpa mengubah owner."""
+    now = time.time()
+    payload = {
+        'owner': str(owner_sid or ''),
+        'created_at': float(created_at or now),
+        'heartbeat_at': now,
+    }
+    tmp = _APP_LOCK_FILE + f'.{owner_sid}.tmp'
+    with open(tmp, 'w', encoding='utf-8') as fh:
+        json.dump(payload, fh)
+        fh.flush()
+        try:
+            os.fsync(fh.fileno())
+        except OSError:
+            pass
+    os.replace(tmp, _APP_LOCK_FILE)
+
+def _touch_app_lock(owner_sid: str) -> bool:
+    """Perbarui heartbeat hanya jika lock masih dimiliki owner ini."""
     owner_sid = str(owner_sid or '')
-    for _ in range(2):
+    try:
+        info = _read_app_lock()
+        if info.get('owner') != owner_sid:
+            return False
+        _write_lock_payload(owner_sid, info.get('created_at') or time.time())
+        return True
+    except Exception:
+        return False
+
+def _heartbeat_loop(owner_sid: str, stop_event: threading.Event) -> None:
+    while not stop_event.wait(_APP_LOCK_HEARTBEAT_SECONDS):
+        if not _touch_app_lock(owner_sid):
+            break
+
+def _start_app_lock_heartbeat(owner_sid: str) -> None:
+    owner_sid = str(owner_sid or '')
+    with _APP_HEARTBEAT_GUARD:
+        old = _APP_HEARTBEAT_EVENTS.get(owner_sid)
+        if old is not None and not old.is_set():
+            return
+        ev = threading.Event()
+        _APP_HEARTBEAT_EVENTS[owner_sid] = ev
+        threading.Thread(
+            target=_heartbeat_loop, args=(owner_sid, ev), daemon=True,
+            name=f'rsni-lock-{owner_sid}'
+        ).start()
+
+def _stop_app_lock_heartbeat(owner_sid: str) -> None:
+    owner_sid = str(owner_sid or '')
+    with _APP_HEARTBEAT_GUARD:
+        ev = _APP_HEARTBEAT_EVENTS.pop(owner_sid, None)
+    if ev is not None:
+        ev.set()
+
+def _acquire_app_lock(owner_sid: str) -> bool:
+    """Ambil lock lintas-session; lock hidup selama heartbeat aktif."""
+    owner_sid = str(owner_sid or '')
+    for _ in range(3):
         try:
             fd = os.open(_APP_LOCK_FILE, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
             try:
-                payload = json.dumps({'owner': owner_sid, 'created_at': time.time()})
+                now = time.time()
+                payload = json.dumps({
+                    'owner': owner_sid, 'created_at': now, 'heartbeat_at': now
+                })
                 os.write(fd, payload.encode('utf-8'))
             finally:
                 os.close(fd)
+            _start_app_lock_heartbeat(owner_sid)
             return True
         except FileExistsError:
             info = _read_app_lock()
             if info.get('owner') == owner_sid:
+                _touch_app_lock(owner_sid)
+                _start_app_lock_heartbeat(owner_sid)
                 return True
             try:
-                age = time.time() - float(info.get('created_at', 0) or 0)
+                last_alive = float(
+                    info.get('heartbeat_at') or info.get('created_at') or 0
+                )
+                age = time.time() - last_alive
             except Exception:
                 age = _APP_LOCK_STALE_SECONDS + 1
             if age <= _APP_LOCK_STALE_SECONDS:
                 return False
-            # Lock yatim (mis. proses server mati) boleh dibersihkan.
+            # Lock yatim: owner lama tidak memberi heartbeat selama > 2 menit.
             try:
                 os.remove(_APP_LOCK_FILE)
             except FileNotFoundError:
@@ -74,10 +143,12 @@ def _acquire_app_lock(owner_sid: str) -> bool:
     return False
 
 def _release_app_lock(owner_sid: str) -> None:
-    """Lepas lock hanya jika lock memang dimiliki sesi ini."""
+    """Lepas lock segera saat proses selesai/error, hanya oleh pemiliknya."""
+    owner_sid = str(owner_sid or '')
+    _stop_app_lock_heartbeat(owner_sid)
     try:
         info = _read_app_lock()
-        if info.get('owner') == str(owner_sid or ''):
+        if info.get('owner') == owner_sid:
             os.remove(_APP_LOCK_FILE)
     except FileNotFoundError:
         pass
@@ -85,7 +156,19 @@ def _release_app_lock(owner_sid: str) -> None:
         pass
 
 def _show_busy_popup() -> None:
-    st.toast(_BUSY_MESSAGE, icon='⏳')
+    """Modal native Streamlit yang tampil tepat di tengah halaman."""
+    @st.dialog('Aplikasi Sedang Digunakan', width='small')
+    def _busy_dialog():
+        st.markdown(
+            '<div style="text-align:center;padding:0.35rem 0 0.8rem;">'
+            '<div style="font-size:2rem;margin-bottom:0.55rem;">⏳</div>'
+            '<div style="font-weight:650;">Aplikasi sedang digunakan oleh user lain.</div>'
+            '<div style="height:1rem;"></div>'
+            '<div>Mohon menunggu beberapa saat lagi.</div>'
+            '</div>',
+            unsafe_allow_html=True,
+        )
+    _busy_dialog()
 
 def _cleanup_temp_files(max_age_minutes: int = _MAX_AGE_MINUTES, silent: bool = True):
     """Hapus semua file temporer yang lebih lama dari max_age_minutes."""
