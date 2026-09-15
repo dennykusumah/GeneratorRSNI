@@ -33,7 +33,7 @@ _MAX_AGE_MINUTES = 30
 # yang menekan hampir bersamaan tidak dapat sama-sama masuk pipeline.
 _APP_LOCK_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.rsni_process.lock')
 _APP_LOCK_STALE_SECONDS = 3 * 60 * 60
-_BUSY_MESSAGE = 'Aplikasi sedang digunakan oleh user lain. Mohon menunggu beberapa saat lagi.'
+_BUSY_MESSAGE = 'Aplikasi sedang digunakan oleh user lain.\n\nMohon menunggu beberapa saat lagi.'
 
 def _read_app_lock():
     try:
@@ -85,7 +85,23 @@ def _release_app_lock(owner_sid: str) -> None:
         pass
 
 def _show_busy_popup() -> None:
-    st.toast(_BUSY_MESSAGE, icon='⏳')
+    """Tampilkan popup busy tepat di tengah layar dengan jeda 1 baris."""
+    # st.dialog dirender sebagai modal di tengah viewport, berbeda dengan st.toast
+    # yang selalu muncul di sudut kanan atas.
+    @st.dialog("⏳ Aplikasi sedang digunakan", width="small")
+    def _busy_dialog():
+        st.markdown(
+            """
+            <div style="text-align:center; line-height:1.55; padding:0.35rem 0 0.15rem;">
+                <div>Aplikasi sedang digunakan oleh user lain.</div>
+                <div style="height:1em;"></div>
+                <div>Mohon menunggu beberapa saat lagi.</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+    _busy_dialog()
 
 def _cleanup_temp_files(max_age_minutes: int = _MAX_AGE_MINUTES, silent: bool = True):
     """Hapus semua file temporer yang lebih lama dari max_age_minutes."""
@@ -1623,7 +1639,7 @@ def _render_header_with_live_kamus():
 
     st.markdown(f"""
         <div class="app-header">
-            <div class="badge">Generator RSNI</div>
+            <div class="badge">Generator RSNI · Dashboard v9</div>
             <h1>📑 ISO to RSNI Converter</h1>
             <p>Memformat & Menerjemahan Dokumen Standar ISO Menjadi Draft RSNI Secara Otomatis</p>
             <div class="stats-row">
