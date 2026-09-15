@@ -8,6 +8,7 @@ import atexit
 import threading
 import uuid
 import importlib.util
+import hashlib
 import shutil
 import subprocess
 import csv
@@ -838,8 +839,25 @@ def extract_titles_from_docx(docx_path: str):
     except Exception: return "", ""
 
 # --- INISIALISASI ENGINE ---
+def _engine_source_version() -> str:
+    """Hash source engine files so Streamlit cannot reuse stale resources."""
+    h = hashlib.sha256()
+    base = os.path.dirname(os.path.abspath(__file__))
+    for name in ("app.py", "engine8.py"):
+        path = os.path.join(base, name)
+        try:
+            with open(path, "rb") as fh:
+                h.update(fh.read())
+        except OSError:
+            h.update(name.encode())
+    return h.hexdigest()[:10]
+
+ENGINE_SOURCE_VERSION = _engine_source_version()
+
 @st.cache_resource
-def load_engines():
+def load_engines(source_version: str):
+    # source_version is intentionally part of the cache key. After a GitHub /
+    # Streamlit code update, a changed source hash forces fresh Engine objects.
     return (
         IntroductionContentTrimmerEngine(),
         CoverPageEngine(),
@@ -852,7 +870,7 @@ def load_engines():
         TableOfContentsEngine(),
     )
 
-engine1, engine2, engine3, engine4, engine5, engine6, engine7, engine8, engine9 = load_engines()
+engine1, engine2, engine3, engine4, engine5, engine6, engine7, engine8, engine9 = load_engines(ENGINE_SOURCE_VERSION)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # HEADER PERSISTEN
