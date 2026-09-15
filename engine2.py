@@ -16,6 +16,7 @@ Ketentuan Cover:
 - Cover adalah section TERSENDIRI tanpa nomor halaman.
 """
 
+from pipeline_utils import validate_docx, atomic_save_docx
 import os
 import re
 from datetime import datetime
@@ -834,7 +835,7 @@ class CoverPageEngine:
 
         first_body_child = body[0]
         first_body_child.addprevious(separator)
-        doc.save(output_docx)
+        atomic_save_docx(doc, output_docx)
         return True
 
     @staticmethod
@@ -1371,8 +1372,7 @@ class CoverPageEngine:
         # (section tunggal/terakhir yang sah menurut OOXML).
         body.append(sect_el_copy)
 
-        doc.save(output_docx)
-
+        atomic_save_docx(doc, output_docx)
     # ──────────────────────────────────────────────────────
     # HELPERS
     # ──────────────────────────────────────────────────────
