@@ -11,7 +11,7 @@ Fitur utama:
     1. KAMUS_SPREADSHEET_URL → untuk terjemahan istilah
     2. ITALIC_SPREADSHEET_URL → daftar kata yang TIDAK diterjemahkan, OUTPUT MIRING
   - Dual Title Sync, Note/Catatan, Annex fix, dll.
-  - Stabilitas tran1/tran2: 2 worker, request pacing ringan, retry sekali 0,8 s.
+  - Stabilitas tran1/tran2: 1 worker provider-safe, delay ringan, retry bertahap.
   - Hybrid cache: RAM LRU (L1) + SQLite (L2).
 """
 
@@ -1328,7 +1328,7 @@ def _cache_put(cache_key: str, translated: str, italic_terms: list[str]) -> None
 # failures, then automatically returns to fast mode after successful requests.
 _TRANSLATE_GATE_LOCK = threading.Lock()
 _TRANSLATE_NEXT_REQUEST = 0.0
-_TRANSLATE_FAST_INTERVAL = 0.12
+_TRANSLATE_FAST_INTERVAL = 0.18
 _TRANSLATE_ADAPTIVE_INTERVAL = 0.35
 _TRANSLATE_ADAPTIVE_UNTIL = 0.0
 _TRANSLATE_SUCCESS_STREAK = 0
@@ -1438,7 +1438,7 @@ class _Translator:
         }
         result = None
         last_error = None
-        for attempt in range(1, 3):
+        for attempt in range(1, 4):
             try:
                 _translation_gate_wait()
                 candidate = self._client.translate(t)
@@ -1466,13 +1466,16 @@ class _Translator:
                 last_error = exc
                 # Filosofi tran1/tran2: jangan memperlambat seluruh dokumen
                 # karena satu kegagalan. Buat ulang client, tunggu singkat, lalu
-                # retry sekali. Recovery khusus dilakukan kemudian dengan 1 worker.
+                # retry terbatas dengan backoff. Recovery khusus dilakukan kemudian dengan 1 worker.
                 try:
                     self._client = self._cls(source=self.source, target=self.target)
                 except Exception:
                     pass
-                if attempt < 2:
-                    time.sleep(0.8 + random.uniform(0.0, 0.15))
+                if attempt < 3:
+                    # Backoff pendek lalu lebih panjang. Dengan satu worker ini
+                    # tidak menahan request milik worker lain.
+                    base_wait = 0.9 if attempt == 1 else 1.8
+                    time.sleep(base_wait + random.uniform(0.05, 0.25))
 
         if result is None:
             # Judul standar lazim terdiri dari beberapa klausa yang dipisahkan
@@ -2037,9 +2040,11 @@ class DocxFinalTranslatorEngine:
                 failed = len(worker_tr.failed_texts) > before_failed
                 return index, para, found, failed
 
-            # Tahap utama: 2 worker translate yang stabil. Request tetap dipacing
-            # adaptif untuk menghindari burst/rate-limit di tengah dokumen.
-            with ThreadPoolExecutor(max_workers=2, thread_name_prefix='translate') as pool:
+            # Tahap utama provider-safe: tepat 1 worker seperti pola tran1/tran2.
+            # Pada shared IP Streamlit Cloud, dua request paralel terbukti pada
+            # dashboard dapat menghasilkan burst kegagalan. Cache RAM/SQLite
+            # tetap membuat teks yang sudah pernah sukses selesai instan.
+            with ThreadPoolExecutor(max_workers=1, thread_name_prefix='translate') as pool:
                 futures = [pool.submit(_translate_job, item)
                            for item in enumerate(translation_queue)]
                 for future in as_completed(futures):
@@ -2055,7 +2060,7 @@ class DocxFinalTranslatorEngine:
                     pct = 10 + int(done / max(total, 1) * 80)
                     _notify(
                         progress_callback, pct,
-                        f"[translate 2 worker] {done}/{total} | "
+                        f"[translate stabil 1 worker] {done}/{total} | "
                         f"berhasil={translated_count} | "
                         f"gagal={len(failed_paras)} | "
                         f"[progres-total] {done}/{total + len(failed_paras)}",
@@ -2072,8 +2077,9 @@ class DocxFinalTranslatorEngine:
             )
             for recovery_done, (index, para) in enumerate(
                     sorted(failed_paras, key=lambda item: item[0]), start=1):
-                # Recovery tetap 1 worker. translate_one sudah mempunyai satu
-                # retry internal (0,8 s), jadi tidak dibuat retry bertingkat lagi.
+                # Beri provider kesempatan pulih sebelum mengulang item yang gagal.
+                # Ini penting pada shared IP Streamlit Cloud setelah burst/429.
+                time.sleep(1.25 + random.uniform(0.05, 0.25))
                 before = len(recovery_tr.failed_texts)
                 found = _translate_para(para, recovery_tr)
                 failed = len(recovery_tr.failed_texts) > before
