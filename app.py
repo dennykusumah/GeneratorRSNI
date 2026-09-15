@@ -481,10 +481,28 @@ div[data-testid="stFileUploader"] button:hover {
 }
 
 div[data-testid="stFileUploaderFile"] {
-    background: rgba(99,102,241,0.1) !important;
+    background: #ffffff !important;
     border: 1px solid rgba(99,102,241,0.3) !important;
     border-radius: 10px !important;
-    color: #c7d2fe !important;
+    color: #000000 !important;
+}
+
+/* Nama file + ukuran file harus hitam dan kontras di kartu upload putih.
+   Selector dibuat spesifik dan memakai !important agar tidak ditimpa
+   aturan global .stApp p/.stApp div/.stApp label di bawah. */
+div[data-testid="stFileUploaderFile"] p,
+div[data-testid="stFileUploaderFile"] span,
+div[data-testid="stFileUploaderFile"] div:not([role="button"]),
+div[data-testid="stFileUploaderFile"] small {
+    color: #000000 !important;
+    -webkit-text-fill-color: #000000 !important;
+    opacity: 1 !important;
+}
+
+/* Ikon dokumen tetap jelas pada kartu putih. */
+div[data-testid="stFileUploaderFile"] svg {
+    color: #111827 !important;
+    fill: currentColor !important;
 }
 
 /* ══════════════════════════════════════════
@@ -564,7 +582,7 @@ div[class*="st-key-upl_main"] + div[data-testid="stElementContainer"] {
     font-weight: 500 !important;
     letter-spacing: 0.3px !important;
     text-transform: none !important;
-    color: rgba(255,255,255,0.55) !important;
+    color: #ffffff !important;
     line-height: 1.25 !important;
 }
 
@@ -582,7 +600,7 @@ div[class*="st-key-upl_main"] + div[data-testid="stElementContainer"] {
     font-weight: 500 !important;
     letter-spacing: 0.3px !important;
     text-transform: none !important;
-    color: rgba(255,255,255,0.55) !important;
+    color: #ffffff !important;
     line-height: 1.25 !important;
 }
 
