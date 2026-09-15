@@ -547,6 +547,36 @@ div[data-testid="stFileUploaderFile"] button {
     -webkit-text-fill-color: initial !important;
 }
 
+/* FINAL FIX — metadata file upload harus terbaca di kartu putih.
+   Streamlit dapat merender nama/ukuran melalui data-testid, class dinamis,
+   atau teks di sibling tombol delete; semua jalur tersebut ditangani. */
+div[data-testid="stFileUploader"] div[data-testid="stFileUploaderFile"] {
+    background: #ffffff !important;
+}
+div[data-testid="stFileUploader"] div[data-testid="stFileUploaderFile"] :is(p, span, small),
+div[data-testid="stFileUploader"] div[data-testid="stFileUploaderFile"] [data-testid*="FileName"],
+div[data-testid="stFileUploader"] div[data-testid="stFileUploaderFile"] [data-testid*="FileSize"],
+div[data-testid="stFileUploader"] div[data-testid="stFileUploaderFile"] [data-testid*="FileData"],
+div[data-testid="stFileUploader"] div[data-testid="stFileUploaderFile"] [class*="fileName"],
+div[data-testid="stFileUploader"] div[data-testid="stFileUploaderFile"] [class*="fileSize"],
+div[data-testid="stFileUploader"] div[data-testid="stFileUploaderFile"] [class*="fileData"] {
+    color: #111827 !important;
+    -webkit-text-fill-color: #111827 !important;
+    opacity: 1 !important;
+    visibility: visible !important;
+}
+/* Jika metadata memakai div tanpa class/test-id, warnai div teksnya juga. */
+div[data-testid="stFileUploader"] div[data-testid="stFileUploaderFile"] div:not(:has(button)):not(:has(svg)) {
+    color: #111827 !important;
+    -webkit-text-fill-color: #111827 !important;
+    opacity: 1 !important;
+}
+/* Ikon/tombol hapus tidak ikut menjadi hitam. */
+div[data-testid="stFileUploader"] div[data-testid="stFileUploaderFile"] button,
+div[data-testid="stFileUploader"] div[data-testid="stFileUploaderFile"] button * {
+    -webkit-text-fill-color: initial !important;
+}
+
 /* ══════════════════════════════════════════
    INPUT FIELDS
 ══════════════════════════════════════════ */
@@ -619,6 +649,13 @@ div[class*="st-key-upl_main"] + div[data-testid="stElementContainer"] {
 }
 
 /* Label Kecepatan dibuat identik dengan label input ICS/No. SNI. */
+.speed-stopwatch {
+    font-size: 0.82rem !important;
+    line-height: 1 !important;
+    display: inline-block !important;
+    vertical-align: baseline !important;
+}
+
 .speed-label {
     font-size: 0.82rem !important;
     font-weight: 500 !important;
@@ -1236,7 +1273,7 @@ with col_set2:
     )
 
 # --- PENGATURAN KECEPATAN ENGINE 8 ---
-st.markdown('<div class="section-label speed-label">⏱️ Kecepatan</div>', unsafe_allow_html=True)
+st.markdown('<div class="section-label speed-label"><span class="speed-stopwatch">⏱️</span> Kecepatan</div>', unsafe_allow_html=True)
 if '_engine8_workers' not in st.session_state:
     st.session_state['_engine8_workers'] = 2
 
