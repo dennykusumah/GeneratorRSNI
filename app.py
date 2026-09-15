@@ -554,7 +554,7 @@ div[data-testid="stFileUploaderFile"] {
    - angka tetap kontras pada kondisi normal/hover/aktif
 ══════════════════════════════════════════ */
 .speed-label {
-    margin-top: 0.8rem !important;
+    margin-top: 0.4rem !important;
     margin-bottom: 0.45rem !important;
 }
 
@@ -585,28 +585,28 @@ div[class*="st-key-worker_"] .stButton > button {
 
 /* Belum dipilih: gelap/netral dengan angka terang. */
 div[class*="st-key-worker_"] button[data-testid="baseButton-secondary"] {
-    background: rgba(30,41,59,0.95) !important;
-    border: 1.5px solid rgba(148,163,184,0.45) !important;
-    color: #f8fafc !important;
+    background: rgba(99,102,241,0.12) !important;
+    border: 1.5px solid rgba(99,102,241,0.35) !important;
+    color: #c7d2fe !important;
 }
 div[class*="st-key-worker_"] button[data-testid="baseButton-secondary"]:hover {
-    background: rgba(51,65,85,1) !important;
-    border-color: rgba(129,140,248,0.9) !important;
+    background: rgba(99,102,241,0.22) !important;
+    border-color: rgba(99,102,241,0.6) !important;
     color: #ffffff !important;
 }
 
 /* Dipilih: biru tegas (tidak merah) dengan angka putih. */
 div[class*="st-key-worker_"] button[data-testid="baseButton-primary"] {
-    background: linear-gradient(135deg, #3b82f6 0%, #2563eb 55%, #1d4ed8 100%) !important;
-    border: 1.5px solid #60a5fa !important;
+    background: linear-gradient(135deg, #6366f1 0%, #4f46e5 50%, #4338ca 100%) !important;
+    border: none !important;
     color: #ffffff !important;
-    box-shadow: 0 0 0 2px rgba(59,130,246,0.18), 0 4px 12px rgba(37,99,235,0.28) !important;
+    box-shadow: 0 4px 20px rgba(99,102,241,0.4), 0 1px 0 rgba(255,255,255,0.1) inset !important;
 }
 div[class*="st-key-worker_"] button[data-testid="baseButton-primary"]:hover,
 div[class*="st-key-worker_"] button[data-testid="baseButton-primary"]:active,
 div[class*="st-key-worker_"] button[data-testid="baseButton-primary"]:focus {
-    background: linear-gradient(135deg, #60a5fa 0%, #3b82f6 55%, #2563eb 100%) !important;
-    border-color: #93c5fd !important;
+    background: linear-gradient(135deg, #818cf8 0%, #6366f1 50%, #4f46e5 100%) !important;
+    border-color: transparent !important;
     color: #ffffff !important;
     transform: none !important;
 }
