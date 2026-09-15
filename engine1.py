@@ -6,6 +6,8 @@ header/footer, section, dan pengaturan halaman asli tetap dipertahankan.
 
 from __future__ import annotations
 
+from pipeline_utils import validate_docx, atomic_save_docx
+
 import os
 import re
 from typing import Optional, Tuple
@@ -479,6 +481,7 @@ class IntroductionContentTrimmerEngine:
         try:
             if not os.path.isfile(input_docx):
                 raise FileNotFoundError(f"File tidak ditemukan: {input_docx}")
+            validate_docx(input_docx)
 
             doc = Document(input_docx)
             intro_idx, scope_idx, biblio_idx = self._find_markers(doc)
@@ -516,8 +519,7 @@ class IntroductionContentTrimmerEngine:
             self._format_trimmed_document(doc, fallback_title=fallback_title)
 
             os.makedirs(os.path.dirname(os.path.abspath(output_docx)), exist_ok=True)
-            doc.save(output_docx)
-
+            atomic_save_docx(doc, output_docx)
             intro_msg = "Introduction + Content" if has_intro else "Content (mulai halaman 1)"
             biblio_msg = " sampai Bibliography" if biblio_idx is not None else ""
             link_msg = f" {hyperlinks_removed} hyperlink diubah menjadi teks biasa."
