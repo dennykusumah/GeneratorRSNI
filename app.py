@@ -13,6 +13,7 @@ import subprocess
 import csv
 import io
 import json
+import html
 from io import BytesIO
 from urllib.request import Request, urlopen
 
@@ -900,6 +901,18 @@ div[data-testid="stFileUploader"] div[data-testid="stFileUploaderFile"] button s
     opacity: 1 !important;
 }
 
+/* FINAL X OVERRIDE */
+div[data-testid="stFileUploader"] div[data-testid="stFileUploaderFile"] button,
+div[data-testid="stFileUploader"] [data-testid="stFileUploaderDeleteBtn"],
+div[data-testid="stFileUploader"] [data-testid="stFileUploaderDeleteBtn"] button,
+div[data-testid="stFileUploader"] button[aria-label*="delete" i],
+div[data-testid="stFileUploader"] button[aria-label*="remove" i] { background:transparent!important; background-image:none!important; border:0!important; outline:0!important; box-shadow:none!important; padding:0!important; width:24px!important; min-width:24px!important; max-width:24px!important; height:24px!important; min-height:24px!important; max-height:24px!important; border-radius:999px!important; }
+div[data-testid="stFileUploader"] div[data-testid="stFileUploaderFile"] button:hover, div[data-testid="stFileUploader"] div[data-testid="stFileUploaderFile"] button:focus, div[data-testid="stFileUploader"] div[data-testid="stFileUploaderFile"] button:active { background:transparent!important; border:0!important; outline:0!important; box-shadow:none!important; }
+div[data-testid="stFileUploader"] div[data-testid="stFileUploaderFile"] button > div, div[data-testid="stFileUploader"] div[data-testid="stFileUploaderFile"] button > span { background:transparent!important; border:0!important; outline:0!important; box-shadow:none!important; }
+.uploaded-file-guaranteed-meta { margin-top:-0.45rem!important; margin-bottom:0.35rem!important; padding:0.48rem 0.75rem!important; max-width:100%!important; display:flex!important; align-items:center!important; gap:0.55rem!important; background:#fff!important; border:0!important; border-radius:8px!important; box-shadow:none!important; }
+.uploaded-file-guaranteed-meta .uf-name { color:#111827!important; -webkit-text-fill-color:#111827!important; font-size:0.84rem!important; font-weight:700!important; max-width:430px!important; overflow:hidden!important; text-overflow:ellipsis!important; white-space:nowrap!important; }
+.uploaded-file-guaranteed-meta .uf-size { color:#374151!important; -webkit-text-fill-color:#374151!important; font-size:0.76rem!important; font-weight:600!important; white-space:nowrap!important; }
+
 /* ══════════════════════════════════════════
    INPUT FIELDS
 ══════════════════════════════════════════ */
@@ -1582,6 +1595,23 @@ uploaded_file = st.file_uploader(
     "Upload file .doc/.docx di sini atau klik Browse",
     type=["doc", "docx"], key="upl_main", label_visibility="collapsed"
 )
+
+# Tampilkan metadata langsung dari UploadedFile agar selalu terlihat, terlepas dari DOM Streamlit.
+if uploaded_file is not None:
+    _uploaded_name = html.escape(str(uploaded_file.name or "File dokumen"))
+    _uploaded_size = int(getattr(uploaded_file, "size", 0) or 0)
+    if _uploaded_size >= 1024 * 1024:
+        _uploaded_size_text = f"{_uploaded_size / (1024 * 1024):.2f} MB"
+    elif _uploaded_size >= 1024:
+        _uploaded_size_text = f"{_uploaded_size / 1024:.1f} KB"
+    else:
+        _uploaded_size_text = f"{_uploaded_size} B"
+    _meta_html = (
+        '<div class="uploaded-file-guaranteed-meta" title="' + _uploaded_name + '">'
+        '<span class="uf-name">' + _uploaded_name + '</span>'
+        '<span class="uf-size">' + _uploaded_size_text + '</span></div>'
+    )
+    st.markdown(_meta_html, unsafe_allow_html=True)
 
 st.markdown('<div class="section-label">⚙️ Pengaturan</div>', unsafe_allow_html=True)
 col_set1, col_set2 = st.columns([2, 3])
