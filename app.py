@@ -505,6 +505,29 @@ div[data-testid="stFileUploaderFile"] svg {
     fill: currentColor !important;
 }
 
+/* Streamlit versi baru membungkus nama/ukuran file pada elemen berbeda.
+   Paksa seluruh teks metadata file menjadi hitam di atas kartu putih. */
+div[data-testid="stFileUploaderFile"] [data-testid="stFileUploaderFileName"],
+div[data-testid="stFileUploaderFile"] [data-testid="stFileUploaderFileSize"],
+div[data-testid="stFileUploaderFile"] [data-testid="stFileUploaderFileName"] *,
+div[data-testid="stFileUploaderFile"] [data-testid="stFileUploaderFileSize"] *,
+div[data-testid="stFileUploaderFile"] > div,
+div[data-testid="stFileUploaderFile"] > div > div,
+div[data-testid="stFileUploaderFile"] > div > div > div,
+div[data-testid="stFileUploaderFile"] p,
+div[data-testid="stFileUploaderFile"] span {
+    color: #111111 !important;
+    -webkit-text-fill-color: #111111 !important;
+    opacity: 1 !important;
+    visibility: visible !important;
+}
+
+/* Jangan mengubah warna ikon tombol hapus file. */
+div[data-testid="stFileUploaderFile"] button,
+div[data-testid="stFileUploaderFile"] button * {
+    -webkit-text-fill-color: initial !important;
+}
+
 /* ══════════════════════════════════════════
    INPUT FIELDS
 ══════════════════════════════════════════ */
@@ -582,7 +605,7 @@ div[class*="st-key-upl_main"] + div[data-testid="stElementContainer"] {
     font-weight: 500 !important;
     letter-spacing: 0.3px !important;
     text-transform: none !important;
-    color: #ffffff !important;
+    color: rgba(255,255,255,0.55) !important;
     line-height: 1.25 !important;
 }
 
@@ -600,7 +623,7 @@ div[class*="st-key-upl_main"] + div[data-testid="stElementContainer"] {
     font-weight: 500 !important;
     letter-spacing: 0.3px !important;
     text-transform: none !important;
-    color: #ffffff !important;
+    color: rgba(255,255,255,0.55) !important;
     line-height: 1.25 !important;
 }
 
