@@ -13,6 +13,7 @@ Fitur utama:
   - Dual Title Sync, Note/Catatan, Annex fix, dll.
 """
 
+from pipeline_utils import validate_docx, atomic_save_docx
 import re
 import copy
 import time
@@ -73,10 +74,13 @@ _HEADING_STYLES_WITH_NUM = {
 _TRANSLATE_DELAY = 0.15
 _EM_DASH = '—'
 
-ENGINE8_POLICY_VERSION = "2026.09-cache-v1"
+ENGINE8_POLICY_VERSION = "2026.09-cache-v2-quality-gate"
 ENGINE8_PROVIDER_VERSION = "deep-translator-google+mymemory-v1"
 _ENGINE8_L1_MAX_ENTRIES = 5000
 _ENGINE8_L2_MAX_ENTRIES = 100000
+_ENGINE8_NEGATIVE_TTL = 60
+_ENGINE8_NEGATIVE_CACHE = {}
+_ENGINE8_NEGATIVE_LOCK = threading.RLock()
 _ENGINE8_CACHE_PATH = os.getenv("ENGINE8_CACHE_PATH", os.path.join(tempfile.gettempdir(), "rsni_engine8_translation_cache.sqlite3"))
 
 
@@ -86,6 +90,38 @@ def _canonical_dictionary_fingerprint(custom_dict, italic_dict):
     raw = json.dumps({"custom": custom, "italic": italic}, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
+
+def _translation_quality_ok(source: str, translated: str) -> bool:
+    """Conservative, language-agnostic gate before a result enters cache."""
+    if not translated or _looks_like_error_response(source, translated):
+        return False
+    # Numeric values and explicit protection tokens must survive translation.
+    nums_src = re.findall(r'(?<![A-Za-z])\d+(?:[.,]\d+)*(?![A-Za-z])', source)
+    nums_dst = re.findall(r'(?<![A-Za-z])\d+(?:[.,]\d+)*(?![A-Za-z])', translated)
+    if nums_src != nums_dst:
+        return False
+    toks_src = {x.casefold() for x in _RE_PROTECTION_TOKEN.findall(source)}
+    toks_dst = {x.casefold() for x in _RE_PROTECTION_TOKEN.findall(translated)}
+    if toks_src != toks_dst:
+        return False
+    # Reject obviously truncated/expanded provider garbage, but keep short headings.
+    a, b = len(source.strip()), len(translated.strip())
+    if a >= 30 and (b < max(5, int(a * .18)) or b > int(a * 5.0)):
+        return False
+    return True
+
+def _negative_cache_active(key: str) -> bool:
+    now = time.monotonic()
+    with _ENGINE8_NEGATIVE_LOCK:
+        until = _ENGINE8_NEGATIVE_CACHE.get(key, 0)
+        if until <= now:
+            _ENGINE8_NEGATIVE_CACHE.pop(key, None)
+            return False
+        return True
+
+def _negative_cache_mark(key: str) -> None:
+    with _ENGINE8_NEGATIVE_LOCK:
+        _ENGINE8_NEGATIVE_CACHE[key] = time.monotonic() + _ENGINE8_NEGATIVE_TTL
 
 def _stable_cache_source(text, italic_map=None):
     value = str(text or "")
@@ -1424,11 +1460,12 @@ class _Translator:
         }
         result = None
         last_error = None
-        for attempt in range(1, 5):
+        attempts = 1 if _negative_cache_active(cache_key) else 4
+        for attempt in range(1, attempts + 1):
             try:
                 candidate = self._client.translate(t)
-                if not candidate or _looks_like_error_response(t, candidate):
-                    raise ValueError('respons layanan terjemahan tidak valid')
+                if not candidate or not _translation_quality_ok(t, candidate):
+                    raise ValueError('respons layanan terjemahan tidak lolos quality gate')
                 returned_tokens = {
                     token.casefold()
                     for token in _RE_PROTECTION_TOKEN.findall(candidate)
@@ -1448,8 +1485,8 @@ class _Translator:
                 break
             except Exception as exc:
                 last_error = exc
-                if attempt < 4:
-                    time.sleep(0.8 * attempt)
+                if attempt < attempts:
+                    time.sleep(min(3.0, 0.6 * (2 ** (attempt - 1))))
 
         if result is None:
             # Judul standar lazim terdiri dari beberapa klausa yang dipisahkan
@@ -1488,7 +1525,7 @@ class _Translator:
                 fallback = MyMemoryTranslator(
                     source=fallback_source, target=fallback_target
                 ).translate(t)
-                if fallback and not _looks_like_error_response(t, fallback):
+                if fallback and _translation_quality_ok(t, fallback):
                     fallback_tokens = {
                         token.casefold()
                         for token in _RE_PROTECTION_TOKEN.findall(fallback)
@@ -1527,6 +1564,7 @@ class _Translator:
             # membiarkan paragraf 100% utuh (termasuk semua run/format)
             # untuk diulang di tahap pemulihan.
             self.failed_texts.append(preview)
+            _negative_cache_mark(cache_key)
             if owns_flight:
                 _ENGINE8_TRANSLATION_CACHE.finish(cache_key)
             return text, []
@@ -1955,6 +1993,7 @@ class DocxFinalTranslatorEngine:
     def translate(self, input_docx: str, output_docx: str, progress_callback=None, 
                   translate_headers: bool = False, worker_count: int = 2) -> tuple[bool, str]:
         try:
+            validate_docx(input_docx)
             # app.py membuat engine tanpa parameter kamus. Karena itu Engine 8
             # wajib mengambil kedua spreadsheet sendiri pada setiap proses,
             # sehingga perubahan Google Sheet langsung dipakai dan bukan hanya
@@ -2125,8 +2164,7 @@ class DocxFinalTranslatorEngine:
             _normalize_all_clause_heading_spacing(doc)
 
             _notify(progress_callback, 98, "Saving...")
-            doc.save(output_docx)
-
+            atomic_save_docx(doc, output_docx)
             if still_failed:
                 return False, (
                     f"{len(still_failed)} bagian masih belum berhasil "
