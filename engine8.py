@@ -565,6 +565,131 @@ def _extract_source_format_map(text_runs, para_style_italic: bool) -> tuple[str,
     return ''.join(out_parts), token_map
 
 
+def _segment_runs_by_format(text_runs, para_style_italic: bool) -> list:
+    """Gabungkan run yang berdekatan dengan (miring, vertAlign) sama menjadi
+    daftar segmen berurutan ``(teks, is_italic, vtype)``.
+
+    Dipakai bersama oleh jalur lama (``_extract_source_format_map``, yang
+    menyisipkan token proteksi ke dalam SATU string sebelum dikirim ke
+    layanan terjemahan) dan jalur baru per-segmen
+    (``_translate_paragraph_segments``, yang TIDAK PERNAH mengirim bagian
+    superscript/subscript/miring-sumber ke layanan terjemahan sama sekali).
+    """
+    segments = []
+    for _, r in text_runs:
+        is_ital = _run_effective_italic(r, para_style_italic)
+        vtype = _run_vertalign(r)
+        t = r.text or ''
+        if segments and (segments[-1][1], segments[-1][2]) == (is_ital, vtype):
+            segments[-1][0] += t
+        else:
+            segments.append([t, is_ital, vtype])
+    return [(t, i, v) for t, i, v in segments]
+
+
+def _is_protected_segment(seg_text: str, is_ital: bool, vtype) -> bool:
+    """True bila segmen ini harus dilindungi (tidak diterjemahkan) —
+    superscript/subscript apa pun panjangnya, atau istilah/judul miring
+    sumber yang cukup panjang untuk dianggap istilah asing, bukan tanda
+    baca/angka semata."""
+    stripped = seg_text.strip()
+    if not stripped:
+        return False
+    if vtype is not None:
+        return True
+    if is_ital and len(stripped) >= 3 and not _RE_PURE_NUMBER.fullmatch(stripped):
+        return True
+    return False
+
+
+def _translate_paragraph_segments(text_runs, tr, para_style_italic: bool):
+    """Jalur terjemahan PER-SEGMEN untuk paragraf yang memiliki superscript/
+    subscript atau istilah miring-sumber (mis. CATATAN/NOTE berisi notasi
+    pangkat seperti "kWm⁻²" atau "0,7 m²").
+
+    Masalah pada jalur lama: seluruh paragraf digabung jadi SATU string,
+    dengan setiap segmen superscript/subscript disisipi token proteksi acak
+    (mis. ``ZXQSRC...QXZ``), lalu SATU request itu dikirim ke Google
+    Translate. Untuk CATATAN teknis yang memuat beberapa notasi pangkat
+    berdekatan (beberapa token mirip dalam satu kalimat pendek), mesin
+    terjemahan kerap gagal mengembalikan token-token itu persis utuh
+    (tertukar/hilang/dianggap pengulangan lalu dipangkas), sehingga
+    validasi round-trip pada ``_Translator.translate_one`` gagal berulang
+    kali dan SELURUH paragraf berakhir tidak diterjemahkan (font merah) —
+    padahal sebagian besar isinya teks biasa yang sebenarnya mudah
+    diterjemahkan.
+
+    Solusi: paragraf dipecah dulu secara lokal (murni baca run, tidak
+    memanggil layanan apa pun) di setiap batas segmen terproteksi. Segmen
+    "polos" yang berurutan digabung jadi satu blok teks dan diterjemahkan
+    satu per satu lewat ``tr.translate_one`` (kamus SNI & Kamus Istilah
+    Asing tetap berlaku per blok, sama seperti sebelumnya). Segmen
+    terproteksi TIDAK PERNAH dikirim ke layanan terjemahan sama sekali —
+    formatnya (dan teksnya) sehingga mustahil rusak, dan Google Translate
+    tidak pernah perlu me-round-trip token aneh untuk bagian ini.
+
+    Return ``(translated_text, format_spans, italic_terms_found)`` bila
+    SEMUA blok polos berhasil diterjemahkan (atau memang trivial/di-skip
+    karena terlalu pendek), atau ``None`` bila ADA satu saja blok yang
+    gagal — dalam hal ini paragraf dianggap gagal secara UTUH dan TIDAK
+    disentuh sama sekali (persis seperti kegagalan pada jalur lama),
+    supaya tetap aman diulang di tahap pemulihan / retry.
+    """
+    segments = _segment_runs_by_format(text_runs, para_style_italic)
+
+    blocks: list[tuple[str, object]] = []
+    current_plain: list[str] = []
+    for seg_text, is_ital, vtype in segments:
+        if _is_protected_segment(seg_text, is_ital, vtype):
+            if current_plain:
+                blocks.append(('plain', ''.join(current_plain)))
+                current_plain = []
+            blocks.append(('protected', (seg_text, is_ital, vtype)))
+        else:
+            current_plain.append(seg_text)
+    if current_plain:
+        blocks.append(('plain', ''.join(current_plain)))
+
+    out_parts: list[str] = []
+    format_spans: list[tuple] = []
+    italic_terms_found: list[str] = []
+    cur_len = 0
+
+    for kind, payload in blocks:
+        if kind == 'protected':
+            seg_text, is_ital, vtype = payload
+            format_spans.append((cur_len, cur_len + len(seg_text), is_ital, vtype))
+            out_parts.append(seg_text)
+            cur_len += len(seg_text)
+            continue
+
+        block_text = payload
+        if not block_text.strip():
+            out_parts.append(block_text)
+            cur_len += len(block_text)
+            continue
+
+        if tr.italic_dict and len(tr.italic_dict) > 0:
+            pre_text, dict_italic_map = tr.italic_dict._apply_pre(block_text)
+        else:
+            pre_text, dict_italic_map = block_text, {}
+
+        before_fail = len(tr.failed_texts)
+        block_result, block_italic_terms = tr.translate_one(pre_text, dict_italic_map)
+        if len(tr.failed_texts) > before_fail:
+            # Satu blok gagal -> seluruh paragraf dianggap gagal ronde ini
+            # (bukan hasil campuran sebagian bahasa Inggris/Indonesia),
+            # supaya aman diulang utuh pada tahap pemulihan.
+            return None
+        out_parts.append(block_result)
+        cur_len += len(block_result)
+        for term in block_italic_terms:
+            if term not in italic_terms_found:
+                italic_terms_found.append(term)
+
+    return ''.join(out_parts), format_spans, italic_terms_found
+
+
 def _detokenize_with_formatting(text: str, token_map: dict) -> tuple[str, list]:
     """
     Kembalikan token @@SRC_...@@ pada `text` menjadi teks aslinya (verbatim),
@@ -1262,10 +1387,26 @@ class _Translator:
         if result is None:
             preview = re.sub(r'\s+', ' ', text).strip()[:100]
             # Jangan gagalkan seluruh pipeline karena satu request eksternal.
-            # Simpan teks sumber (token kamus tetap dipulihkan di bawah) dan
-            # laporkan sebagai peringatan pada ringkasan proses.
+            # Laporkan sebagai peringatan pada ringkasan proses, dan
+            # KEMBALIKAN TEKS ASLI APA ADANYA (`text`, sebelum token kamus/
+            # proteksi apa pun disisipkan) tanpa menerapkan `_apply_post`.
+            #
+            # Sebelumnya baris ini melanjutkan ke `_apply_post` di bawah
+            # walau `result` gagal total (`result = t`, teks sumber yang
+            # SUDAH disisipi token kamus). Karena `_apply_post` mengganti
+            # token kamus dengan kata TARGET tanpa syarat, satu paragraf
+            # yang gagal total bisa berakhir sebagai campuran aneh —
+            # sebagian besar tetap bahasa sumber, tapi satu-dua kata umum
+            # (mis. "can") ikut terganti ("dapat") seolah-olah paragraf itu
+            # sudah diterjemahkan. Akibatnya pemanggil (`_translate_para`)
+            # tidak mendeteksi ini sebagai "tidak ada perubahan" dan
+            # menyimpan hasil setengah-campur itu ke dokumen. Dengan
+            # langsung mengembalikan `text` asli di sini, pemanggil selalu
+            # bisa mendeteksi kegagalan lewat kesamaan teks dan
+            # membiarkan paragraf 100% utuh (termasuk semua run/format)
+            # untuk diulang di tahap pemulihan.
             self.failed_texts.append(preview)
-            result = t
+            return text, []
         if token_map: result = self.custom_dict._apply_post(result, token_map)
         italic_terms_found = []
         if final_italic_map:
@@ -1317,33 +1458,50 @@ def _translate_para(para, tr, past_bibliography: bool = False) -> list[str]:
     # tidak ikut dihitung dan salah membuat seluruh paragraf jadi HURUF BESAR.
     original_for_case = combined
     source_note_upper = bool(re.match(r'^NOTE(?:\s|\t|:)', combined))
-
-    # Proteksi 1: istilah/judul asing yang SUDAH miring di dokumen sumber
-    # (mis. judul standar acuan pada klausul "Acuan normatif"), SERTA
-    # seluruh teks berformat superscript/subscript (pangkat/indeks) —
-    # keduanya tidak diterjemahkan dan formatnya dikembalikan persis
-    # seperti sumber setelah proses terjemahan selesai.
     para_style_italic = _get_para_style_italic(para)
-    combined_with_src_tokens, format_token_map = _extract_source_format_map(text_runs, para_style_italic)
-    combined = combined_with_src_tokens.strip()
 
-    # Proteksi 2: kamus istilah asing dari spreadsheet ("Kamus Istilah Asing")
-    if tr.italic_dict and len(tr.italic_dict) > 0:
-        combined, dict_italic_map = tr.italic_dict._apply_pre(combined)
+    # Paragraf yang memiliki superscript/subscript (pangkat/indeks) atau
+    # istilah/judul miring-sumber (mis. CATATAN/NOTE berisi notasi teknis
+    # seperti "kWm⁻²" atau "0,7 m²") memakai jalur PER-SEGMEN: bagian
+    # terproteksi tidak pernah dikirim ke layanan terjemahan sama sekali,
+    # jauh lebih tahan gagal dibanding menyisipkan token proteksi ke dalam
+    # satu string besar. Lihat _translate_paragraph_segments untuk detail.
+    preview_segments = _segment_runs_by_format(text_runs, para_style_italic)
+    has_protected_segment = any(
+        _is_protected_segment(t, i, v) for t, i, v in preview_segments
+    )
+
+    if has_protected_segment:
+        segmented = _translate_paragraph_segments(text_runs, tr, para_style_italic)
+        time.sleep(_TRANSLATE_DELAY)
+        if segmented is None:
+            return []
+        translated, format_spans, italic_terms_found = segmented
+        if not translated or translated == original_for_case:
+            return []
+        translated = _match_capitalization(original_for_case, translated)
     else:
-        dict_italic_map = {}
+        # Proteksi 1 (jalur lama): istilah/judul asing yang SUDAH miring di
+        # dokumen sumber (mis. judul standar acuan pada klausul "Acuan
+        # normatif") — tidak diterjemahkan, formatnya dikembalikan persis
+        # seperti sumber setelah proses terjemahan selesai.
+        combined_with_src_tokens, format_token_map = _extract_source_format_map(text_runs, para_style_italic)
+        combined = combined_with_src_tokens.strip()
 
-    # Terjemahkan (token @@SRC_...@@ dari proteksi superscript/subscript
-    # ikut terkirim dan diharapkan lolos utuh dari mesin terjemahan, sama
-    # seperti token proteksi miring lain yang sudah terbukti aman).
-    translated, italic_terms_found = tr.translate_one(combined, dict_italic_map)
-    time.sleep(_TRANSLATE_DELAY)
-    if not translated or translated == combined: return []
-    translated = _match_capitalization(original_for_case, translated)
+        # Proteksi 2: kamus istilah asing dari spreadsheet ("Kamus Istilah Asing")
+        if tr.italic_dict and len(tr.italic_dict) > 0:
+            combined, dict_italic_map = tr.italic_dict._apply_pre(combined)
+        else:
+            dict_italic_map = {}
 
-    # Kembalikan token superscript/subscript/miring-sumber menjadi teks asli,
-    # sekaligus dapatkan posisi presisi untuk membangun ulang run.
-    translated, format_spans = _detokenize_with_formatting(translated, format_token_map)
+        translated, italic_terms_found = tr.translate_one(combined, dict_italic_map)
+        time.sleep(_TRANSLATE_DELAY)
+        if not translated or translated == combined: return []
+        translated = _match_capitalization(original_for_case, translated)
+
+        # Kembalikan token miring-sumber menjadi teks asli, sekaligus
+        # dapatkan posisi presisi untuk membangun ulang run.
+        translated, format_spans = _detokenize_with_formatting(translated, format_token_map)
 
     # Apply formatting ke teks normal
     if italic_terms_found or format_spans:
