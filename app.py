@@ -29,16 +29,48 @@ _TEMP_PATTERNS = ["temp_main_*", "converted_*", "engine1_*", "engine2_*", "engin
 _MAX_AGE_MINUTES = 30
 
 # Satu proses konversi untuk seluruh instance aplikasi pada satu filesystem.
-# Lock memakai lease/heartbeat: selama pipeline benar-benar hidup, heartbeat
-# diperbarui. Jika worker mati/terputus, lock yatim otomatis kedaluwarsa.
+# Lock mengikuti SESSION BROWSER Streamlit. Jika tab/browser pemilik ditutup,
+# lock dilepas otomatis setelah grace period singkat.
 _APP_LOCK_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.rsni_process.lock')
-_APP_LOCK_STALE_SECONDS = 2 * 60          # lock yatim dibersihkan setelah 2 menit
-_APP_LOCK_HEARTBEAT_SECONDS = 20          # heartbeat setiap 20 detik
+_APP_LOCK_STALE_SECONDS = 15
+_APP_LOCK_HEARTBEAT_SECONDS = 2
+_APP_BROWSER_DISCONNECT_GRACE = 6
 _BUSY_MESSAGE = 'Aplikasi sedang digunakan oleh user lain.\n\nMohon menunggu beberapa saat lagi.'
 
-# Event heartbeat per owner. Thread daemon berhenti sendiri bila lock dilepas/berubah.
 _APP_HEARTBEAT_EVENTS = {}
 _APP_HEARTBEAT_GUARD = threading.Lock()
+
+def _current_streamlit_session_id() -> str:
+    try:
+        try:
+            from streamlit.runtime.scriptrunner import get_script_run_ctx
+        except ImportError:
+            from streamlit.runtime.scriptrunner_utils.script_run_context import get_script_run_ctx
+        ctx = get_script_run_ctx()
+        return str(getattr(ctx, 'session_id', '') or '')
+    except Exception:
+        return ''
+
+def _is_streamlit_session_active(streamlit_session_id: str) -> bool:
+    sid = str(streamlit_session_id or '')
+    if not sid:
+        return True
+    try:
+        try:
+            from streamlit.runtime import get_instance
+            runtime = get_instance()
+        except (ImportError, AttributeError):
+            from streamlit.runtime.runtime import Runtime
+            runtime = Runtime.instance()
+        checker = getattr(runtime, 'is_active_session', None)
+        if callable(checker):
+            try:
+                return bool(checker(session_id=sid))
+            except TypeError:
+                return bool(checker(sid))
+    except Exception:
+        pass
+    return True
 
 def _read_app_lock():
     try:
@@ -47,11 +79,11 @@ def _read_app_lock():
     except Exception:
         return {}
 
-def _write_lock_payload(owner_sid: str, created_at=None) -> None:
-    """Tulis payload lock secara atomik tanpa mengubah owner."""
+def _write_lock_payload(owner_sid: str, streamlit_session_id: str = '', created_at=None) -> None:
     now = time.time()
     payload = {
         'owner': str(owner_sid or ''),
+        'streamlit_session_id': str(streamlit_session_id or ''),
         'created_at': float(created_at or now),
         'heartbeat_at': now,
     }
@@ -65,24 +97,48 @@ def _write_lock_payload(owner_sid: str, created_at=None) -> None:
             pass
     os.replace(tmp, _APP_LOCK_FILE)
 
-def _touch_app_lock(owner_sid: str) -> bool:
-    """Perbarui heartbeat hanya jika lock masih dimiliki owner ini."""
+def _touch_app_lock(owner_sid: str, streamlit_session_id: str = '') -> bool:
     owner_sid = str(owner_sid or '')
     try:
         info = _read_app_lock()
         if info.get('owner') != owner_sid:
             return False
-        _write_lock_payload(owner_sid, info.get('created_at') or time.time())
+        session_id = str(streamlit_session_id or '') or str(info.get('streamlit_session_id') or '')
+        _write_lock_payload(owner_sid, session_id, info.get('created_at') or time.time())
         return True
     except Exception:
         return False
 
-def _heartbeat_loop(owner_sid: str, stop_event: threading.Event) -> None:
-    while not stop_event.wait(_APP_LOCK_HEARTBEAT_SECONDS):
-        if not _touch_app_lock(owner_sid):
-            break
+def _remove_lock_if_owned(owner_sid: str) -> None:
+    try:
+        info = _read_app_lock()
+        if info.get('owner') == str(owner_sid or ''):
+            os.remove(_APP_LOCK_FILE)
+    except FileNotFoundError:
+        pass
+    except Exception:
+        pass
 
-def _start_app_lock_heartbeat(owner_sid: str) -> None:
+def _heartbeat_loop(owner_sid: str, streamlit_session_id: str, stop_event: threading.Event) -> None:
+    disconnected_since = None
+    while not stop_event.wait(_APP_LOCK_HEARTBEAT_SECONDS):
+        if _is_streamlit_session_active(streamlit_session_id):
+            disconnected_since = None
+            if not _touch_app_lock(owner_sid, streamlit_session_id):
+                break
+            continue
+        if disconnected_since is None:
+            disconnected_since = time.time()
+            continue
+        if time.time() - disconnected_since >= _APP_BROWSER_DISCONNECT_GRACE:
+            _remove_lock_if_owned(owner_sid)
+            break
+    with _APP_HEARTBEAT_GUARD:
+        current = _APP_HEARTBEAT_EVENTS.get(str(owner_sid or ''))
+        if current is stop_event:
+            _APP_HEARTBEAT_EVENTS.pop(str(owner_sid or ''), None)
+
+def _start_app_lock_heartbeat(owner_sid: str, streamlit_session_id: str) -> None:
     owner_sid = str(owner_sid or '')
     with _APP_HEARTBEAT_GUARD:
         old = _APP_HEARTBEAT_EVENTS.get(owner_sid)
@@ -91,8 +147,10 @@ def _start_app_lock_heartbeat(owner_sid: str) -> None:
         ev = threading.Event()
         _APP_HEARTBEAT_EVENTS[owner_sid] = ev
         threading.Thread(
-            target=_heartbeat_loop, args=(owner_sid, ev), daemon=True,
-            name=f'rsni-lock-{owner_sid}'
+            target=_heartbeat_loop,
+            args=(owner_sid, str(streamlit_session_id or ''), ev),
+            daemon=True,
+            name=f'rsni-lock-{owner_sid}',
         ).start()
 
 def _stop_app_lock_heartbeat(owner_sid: str) -> None:
@@ -103,37 +161,53 @@ def _stop_app_lock_heartbeat(owner_sid: str) -> None:
         ev.set()
 
 def _acquire_app_lock(owner_sid: str) -> bool:
-    """Ambil lock lintas-session; lock hidup selama heartbeat aktif."""
     owner_sid = str(owner_sid or '')
+    browser_sid = _current_streamlit_session_id()
     for _ in range(3):
         try:
             fd = os.open(_APP_LOCK_FILE, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
             try:
                 now = time.time()
                 payload = json.dumps({
-                    'owner': owner_sid, 'created_at': now, 'heartbeat_at': now
+                    'owner': owner_sid,
+                    'streamlit_session_id': browser_sid,
+                    'created_at': now,
+                    'heartbeat_at': now,
                 })
                 os.write(fd, payload.encode('utf-8'))
             finally:
                 os.close(fd)
-            _start_app_lock_heartbeat(owner_sid)
+            _start_app_lock_heartbeat(owner_sid, browser_sid)
             return True
         except FileExistsError:
             info = _read_app_lock()
             if info.get('owner') == owner_sid:
-                _touch_app_lock(owner_sid)
-                _start_app_lock_heartbeat(owner_sid)
+                stored_browser_sid = str(info.get('streamlit_session_id') or browser_sid)
+                _touch_app_lock(owner_sid, stored_browser_sid)
+                _start_app_lock_heartbeat(owner_sid, stored_browser_sid)
                 return True
+
+            old_browser_sid = str(info.get('streamlit_session_id') or '')
             try:
-                last_alive = float(
-                    info.get('heartbeat_at') or info.get('created_at') or 0
-                )
-                age = time.time() - last_alive
+                last_alive = float(info.get('heartbeat_at') or info.get('created_at') or 0)
             except Exception:
-                age = _APP_LOCK_STALE_SECONDS + 1
+                last_alive = 0
+            age = time.time() - last_alive
+
+            # Browser pemilik lama sudah ditutup: bersihkan lock segera setelah grace.
+            if old_browser_sid and not _is_streamlit_session_active(old_browser_sid):
+                if age > _APP_BROWSER_DISCONNECT_GRACE:
+                    try:
+                        os.remove(_APP_LOCK_FILE)
+                    except FileNotFoundError:
+                        pass
+                    except Exception:
+                        return False
+                    continue
+
             if age <= _APP_LOCK_STALE_SECONDS:
                 return False
-            # Lock yatim: owner lama tidak memberi heartbeat selama > 2 menit.
+
             try:
                 os.remove(_APP_LOCK_FILE)
             except FileNotFoundError:
@@ -143,28 +217,31 @@ def _acquire_app_lock(owner_sid: str) -> bool:
     return False
 
 def _release_app_lock(owner_sid: str) -> None:
-    """Lepas lock segera saat proses selesai/error, hanya oleh pemiliknya."""
     owner_sid = str(owner_sid or '')
     _stop_app_lock_heartbeat(owner_sid)
-    try:
-        info = _read_app_lock()
-        if info.get('owner') == owner_sid:
-            os.remove(_APP_LOCK_FILE)
-    except FileNotFoundError:
-        pass
-    except Exception:
-        pass
+    _remove_lock_if_owned(owner_sid)
 
 def _show_busy_popup() -> None:
-    """Modal native Streamlit yang tampil tepat di tengah halaman."""
-    @st.dialog('Aplikasi Sedang Digunakan', width='small')
+    @st.dialog('WARNING!!!', width='small')
     def _busy_dialog():
+        st.markdown(
+            """
+            <style>
+            div[data-testid="stDialog"] div[role="dialog"] h2 {
+                width: 100% !important;
+                text-align: center !important;
+                font-weight: 800 !important;
+            }
+            </style>
+            """,
+            unsafe_allow_html=True,
+        )
         st.markdown(
             '<div style="text-align:center;padding:0.35rem 0 0.8rem;">'
             '<div style="font-size:2rem;margin-bottom:0.55rem;">⏳</div>'
-            '<div style="font-weight:650;">Aplikasi sedang digunakan oleh user lain.</div>'
+            '<div style="font-weight:700;">Aplikasi sedang digunakan oleh user lain.</div>'
             '<div style="height:1rem;"></div>'
-            '<div>Mohon menunggu beberapa saat lagi.</div>'
+            '<div style="font-weight:700;">Mohon menunggu beberapa saat lagi.</div>'
             '</div>',
             unsafe_allow_html=True,
         )
@@ -208,6 +285,7 @@ def _remember_engine_output(engine_no: int, path: str) -> None:
 
 def _reset_to_start() -> None:
     """Kembali ke form awal tanpa menghapus cache global aplikasi."""
+    _release_app_lock(st.session_state.get('_sid', ''))
     for key in (
         '_run_process', '_show_results', '_process_error', '_resume_engine',
         '_last_engine', '_last_output', '_target_file', '_final_opt_file',
