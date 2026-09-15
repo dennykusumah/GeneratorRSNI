@@ -14,6 +14,7 @@ Aturan:
   Tabel "Susunan keanggotaan" : 3 kolom, tanpa border, persis dokumen.
 """
 
+from pipeline_utils import validate_docx, atomic_save_docx
 import os
 import re
 import shutil
