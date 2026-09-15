@@ -1599,6 +1599,96 @@ div[class*="st-key-upl_main"] + div[data-testid="stElementContainer"] {
     padding-top: 0 !important;
 }
 
+
+/* =====================================================================
+   FINAL V3 — uploaded/empty state memiliki tinggi yang SAMA
+   ===================================================================== */
+
+/* Outer dropzone tetap setinggi state sebelum upload. */
+div[class*="st-key-upl_main"] [data-testid="stFileUploaderDropzone"] {
+    min-height: 86px !important;
+    height: 86px !important;
+    box-sizing: border-box !important;
+}
+
+/* Setelah file ada, file card tetap berada di tengah dropzone 86px.
+   Jangan biarkan DOM Streamlit mengecilkan tinggi uploader. */
+div[class*="st-key-upl_main"] [data-testid="stFileUploader"] {
+    min-height: 86px !important;
+    height: 86px !important;
+    margin: 0 !important;
+    padding: 0 !important;
+    box-sizing: border-box !important;
+}
+div[class*="st-key-upl_main"] [data-testid="stFileUploader"] > section {
+    min-height: 86px !important;
+    height: 86px !important;
+    margin: 0 !important;
+    box-sizing: border-box !important;
+}
+
+/* File card (putih) tidak mengubah tinggi parent. */
+div[class*="st-key-upl_main"] [data-testid="stFileUploaderFile"] {
+    margin-top: 17px !important;
+    margin-bottom: 17px !important;
+}
+
+/* Hapus hack margin negatif lama: spacing ke Pengaturan kini berasal dari
+   tinggi uploader yang benar-benar konstan, bukan kompensasi state. */
+div[class*="st-key-upl_main"] {
+    margin-bottom: 0 !important;
+    padding-bottom: 0 !important;
+    min-height: 86px !important;
+}
+
+/* Metadata diturunkan sedikit lagi dibanding V2 (-39px -> -36px),
+   tetapi tetap overlay sehingga tidak memengaruhi layout. */
+.uploaded-file-inline-meta {
+    position: relative !important;
+    z-index: 50 !important;
+    height: 0 !important;
+    min-height: 0 !important;
+    max-height: 0 !important;
+    margin: 0 0 0 66px !important;
+    padding: 0 !important;
+    width: 120px !important;
+    overflow: visible !important;
+    pointer-events: none !important;
+    transform: translateY(-36px) !important;
+    display: flex !important;
+    flex-direction: column !important;
+    align-items: flex-start !important;
+    justify-content: center !important;
+    gap: 1px !important;
+}
+.uploaded-file-inline-meta .uf-name {
+    margin: 0 !important;
+    padding: 0 !important;
+    line-height: 14px !important;
+}
+.uploaded-file-inline-meta .uf-size {
+    margin: 0 !important;
+    padding: 0 !important;
+    line-height: 12px !important;
+}
+
+/* Markdown metadata benar-benar tidak mengambil ruang. */
+div[data-testid="stMarkdownContainer"]:has(.uploaded-file-inline-meta),
+div[data-testid="stElementContainer"]:has(.uploaded-file-inline-meta) {
+    height: 0 !important;
+    min-height: 0 !important;
+    max-height: 0 !important;
+    margin: 0 !important;
+    padding: 0 !important;
+    overflow: visible !important;
+}
+
+
+/* FINAL MICRO-ADJUSTMENT — turunkan nama file + ukuran 3px */
+.uploaded-file-inline-meta {
+    transform: translateY(-33px) !important;
+}
+
 </style>
 """, unsafe_allow_html=True)
 
