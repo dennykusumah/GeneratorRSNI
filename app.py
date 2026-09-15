@@ -833,8 +833,6 @@ div[data-testid="stFileUploader"] [data-testid*="FileName"],
 div[data-testid="stFileUploader"] [data-testid*="FileName"] *,
 div[data-testid="stFileUploader"] div[data-testid="stFileUploaderFile"] p {
     font-weight: 600 !important;
-    line-height: 13px !important;
-    min-height: 13px !important;
     white-space: nowrap !important;
     overflow: hidden !important;
     text-overflow: ellipsis !important;
@@ -917,57 +915,43 @@ div[data-testid="stFileUploader"] div[data-testid="stFileUploaderFile"] button >
     position: relative !important;
     z-index: 20 !important;
     height: 0 !important;
-    min-height: 0 !important;
     overflow: visible !important;
     pointer-events: none !important;
-    margin: 0 0 0 66px !important;
+    margin: 0 !important;
     padding: 0 !important;
     background: transparent !important;
     border: 0 !important;
     box-shadow: none !important;
-    transform: none !important;
-    width: 120px !important;
+    /* Naik tepat ke baris file uploader. */
+    transform: translate(66px, -37px) !important;
+    width: 138px !important;
     display: flex !important;
     flex-direction: column !important;
     align-items: flex-start !important;
     justify-content: center !important;
-    gap: 1px !important;
     line-height: 1.05 !important;
 }
 .uploaded-file-inline-meta .uf-name {
     display: block !important;
-    width: 120px !important;
-    max-width: 120px !important;
-    color: #000000 !important;
-    -webkit-text-fill-color: #000000 !important;
+    width: 138px !important;
+    color: #111827 !important;
+    -webkit-text-fill-color: #111827 !important;
     font-family: 'Outfit', sans-serif !important;
     font-size: 0.78rem !important;
-    font-weight: 800 !important;
-    line-height: 15px !important;
-    min-height: 15px !important;
+    font-weight: 700 !important;
     overflow: hidden !important;
     text-overflow: ellipsis !important;
     white-space: nowrap !important;
 }
 .uploaded-file-inline-meta .uf-size {
     display: block !important;
-    margin-top: 1px !important;
-    color: #374151 !important;
+    margin-top: 3px !important;
+    color: #4b5563 !important;
     -webkit-text-fill-color: #4b5563 !important;
     font-family: 'Outfit', sans-serif !important;
     font-size: 0.67rem !important;
     font-weight: 600 !important;
     white-space: nowrap !important;
-}
-
-/* Nama file FINAL: override aturan global .stApp span agar tidak kembali putih/transparan. */
-div[data-testid="stMarkdownContainer"] .uploaded-file-inline-meta .uf-name,
-.stApp .uploaded-file-inline-meta .uf-name {
-    color: #000000 !important;
-    -webkit-text-fill-color: #000000 !important;
-    opacity: 1 !important;
-    visibility: visible !important;
-    text-shadow: none !important;
 }
 
 /* X FINAL: jangan gunakan SVG bawaan karena pada sebagian versi Streamlit
@@ -1423,292 +1407,6 @@ p, li, span, div { color: inherit; }
     transition: all 0.2s ease !important;
     width: 100% !important;
 }
-
-
-/* === FINAL CENTERED FILE METADATA OVERRIDE ===
-   Center filename + size vertically inside the same white card, while reserving
-   safe space for the file icon on the left and round X on the right. */
-.uploaded-file-inline-meta {
-    position: relative !important;
-    z-index: 30 !important;
-    height: 0 !important;
-    overflow: visible !important;
-    pointer-events: none !important;
-    margin: 0 !important;
-    padding: 0 !important;
-    background: transparent !important;
-    border: 0 !important;
-    box-shadow: none !important;
-    transform: translate(66px, -42px) !important;
-    width: 142px !important;
-    display: flex !important;
-    flex-direction: column !important;
-    align-items: flex-start !important;
-    justify-content: center !important;
-    gap: 2px !important;
-    line-height: 1.05 !important;
-}
-.uploaded-file-inline-meta .uf-name {
-    display: block !important;
-    width: 142px !important;
-    max-width: 142px !important;
-    margin: 0 !important;
-    padding: 0 !important;
-    color: #000000 !important;
-    -webkit-text-fill-color: #000000 !important;
-    font-size: 0.78rem !important;
-    font-weight: 800 !important;
-    line-height: 1.08 !important;
-    white-space: nowrap !important;
-    overflow: hidden !important;
-    text-overflow: ellipsis !important;
-}
-.uploaded-file-inline-meta .uf-size {
-    display: block !important;
-    margin: 2px 0 0 0 !important;
-    padding: 0 !important;
-    color: #4b5563 !important;
-    -webkit-text-fill-color: #4b5563 !important;
-    font-size: 0.67rem !important;
-    font-weight: 600 !important;
-    line-height: 1.05 !important;
-    white-space: nowrap !important;
-}
-
-/* === FINAL FIX: posisi metadata + jarak uploader/Pengaturan stabil === */
-.uploaded-file-inline-meta {
-    position: relative !important;
-    z-index: 30 !important;
-    height: 0 !important;
-    min-height: 0 !important;
-    margin: 0 0 0 66px !important;
-    padding: 0 !important;
-    transform: translateY(-47px) !important;
-    width: 120px !important;
-    overflow: visible !important;
-    pointer-events: none !important;
-    display: flex !important;
-    flex-direction: column !important;
-    align-items: flex-start !important;
-    justify-content: center !important;
-    gap: 0 !important;
-}
-.uploaded-file-inline-meta .uf-name {
-    margin: 0 !important;
-    padding: 0 !important;
-    line-height: 14px !important;
-    min-height: 14px !important;
-}
-.uploaded-file-inline-meta .uf-size {
-    margin: 1px 0 0 0 !important;
-    padding: 0 !important;
-    line-height: 11px !important;
-}
-
-/* Metadata overlay tidak boleh mengubah tinggi widget uploader. */
-div[data-testid="stMarkdownContainer"]:has(.uploaded-file-inline-meta),
-div[data-testid="stElementContainer"]:has(.uploaded-file-inline-meta) {
-    height: 0 !important;
-    min-height: 0 !important;
-    margin: 0 !important;
-    padding: 0 !important;
-    overflow: visible !important;
-}
-
-/* Jarak Upload -> Pengaturan dibuat konstan pada state kosong maupun terisi. */
-div[class*="st-key-upl_main"] {
-    margin-bottom: -1.05rem !important;
-    padding-bottom: 0 !important;
-}
-
-
-/* =====================================================================
-   FINAL V2 — metadata benar-benar di tengah kartu + spacing upload stabil
-   ===================================================================== */
-
-/* Nama + ukuran file adalah overlay, jadi TIDAK boleh menambah tinggi layout. */
-.uploaded-file-inline-meta {
-    position: relative !important;
-    z-index: 50 !important;
-    height: 0 !important;
-    min-height: 0 !important;
-    max-height: 0 !important;
-    margin: 0 0 0 66px !important;
-    padding: 0 !important;
-    width: 120px !important;
-    overflow: visible !important;
-    pointer-events: none !important;
-
-    /* Turunkan dari revisi sebelumnya (-47px) supaya dua baris tepat
-       di tengah vertikal kartu putih. */
-    transform: translateY(-39px) !important;
-
-    display: flex !important;
-    flex-direction: column !important;
-    align-items: flex-start !important;
-    justify-content: center !important;
-    gap: 1px !important;
-}
-
-.uploaded-file-inline-meta .uf-name {
-    margin: 0 !important;
-    padding: 0 !important;
-    line-height: 14px !important;
-    min-height: 14px !important;
-}
-.uploaded-file-inline-meta .uf-size {
-    margin: 0 !important;
-    padding: 0 !important;
-    line-height: 12px !important;
-    min-height: 12px !important;
-}
-
-/* Container markdown overlay juga wajib 0 tinggi. */
-div[data-testid="stMarkdownContainer"]:has(.uploaded-file-inline-meta),
-div[data-testid="stElementContainer"]:has(.uploaded-file-inline-meta) {
-    height: 0 !important;
-    min-height: 0 !important;
-    max-height: 0 !important;
-    margin: 0 !important;
-    padding: 0 !important;
-    overflow: visible !important;
-}
-
-/* KUNCI tinggi/spacing area uploader.
-   File list bawaan Streamlit tidak boleh menambah margin bawah. */
-div[class*="st-key-upl_main"] {
-    margin-bottom: -1.05rem !important;
-    padding-bottom: 0 !important;
-}
-
-div[class*="st-key-upl_main"] div[data-testid="stFileUploader"],
-div[class*="st-key-upl_main"] div[data-testid="stFileUploader"] > section {
-    margin-bottom: 0 !important;
-    padding-bottom: 0 !important;
-}
-
-/* Hilangkan tambahan vertical gap yang muncul hanya setelah file ter-upload. */
-div[class*="st-key-upl_main"] div[data-testid="stFileUploader"] > div:not(:first-child),
-div[class*="st-key-upl_main"] div[data-testid="stFileUploaderFile"] {
-    margin-bottom: 0 !important;
-}
-
-/* Elemen sesudah uploader tidak boleh terdorong oleh state file. */
-div[class*="st-key-upl_main"] + div[data-testid="stElementContainer"] {
-    margin-top: 0 !important;
-    padding-top: 0 !important;
-}
-
-
-/* =====================================================================
-   FINAL V3 — uploaded/empty state memiliki tinggi yang SAMA
-   ===================================================================== */
-
-/* Outer dropzone tetap setinggi state sebelum upload. */
-div[class*="st-key-upl_main"] [data-testid="stFileUploaderDropzone"] {
-    min-height: 86px !important;
-    height: 86px !important;
-    box-sizing: border-box !important;
-}
-
-/* Setelah file ada, file card tetap berada di tengah dropzone 86px.
-   Jangan biarkan DOM Streamlit mengecilkan tinggi uploader. */
-div[class*="st-key-upl_main"] [data-testid="stFileUploader"] {
-    min-height: 86px !important;
-    height: 86px !important;
-    margin: 0 !important;
-    padding: 0 !important;
-    box-sizing: border-box !important;
-}
-div[class*="st-key-upl_main"] [data-testid="stFileUploader"] > section {
-    min-height: 86px !important;
-    height: 86px !important;
-    margin: 0 !important;
-    box-sizing: border-box !important;
-}
-
-/* File card (putih) tidak mengubah tinggi parent. */
-div[class*="st-key-upl_main"] [data-testid="stFileUploaderFile"] {
-    margin-top: 17px !important;
-    margin-bottom: 17px !important;
-}
-
-/* Hapus hack margin negatif lama: spacing ke Pengaturan kini berasal dari
-   tinggi uploader yang benar-benar konstan, bukan kompensasi state. */
-div[class*="st-key-upl_main"] {
-    margin-bottom: 0 !important;
-    padding-bottom: 0 !important;
-    min-height: 86px !important;
-}
-
-/* Metadata diturunkan sedikit lagi dibanding V2 (-39px -> -36px),
-   tetapi tetap overlay sehingga tidak memengaruhi layout. */
-.uploaded-file-inline-meta {
-    position: relative !important;
-    z-index: 50 !important;
-    height: 0 !important;
-    min-height: 0 !important;
-    max-height: 0 !important;
-    margin: 0 0 0 66px !important;
-    padding: 0 !important;
-    width: 120px !important;
-    overflow: visible !important;
-    pointer-events: none !important;
-    transform: translateY(-36px) !important;
-    display: flex !important;
-    flex-direction: column !important;
-    align-items: flex-start !important;
-    justify-content: center !important;
-    gap: 1px !important;
-}
-.uploaded-file-inline-meta .uf-name {
-    margin: 0 !important;
-    padding: 0 !important;
-    line-height: 14px !important;
-}
-.uploaded-file-inline-meta .uf-size {
-    margin: 0 !important;
-    padding: 0 !important;
-    line-height: 12px !important;
-}
-
-/* Markdown metadata benar-benar tidak mengambil ruang. */
-div[data-testid="stMarkdownContainer"]:has(.uploaded-file-inline-meta),
-div[data-testid="stElementContainer"]:has(.uploaded-file-inline-meta) {
-    height: 0 !important;
-    min-height: 0 !important;
-    max-height: 0 !important;
-    margin: 0 !important;
-    padding: 0 !important;
-    overflow: visible !important;
-}
-
-
-/* FINAL MICRO-ADJUSTMENT — turunkan nama file + ukuran 3px */
-.uploaded-file-inline-meta {
-    transform: translateY(-33px) !important;
-}
-
-
-/* FINAL — pusatkan vertikal teks 200MB per file • DOC, DOCX */
-div[class*="st-key-upl_main"] [data-testid="stFileUploaderDropzoneInstructions"] {
-    display: flex !important;
-    flex-direction: column !important;
-    justify-content: center !important;
-    align-self: center !important;
-    height: 100% !important;
-    min-height: 52px !important;
-    margin: 0 !important;
-    padding: 0 !important;
-}
-div[class*="st-key-upl_main"] [data-testid="stFileUploaderDropzoneInstructions"] small {
-    margin: 0 !important;
-    padding: 0 !important;
-    line-height: 1.2 !important;
-    display: flex !important;
-    align-items: center !important;
-}
-
 </style>
 """, unsafe_allow_html=True)
 
