@@ -1474,31 +1474,6 @@ p, li, span, div { color: inherit; }
     line-height: 1.05 !important;
     white-space: nowrap !important;
 }
-
-/* === FINAL VERTICAL CENTERING OF UPLOADED FILE METADATA ===
-   Angkat grup nama+ukuran sebagai satu unit agar pusat vertikalnya tepat di kartu. */
-.uploaded-file-inline-meta {
-    transform: translate(66px, -43px) !important;
-    height: 0 !important;
-    width: 138px !important;
-    display: flex !important;
-    flex-direction: column !important;
-    align-items: flex-start !important;
-    justify-content: center !important;
-    gap: 0 !important;
-    line-height: 1 !important;
-}
-.uploaded-file-inline-meta .uf-name {
-    margin: 0 !important;
-    padding: 0 !important;
-    line-height: 1.05 !important;
-}
-.uploaded-file-inline-meta .uf-size {
-    margin: 2px 0 0 0 !important;
-    padding: 0 !important;
-    line-height: 1 !important;
-}
-
 </style>
 """, unsafe_allow_html=True)
 
