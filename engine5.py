@@ -8,6 +8,8 @@ Content tepat sebelum Bibliography. Bibliography boleh berada di section layout
 
 from __future__ import annotations
 
+from pipeline_utils import validate_docx, atomic_save_docx
+
 import os
 import re
 from copy import deepcopy
@@ -184,7 +186,7 @@ class IntroductionContentDuplicatorEngine:
 
             if self._already_processed(doc):
                 self._force_content_decimal(doc)
-                doc.save(output_docx)
+                atomic_save_docx(doc, output_docx)
                 return True, output_docx
 
             body = doc.element.body
@@ -257,8 +259,7 @@ class IntroductionContentDuplicatorEngine:
             self._force_content_decimal(doc)
             out_dir = os.path.dirname(os.path.abspath(output_docx))
             os.makedirs(out_dir, exist_ok=True)
-            doc.save(output_docx)
-
+            atomic_save_docx(doc, output_docx)
             check = Document(output_docx)
             if len(check.sections) != expected_section_count:
                 raise RuntimeError("Engine 5 mengubah jumlah section dokumen.")
