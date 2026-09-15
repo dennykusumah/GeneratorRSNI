@@ -1827,7 +1827,7 @@ class DocxFinalTranslatorEngine:
         return self.italic_dict
 
     def translate(self, input_docx: str, output_docx: str, progress_callback=None, 
-                  translate_headers: bool = False) -> tuple[bool, str]:
+                  translate_headers: bool = False, worker_count: int = 2) -> tuple[bool, str]:
         try:
             # app.py membuat engine tanpa parameter kamus. Karena itu Engine 8
             # wajib mengambil kedua spreadsheet sendiri pada setiap proses,
@@ -1913,8 +1913,13 @@ class DocxFinalTranslatorEngine:
                 found = _translate_para(para, worker_tr)
                 return index, para, found, bool(worker_tr.failed_texts)
 
-            # Tahap utama: tepat 4 worker translate.
-            with ThreadPoolExecutor(max_workers=4, thread_name_prefix='translate') as pool:
+            # Tahap utama: jumlah worker dipilih user dari UI (1--4).
+            try:
+                worker_count = int(worker_count)
+            except (TypeError, ValueError):
+                worker_count = 2
+            worker_count = max(1, min(worker_count, 4))
+            with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix='translate') as pool:
                 futures = [pool.submit(_translate_job, item)
                            for item in enumerate(translation_queue)]
                 for future in as_completed(futures):
@@ -1930,7 +1935,7 @@ class DocxFinalTranslatorEngine:
                     pct = 10 + int(done / max(total, 1) * 80)
                     _notify(
                         progress_callback, pct,
-                        f"[translate 4 worker] {done}/{total} | "
+                        f"[translate {worker_count} worker] {done}/{total} | "
                         f"berhasil={translated_count} | "
                         f"gagal={len(failed_paras)} | "
                         f"[progres-total] {done}/{total + len(failed_paras)}",
@@ -2037,12 +2042,14 @@ class SelectiveTranslationEngine(DocxFinalTranslatorEngine):
         output_docx: str,
         progress_callback=None,
         translate_headers: bool = False,
+        worker_count: int = 2,
     ) -> tuple[bool, str, str]:
         success, result = self.translate(
             input_docx=input_docx,
             output_docx=output_docx,
             progress_callback=progress_callback,
             translate_headers=translate_headers,
+            worker_count=worker_count,
         )
         if success:
             return True, result, "Penerjemahan selektif selesai."
