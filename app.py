@@ -1832,7 +1832,7 @@ def _render_header_with_live_kamus():
     _status_html = (
         f"""<div class="status-pill status-ready">
             <span class="status-dot"></span>
-            Sistem Siap &nbsp;
+            Ready &nbsp;
         </div>"""
         if _d is not None and len(_d) > 0 else
         """<div class="status-pill status-warn">
@@ -1843,7 +1843,7 @@ def _render_header_with_live_kamus():
 
     st.markdown(f"""
         <div class="app-header">
-            <div class="badge">Generator RSNI · Dashboard v9</div>
+            <div class="badge">Generator RSNI</div>
             <h1>📑 ISO to RSNI Converter</h1>
             <p>Memformat & Menerjemahan Dokumen Standar ISO Menjadi Draft RSNI Secara Otomatis</p>
             <div class="stats-row">
