@@ -32,9 +32,9 @@ _MAX_AGE_MINUTES = 30
 # Lock mengikuti SESSION BROWSER Streamlit. Jika tab/browser pemilik ditutup,
 # lock dilepas otomatis setelah grace period singkat.
 _APP_LOCK_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.rsni_process.lock')
-_APP_LOCK_STALE_SECONDS = 15
+_APP_LOCK_STALE_SECONDS = 10
 _APP_LOCK_HEARTBEAT_SECONDS = 2
-_APP_BROWSER_DISCONNECT_GRACE = 6
+_APP_BROWSER_DISCONNECT_GRACE = 3
 _BUSY_MESSAGE = 'Aplikasi sedang digunakan oleh user lain.\n\nMohon menunggu beberapa saat lagi.'
 
 _APP_HEARTBEAT_EVENTS = {}
