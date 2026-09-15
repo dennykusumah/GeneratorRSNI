@@ -833,6 +833,8 @@ div[data-testid="stFileUploader"] [data-testid*="FileName"],
 div[data-testid="stFileUploader"] [data-testid*="FileName"] *,
 div[data-testid="stFileUploader"] div[data-testid="stFileUploaderFile"] p {
     font-weight: 600 !important;
+    line-height: 13px !important;
+    min-height: 13px !important;
     white-space: nowrap !important;
     overflow: hidden !important;
     text-overflow: ellipsis !important;
@@ -914,33 +916,35 @@ div[data-testid="stFileUploader"] div[data-testid="stFileUploaderFile"] button >
 .uploaded-file-inline-meta {
     position: relative !important;
     z-index: 20 !important;
-    height: 0 !important;
+    height: 34px !important;
+    min-height: 34px !important;
     overflow: visible !important;
     pointer-events: none !important;
-    margin: 0 !important;
+    margin: -49px 0 15px 66px !important;
     padding: 0 !important;
     background: transparent !important;
     border: 0 !important;
     box-shadow: none !important;
-    /* Naik tepat ke baris file uploader. */
-    transform: translate(66px, -37px) !important;
-    width: 138px !important;
+    transform: none !important;
+    width: 120px !important;
     display: flex !important;
     flex-direction: column !important;
     align-items: flex-start !important;
     justify-content: center !important;
-    gap: 2px !important;
+    gap: 1px !important;
     line-height: 1.05 !important;
 }
 .uploaded-file-inline-meta .uf-name {
     display: block !important;
-    width: 138px !important;
-    max-width: 138px !important;
+    width: 120px !important;
+    max-width: 120px !important;
     color: #000000 !important;
     -webkit-text-fill-color: #000000 !important;
     font-family: 'Outfit', sans-serif !important;
     font-size: 0.78rem !important;
     font-weight: 800 !important;
+    line-height: 15px !important;
+    min-height: 15px !important;
     overflow: hidden !important;
     text-overflow: ellipsis !important;
     white-space: nowrap !important;
