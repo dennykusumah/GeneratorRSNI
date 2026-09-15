@@ -1193,9 +1193,9 @@ div[class~="st-key-speed_worker_row"] {
     /* Geser row tombol secara nyata ke atas. Margin saja tidak cukup karena
        Streamlit menambahkan gap pada parent vertical-block. */
     position: relative !important;
-    top: -2.30rem !important;
+    top: -2.70rem !important;
     margin-top: 0 !important;
-    margin-bottom: -2.30rem !important;
+    margin-bottom: -2.70rem !important;
     padding-top: 0 !important;
     padding-bottom: 0 !important;
 }
