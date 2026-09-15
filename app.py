@@ -916,11 +916,11 @@ div[data-testid="stFileUploader"] div[data-testid="stFileUploaderFile"] button >
 .uploaded-file-inline-meta {
     position: relative !important;
     z-index: 20 !important;
-    height: 34px !important;
-    min-height: 34px !important;
+    height: 0 !important;
+    min-height: 0 !important;
     overflow: visible !important;
     pointer-events: none !important;
-    margin: -49px 0 15px 66px !important;
+    margin: 0 0 0 66px !important;
     padding: 0 !important;
     background: transparent !important;
     border: 0 !important;
@@ -1474,6 +1474,53 @@ p, li, span, div { color: inherit; }
     line-height: 1.05 !important;
     white-space: nowrap !important;
 }
+
+/* === FINAL FIX: posisi metadata + jarak uploader/Pengaturan stabil === */
+.uploaded-file-inline-meta {
+    position: relative !important;
+    z-index: 30 !important;
+    height: 0 !important;
+    min-height: 0 !important;
+    margin: 0 0 0 66px !important;
+    padding: 0 !important;
+    transform: translateY(-47px) !important;
+    width: 120px !important;
+    overflow: visible !important;
+    pointer-events: none !important;
+    display: flex !important;
+    flex-direction: column !important;
+    align-items: flex-start !important;
+    justify-content: center !important;
+    gap: 0 !important;
+}
+.uploaded-file-inline-meta .uf-name {
+    margin: 0 !important;
+    padding: 0 !important;
+    line-height: 14px !important;
+    min-height: 14px !important;
+}
+.uploaded-file-inline-meta .uf-size {
+    margin: 1px 0 0 0 !important;
+    padding: 0 !important;
+    line-height: 11px !important;
+}
+
+/* Metadata overlay tidak boleh mengubah tinggi widget uploader. */
+div[data-testid="stMarkdownContainer"]:has(.uploaded-file-inline-meta),
+div[data-testid="stElementContainer"]:has(.uploaded-file-inline-meta) {
+    height: 0 !important;
+    min-height: 0 !important;
+    margin: 0 !important;
+    padding: 0 !important;
+    overflow: visible !important;
+}
+
+/* Jarak Upload -> Pengaturan dibuat konstan pada state kosong maupun terisi. */
+div[class*="st-key-upl_main"] {
+    margin-bottom: -1.05rem !important;
+    padding-bottom: 0 !important;
+}
+
 </style>
 """, unsafe_allow_html=True)
 
