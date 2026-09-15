@@ -7,6 +7,8 @@ Engine menerima keluaran Engine 3 dan mempertahankan susunan section:
 
 from __future__ import annotations
 
+from pipeline_utils import validate_docx, atomic_save_docx
+
 import os
 import re
 from datetime import datetime
@@ -289,7 +291,7 @@ class PrakataPendahuluanEngine:
 
             # Idempoten jika dokumen yang sama diproses ulang.
             if any(self._key(p.text) == "prakata" for p in doc.paragraphs):
-                doc.save(output_docx)
+                atomic_save_docx(doc, output_docx)
                 return True, output_docx
 
             detected_title = self._detect_content_title(doc)
@@ -317,8 +319,7 @@ class PrakataPendahuluanEngine:
 
             out_dir = os.path.dirname(os.path.abspath(output_docx))
             os.makedirs(out_dir, exist_ok=True)
-            doc.save(output_docx)
-
+            atomic_save_docx(doc, output_docx)
             check = Document(output_docx)
             if len(check.sections) != input_section_count:
                 raise RuntimeError("Penyisipan Prakata mengubah jumlah section.")
