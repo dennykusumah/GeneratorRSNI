@@ -555,7 +555,18 @@ div[data-testid="stFileUploaderFile"] {
 ══════════════════════════════════════════ */
 .speed-label {
     margin-top: 0.2rem !important;
-    margin-bottom: 0.25rem !important;
+    margin-bottom: 0 !important;
+}
+
+/* Samakan jarak label Kecepatan -> tombol dengan label No. SNI -> input.
+   Markdown label dan row st.columns adalah dua elemen terpisah, sehingga gap
+   bawaan vertical-block Streamlit perlu dikompensasi secara eksplisit. */
+div[data-testid="stMarkdownContainer"]:has(.speed-label) {
+    margin-bottom: 0 !important;
+    padding-bottom: 0 !important;
+}
+div[data-testid="stMarkdownContainer"]:has(.speed-label) p {
+    margin-bottom: 0 !important;
 }
 
 /* Streamlit memberi class st-key-<key> pada container widget. */
@@ -1173,17 +1184,28 @@ for _n in range(1, 5):
 st.markdown('<style>' + ''.join(_worker_css) + '</style>', unsafe_allow_html=True)
 
 # Empat kolom kecil di kiri + satu spacer fleksibel. Ukuran tombol dikunci 42x42 px via CSS.
-_worker_cols = st.columns([0.48, 0.48, 0.48, 0.48, 5.6], gap="small")[:4]
-for _worker_no, _worker_col in enumerate(_worker_cols, start=1):
-    with _worker_col:
-        if st.button(
-            str(_worker_no),
-            key=f'worker_{_worker_no}',
-            type='primary' if st.session_state['_engine8_workers'] == _worker_no else 'secondary',
-            use_container_width=False,
-        ):
-            st.session_state['_engine8_workers'] = _worker_no
-            st.rerun()
+# Container khusus memungkinkan gap vertikal dikontrol tanpa mengganggu widget lain.
+st.markdown("""
+<style>
+div.st-key-speed_worker_row,
+div[class~="st-key-speed_worker_row"] {
+    margin-top: -0.55rem !important;
+    padding-top: 0 !important;
+}
+</style>
+""", unsafe_allow_html=True)
+with st.container(key='speed_worker_row'):
+    _worker_cols = st.columns([0.48, 0.48, 0.48, 0.48, 5.6], gap="small")[:4]
+    for _worker_no, _worker_col in enumerate(_worker_cols, start=1):
+        with _worker_col:
+            if st.button(
+                str(_worker_no),
+                key=f'worker_{_worker_no}',
+                type='primary' if st.session_state['_engine8_workers'] == _worker_no else 'secondary',
+                use_container_width=False,
+            ):
+                st.session_state['_engine8_workers'] = _worker_no
+                st.rerun()
 
 # --- TOMBOL PROSES ---
 btn_process = st.button("🚀 Proses", key="btn_main", use_container_width=True)
