@@ -577,6 +577,58 @@ div[data-testid="stFileUploader"] div[data-testid="stFileUploaderFile"] button *
     -webkit-text-fill-color: initial !important;
 }
 
+/* ── FINAL UPLOADER OVERRIDE ───────────────────────────────────────────────
+   Kartu file tetap putih; nama + ukuran file dibuat gelap/kontras.
+   Tombol hapus tidak memiliki kotak/background/border, tetapi ikon X tetap ada. */
+div[data-testid="stFileUploader"] div[data-testid="stFileUploaderFile"] {
+    background: #ffffff !important;
+}
+
+div[data-testid="stFileUploader"] div[data-testid="stFileUploaderFile"] :is(p, span, small),
+div[data-testid="stFileUploader"] div[data-testid="stFileUploaderFile"] [data-testid*="FileName"],
+div[data-testid="stFileUploader"] div[data-testid="stFileUploaderFile"] [data-testid*="FileSize"],
+div[data-testid="stFileUploader"] div[data-testid="stFileUploaderFile"] [data-testid*="FileData"],
+div[data-testid="stFileUploader"] div[data-testid="stFileUploaderFile"] [class*="fileName"],
+div[data-testid="stFileUploader"] div[data-testid="stFileUploaderFile"] [class*="fileSize"],
+div[data-testid="stFileUploader"] div[data-testid="stFileUploaderFile"] [class*="fileData"] {
+    color: #111827 !important;
+    -webkit-text-fill-color: #111827 !important;
+    opacity: 1 !important;
+    visibility: visible !important;
+}
+
+/* Hilangkan kotak tombol delete. Selector sengaja diletakkan PALING AKHIR
+   setelah aturan umum uploader button agar menang pada cascade CSS. */
+div[data-testid="stFileUploader"] div[data-testid="stFileUploaderFile"] button,
+div[data-testid="stFileUploader"] div[data-testid="stFileUploaderFile"] button:hover,
+div[data-testid="stFileUploader"] div[data-testid="stFileUploaderFile"] button:focus,
+div[data-testid="stFileUploader"] div[data-testid="stFileUploaderFile"] button:active {
+    background: transparent !important;
+    background-color: transparent !important;
+    background-image: none !important;
+    border: 0 !important;
+    outline: 0 !important;
+    box-shadow: none !important;
+    border-radius: 0 !important;
+    padding: 0 !important;
+    min-width: auto !important;
+    width: auto !important;
+    height: auto !important;
+    transform: none !important;
+}
+
+/* Pertahankan X agar jelas di kartu putih. */
+div[data-testid="stFileUploader"] div[data-testid="stFileUploaderFile"] button svg {
+    color: #111827 !important;
+    stroke: #111827 !important;
+    fill: none !important;
+    opacity: 1 !important;
+}
+
+div[data-testid="stFileUploader"] div[data-testid="stFileUploaderFile"] button svg path {
+    stroke: #111827 !important;
+}
+
 /* ══════════════════════════════════════════
    INPUT FIELDS
 ══════════════════════════════════════════ */
