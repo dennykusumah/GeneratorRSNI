@@ -11,13 +11,9 @@ Fitur utama:
     1. KAMUS_SPREADSHEET_URL → untuk terjemahan istilah
     2. ITALIC_SPREADSHEET_URL → daftar kata yang TIDAK diterjemahkan, OUTPUT MIRING
   - Dual Title Sync, Note/Catatan, Annex fix, dll.
-  - Stabilitas tran1/tran2: 1 worker provider-safe, delay ringan, retry bertahap.
-  - Hybrid cache: RAM LRU (L1) + SQLite (L2).
 """
 
 import re
-import random
-import threading
 import copy
 import time
 import uuid
@@ -25,10 +21,6 @@ import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import csv
 import os
-import sqlite3
-import hashlib
-import json
-from collections import OrderedDict
 
 from docx import Document
 from docx.shared import Pt
@@ -72,7 +64,7 @@ _HEADING_STYLES_WITH_NUM = {
     'ANNEX', 'a2', 'a3',
     'Heading4', 'Heading5', 'Heading6',
 }
-_TRANSLATE_DELAY = 0.0
+_TRANSLATE_DELAY = 0.15
 _EM_DASH = '—'
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -530,36 +522,16 @@ def _run_vertalign(run) -> str | None:
     return None
 
 
-def _vertical_unicode(text: str, vtype: str) -> str | None:
-    """Representasikan pangkat/indeks dengan Unicode alami saat dikirim ke translator.
-
-    Ini jauh lebih stabil daripada token acak ZXQSRC... untuk satu/dua karakter
-    seperti −2 atau 2. Google Translate kadang mengubah/memisahkan token panjang,
-    lalu validasi Engine 8 menganggap seluruh paragraf gagal. Unicode superscript/
-    subscript biasanya dipertahankan verbatim oleh provider.
-    """
-    supers = str.maketrans({
-        '0':'⁰','1':'¹','2':'²','3':'³','4':'⁴','5':'⁵','6':'⁶','7':'⁷','8':'⁸','9':'⁹',
-        '+':'⁺','-':'⁻','−':'⁻','=':'⁼','(':'⁽',')':'⁾',
-    })
-    subs = str.maketrans({
-        '0':'₀','1':'₁','2':'₂','3':'₃','4':'₄','5':'₅','6':'₆','7':'₇','8':'₈','9':'₉',
-        '+':'₊','-':'₋','−':'₋','=':'₌','(':'₍',')':'₎',
-    })
-    table = supers if vtype == 'superscript' else subs
-    converted = text.translate(table)
-    # Hanya pakai cara ini bila seluruh karakter non-spasi memang berhasil
-    # direpresentasikan berbeda; selain itu kembali ke token proteksi lama.
-    return converted if converted != text else None
-
-
 def _extract_source_format_map(text_runs, para_style_italic: bool) -> tuple[str, dict]:
-    """Lindungi italic dan vertAlign tanpa membuat paragraf ilmiah mudah gagal.
-
-    Khusus superscript/subscript numerik (mis. kWm−2 dan m2), kirim sebagai
-    Unicode ⁻²/² ke translator. Setelah terjemahan, glyph itu dikembalikan ke
-    teks asli dan run diberi w:vertAlign lagi. Untuk format lain tetap gunakan
-    token ZXQSRC lama.
+    """
+    Versi gabungan dari _extract_source_italic_map yang JUGA melindungi
+    superscript/subscript. Menggabungkan run menjadi satu teks, tapi:
+      - Segmen superscript/subscript SELALU dilindungi token (berapa pun
+        panjangnya — bisa cuma 1 karakter seperti pangkat "2"), supaya
+        teks & formatnya persis sama setelah diterjemahkan.
+      - Segmen miring (tanpa superscript/subscript) tetap memakai aturan
+        lama (istilah/judul asing yang sudah miring di sumber).
+    token_map: token -> {'text': teks asli, 'italic': bool, 'vtype': str|None}
     """
     segments = []
     for _, r in text_runs:
@@ -579,21 +551,11 @@ def _extract_source_format_map(text_runs, para_style_italic: bool) -> tuple[str,
         if not stripped:
             out_parts.append(seg_text)
             continue
-
+        protect = False
         if vtype is not None:
-            marker = _vertical_unicode(seg_text, vtype)
-            if marker:
-                # Marker Unicode dapat berulang (⁻² muncul beberapa kali);
-                # format dan teks aslinya sama, sehingga aman memakai satu map.
-                token_map[marker] = {
-                    'text': seg_text, 'italic': is_ital, 'vtype': vtype
-                }
-                out_parts.append(marker)
-                continue
-
-        protect = bool(vtype is not None) or (
-            is_ital and len(stripped) >= 3 and not _RE_PURE_NUMBER.fullmatch(stripped)
-        )
+            protect = True
+        elif is_ital and len(stripped) >= 3 and not _RE_PURE_NUMBER.fullmatch(stripped):
+            protect = True
         if protect:
             token = f'ZXQSRC{uuid.uuid4().hex[:12].upper()}QXZ'
             token_map[token] = {'text': seg_text, 'italic': is_ital, 'vtype': vtype}
@@ -601,6 +563,7 @@ def _extract_source_format_map(text_runs, para_style_italic: bool) -> tuple[str,
         else:
             out_parts.append(seg_text)
     return ''.join(out_parts), token_map
+
 
 def _detokenize_with_formatting(text: str, token_map: dict) -> tuple[str, list]:
     """
@@ -1173,278 +1136,141 @@ _TITLE_SAFE_FALLBACKS = {
 class TranslationFailedError(RuntimeError):
     """Mencegah dokumen setengah diterjemahkan tetap disimpan."""
 
-# ─────────────────────────────────────────────────────────────────────────────
-# TRANSLATION CACHE
-# ─────────────────────────────────────────────────────────────────────────────
-_TRANSLATION_CACHE_PATH = os.getenv(
-    'TRANSLATION_CACHE_PATH',
-    os.path.join(os.path.dirname(os.path.abspath(__file__)), 'engine8_translation_cache.sqlite3'),
-)
-_CACHE_INIT_LOCK = threading.Lock()
-_CACHE_READY = False
-
-# L1 RAM cache: hasil terjemahan yang sering dipakai disimpan di memori proses.
-# SQLite tetap menjadi L2 cache. OrderedDict dipakai sebagai LRU sederhana agar
-# penggunaan RAM tidak tumbuh tanpa batas pada Streamlit Cloud.
-_RAM_CACHE_MAX = max(100, int(os.getenv('ENGINE8_RAM_CACHE_MAX', '5000')))
-_RAM_CACHE = OrderedDict()
-_RAM_CACHE_LOCK = threading.RLock()
-
-
-def _cache_init() -> None:
-    global _CACHE_READY
-    if _CACHE_READY:
-        return
-    with _CACHE_INIT_LOCK:
-        if _CACHE_READY:
-            return
-        try:
-            con = sqlite3.connect(_TRANSLATION_CACHE_PATH, timeout=10)
-            try:
-                con.execute('PRAGMA journal_mode=WAL')
-                con.execute('PRAGMA synchronous=NORMAL')
-                con.execute("""CREATE TABLE IF NOT EXISTS translation_cache (
-                    cache_key TEXT PRIMARY KEY,
-                    translated TEXT NOT NULL,
-                    italic_terms TEXT NOT NULL DEFAULT '[]',
-                    created_at INTEGER NOT NULL,
-                    hits INTEGER NOT NULL DEFAULT 0
-                )""")
-                con.commit()
-                _CACHE_READY = True
-            finally:
-                con.close()
-        except Exception:
-            _CACHE_READY = False
-
-
-def _dictionary_fingerprint(custom_dict) -> str:
-    if not custom_dict or not getattr(custom_dict, '_entries', None):
-        return '-'
-    pairs = sorted((k, v[1]) for k, v in custom_dict._entries.items())
-    raw = json.dumps(pairs, ensure_ascii=False, separators=(',', ':'))
-    return hashlib.sha256(raw.encode('utf-8')).hexdigest()[:16]
-
-
-def _canonicalize_source_tokens(text: str) -> tuple[str, list[str]]:
-    tokens = []
-    def repl(m):
-        tokens.append(m.group(0))
-        return f'ZXQCACHE{len(tokens)-1:04d}QXZ'
-    canonical = re.sub(r'ZXQSRC[A-F0-9]{12}QXZ', repl, text, flags=re.IGNORECASE)
-    return canonical, tokens
-
-
-def _restore_source_tokens(text: str, current_tokens: list[str]) -> str:
-    for i, token in enumerate(current_tokens):
-        text = re.sub(re.escape(f'ZXQCACHE{i:04d}QXZ'), token, text, flags=re.IGNORECASE)
-    return text
-
-
-def _cache_identity(text: str, italic_map: dict, source: str, target: str,
-                    custom_dict) -> tuple[str, list[str]]:
-    stable = text
-    for token, original in (italic_map or {}).items():
-        stable = re.sub(re.escape(token), original, stable, flags=re.IGNORECASE)
-    stable, src_tokens = _canonicalize_source_tokens(stable)
-    stable = re.sub(r'\s+', ' ', stable).strip()
-    payload = '\x1f'.join((source, target, _dictionary_fingerprint(custom_dict), stable))
-    key = hashlib.sha256(payload.encode('utf-8')).hexdigest()
-    return key, src_tokens
-
-
-def _cache_get(cache_key: str, src_tokens: list[str]):
-    # L1: RAM. Nilai disimpan dalam bentuk token-kanonik supaya aman walaupun
-    # token format pada paragraf yang sama berbeda UUID di proses berikutnya.
-    with _RAM_CACHE_LOCK:
-        row = _RAM_CACHE.get(cache_key)
-        if row is not None:
-            _RAM_CACHE.move_to_end(cache_key)
-            translated = _restore_source_tokens(row[0], src_tokens)
-            return translated, list(row[1])
-
-    # L2: SQLite.
-    _cache_init()
-    if not _CACHE_READY:
-        return None
-    try:
-        con = sqlite3.connect(_TRANSLATION_CACHE_PATH, timeout=5)
-        try:
-            row = con.execute(
-                'SELECT translated, italic_terms FROM translation_cache WHERE cache_key=?',
-                (cache_key,),
-            ).fetchone()
-            if not row:
-                return None
-            con.execute('UPDATE translation_cache SET hits=hits+1 WHERE cache_key=?', (cache_key,))
-            con.commit()
-            translated = _restore_source_tokens(row[0], src_tokens)
-            try:
-                terms = json.loads(row[1])
-            except Exception:
-                terms = []
-            with _RAM_CACHE_LOCK:
-                _RAM_CACHE[cache_key] = (row[0], tuple(terms))
-                _RAM_CACHE.move_to_end(cache_key)
-                while len(_RAM_CACHE) > _RAM_CACHE_MAX:
-                    _RAM_CACHE.popitem(last=False)
-            return translated, terms
-        finally:
-            con.close()
-    except Exception:
-        return None
-
-
-def _cache_put(cache_key: str, translated: str, italic_terms: list[str]) -> None:
-    canonical, _ = _canonicalize_source_tokens(translated)
-    with _RAM_CACHE_LOCK:
-        _RAM_CACHE[cache_key] = (canonical, tuple(italic_terms or []))
-        _RAM_CACHE.move_to_end(cache_key)
-        while len(_RAM_CACHE) > _RAM_CACHE_MAX:
-            _RAM_CACHE.popitem(last=False)
-
-    _cache_init()
-    if not _CACHE_READY:
-        return
-    try:
-        con = sqlite3.connect(_TRANSLATION_CACHE_PATH, timeout=5)
-        try:
-            con.execute("""INSERT INTO translation_cache(cache_key, translated, italic_terms, created_at, hits)
-                   VALUES(?,?,?,?,0)
-                   ON CONFLICT(cache_key) DO UPDATE SET
-                     translated=excluded.translated,
-                     italic_terms=excluded.italic_terms,
-                     created_at=excluded.created_at""",
-                (cache_key, canonical, json.dumps(italic_terms, ensure_ascii=False), int(time.time())),
-            )
-            con.commit()
-        finally:
-            con.close()
-    except Exception:
-        pass
-
-
-# Adaptive request controller: fast by default, slows only after provider/network
-# failures, then automatically returns to fast mode after successful requests.
-_TRANSLATE_GATE_LOCK = threading.Lock()
-_TRANSLATE_NEXT_REQUEST = 0.0
-_TRANSLATE_FAST_INTERVAL = 0.18
-_TRANSLATE_ADAPTIVE_INTERVAL = 0.35
-_TRANSLATE_ADAPTIVE_UNTIL = 0.0
-_TRANSLATE_SUCCESS_STREAK = 0
-
-def _translation_gate_wait(extra_delay: float = 0.0) -> None:
-    """Reserve a request slot, but NEVER sleep while holding the lock.
-
-    The previous implementation slept inside _TRANSLATE_GATE_LOCK. With four
-    workers this accidentally serialized requests whenever one worker had to
-    wait, making the 4-worker pool feel like one worker.
-    """
-    global _TRANSLATE_NEXT_REQUEST
-    with _TRANSLATE_GATE_LOCK:
-        now = time.monotonic()
-        # Pola stabil ala tran1/tran2: request dimulai berjarak tetap. Dua
-        # worker boleh overlap pada waktu tunggu jaringan, tetapi tidak burst.
-        interval = _TRANSLATE_FAST_INTERVAL
-        slot = max(now, _TRANSLATE_NEXT_REQUEST)
-        jitter = random.uniform(0.0, 0.025)
-        _TRANSLATE_NEXT_REQUEST = slot + interval + extra_delay + jitter
-    wait = max(0.0, slot - time.monotonic())
-    if wait:
-        time.sleep(wait)
-
-def _is_provider_failure(exc: Exception) -> bool:
-    msg = str(exc).casefold()
-    # Validation failures caused by document/token content must not throttle
-    # every other worker. Only network/provider/rate-limit symptoms do.
-    provider_terms = (
-        '429', 'too many', 'rate', 'timeout', 'timed out', 'connection',
-        'remote', 'temporar', '503', '502', 'service unavailable',
-        'request exception', 'proxy', 'ssl', 'captcha', 'blocked'
-    )
-    return any(term in msg for term in provider_terms)
-
-def _translation_gate_penalize(attempt: int, exc: Exception | None = None) -> None:
-    global _TRANSLATE_ADAPTIVE_UNTIL, _TRANSLATE_SUCCESS_STREAK, _TRANSLATE_NEXT_REQUEST
-    if exc is not None and not _is_provider_failure(exc):
-        return
-    # Short adaptive window instead of permanently slowing the whole document.
-    penalty = min(4.0, 0.9 + (0.65 * max(0, attempt - 1)))
-    with _TRANSLATE_GATE_LOCK:
-        now = time.monotonic()
-        _TRANSLATE_ADAPTIVE_UNTIL = max(_TRANSLATE_ADAPTIVE_UNTIL, now + penalty)
-        _TRANSLATE_NEXT_REQUEST = max(_TRANSLATE_NEXT_REQUEST, now + 0.30)
-        _TRANSLATE_SUCCESS_STREAK = 0
-
-def _translation_gate_success() -> None:
-    global _TRANSLATE_ADAPTIVE_UNTIL, _TRANSLATE_SUCCESS_STREAK, _TRANSLATE_NEXT_REQUEST
-    with _TRANSLATE_GATE_LOCK:
-        _TRANSLATE_SUCCESS_STREAK += 1
-        # As soon as normal responses are stable again, immediately restore
-        # fast mode rather than waiting for a long fixed cooldown.
-        if _TRANSLATE_SUCCESS_STREAK >= 2:
-            _TRANSLATE_ADAPTIVE_UNTIL = 0.0
-            _TRANSLATE_NEXT_REQUEST = min(_TRANSLATE_NEXT_REQUEST, time.monotonic() + _TRANSLATE_FAST_INTERVAL)
 
 class _Translator:
-    """Jalur translator disamakan dengan Generator SNI engine9."""
-    def __init__(self, source: str = 'auto', target: str = 'id',
+    def __init__(self, source: str = 'auto', target: str = 'id', 
                  custom_dict: CustomDictionary | None = None,
                  italic_dict: ItalicDictionary | None = None):
-        try:
-            from deep_translator import GoogleTranslator
-        except ImportError:
-            raise ImportError("Jalankan: pip install deep-translator")
+        try: from deep_translator import GoogleTranslator
+        except ImportError: raise ImportError("Jalankan: pip install deep-translator")
         self._cls = GoogleTranslator
-        self.source = source
-        self.target = target
-        self.custom_dict = custom_dict
-        self.italic_dict = italic_dict
+        self.source = source; self.target = target
+        self.custom_dict = custom_dict; self.italic_dict = italic_dict
+        self._client = self._cls(source=self.source, target=self.target)
         self.failed_texts: list[str] = []
 
     def translate_one(self, text: str, italic_map: dict = None) -> tuple[str, list[str]]:
-        original = text
         t = text.strip()
-        if not t or _skip_text(t):
-            return text, []
-
+        if not t or _skip_text(t): return text, []
         token_map = {}
         if self.custom_dict and len(self.custom_dict) > 0:
             t, token_map = self.custom_dict._apply_pre(t)
-
         final_italic_map = italic_map or {}
-        failed = False
 
-        # PERSIS Generator SNI engine9:
-        # GoogleTranslator baru -> request; exception -> sleep 0.8 -> request sekali lagi.
-        try:
-            result = self._cls(source=self.source, target=self.target).translate(t)
-            if not result or _looks_like_error_response(t, result):
-                result = t
-                failed = True
-        except Exception:
-            time.sleep(0.8)
+        # Jika seluruh teks sudah dicakup Kamus SNI, hasil kamus adalah hasil
+        # final. Ini berlaku untuk satu token ("Introduction") maupun beberapa
+        # token yang hanya dipisahkan tanda baca, angka bagian, atau em dash
+        # (judul Cover). Rangkaian token semacam itu tidak memiliki bahasa
+        # alami untuk diterjemahkan dan sering ditolak Google Translate.
+        uncovered = _RE_PROTECTION_TOKEN.sub('', t)
+        uncovered_words = re.findall(r'[A-Za-zÀ-ÿ]{2,}', uncovered)
+        if token_map and not uncovered_words:
+            result = self.custom_dict._apply_post(t, token_map)
+            italic_terms_found = []
+            if final_italic_map:
+                result, italic_terms_found = self.italic_dict._apply_post(
+                    result, final_italic_map
+                )
+            return result, italic_terms_found
+
+        expected_tokens = {
+            token.casefold() for token in _RE_PROTECTION_TOKEN.findall(t)
+        }
+        result = None
+        last_error = None
+        for attempt in range(1, 5):
             try:
-                result = self._cls(source=self.source, target=self.target).translate(t)
-                if not result or _looks_like_error_response(t, result):
-                    result = t
-                    failed = True
-            except Exception:
-                result = t
-                failed = True
+                candidate = self._client.translate(t)
+                if not candidate or _looks_like_error_response(t, candidate):
+                    raise ValueError('respons layanan terjemahan tidak valid')
+                returned_tokens = {
+                    token.casefold()
+                    for token in _RE_PROTECTION_TOKEN.findall(candidate)
+                }
+                if returned_tokens != expected_tokens:
+                    raise ValueError('token kamus/format berubah atau hilang')
 
-        if token_map:
-            result = self.custom_dict._apply_post(result, token_map)
+                source_plain = _RE_PROTECTION_TOKEN.sub('', t)
+                result_plain = _RE_PROTECTION_TOKEN.sub('', candidate)
+                if (
+                    re.search(r'[A-Za-z]{3}', source_plain)
+                    and re.sub(r'\s+', ' ', source_plain).strip().casefold()
+                    == re.sub(r'\s+', ' ', result_plain).strip().casefold()
+                ):
+                    raise ValueError('teks dikembalikan tanpa diterjemahkan')
+                result = candidate
+                break
+            except Exception as exc:
+                last_error = exc
+                if attempt < 4:
+                    time.sleep(0.8 * attempt)
 
+        if result is None:
+            # Judul standar lazim terdiri dari beberapa klausa yang dipisahkan
+            # em dash. Jika layanan menolak judul panjang sebagai satu request,
+            # coba setiap klausa secara mandiri lalu gabungkan kembali dengan
+            # tanda pisah asli. Ini juga membuat bagian yang sudah dicakup
+            # kamus langsung diselesaikan lokal per klausa.
+            title_parts = re.split(r'(\s*[—–]\s*)', t)
+            if len(title_parts) > 1:
+                translated_parts = []
+                try:
+                    for part in title_parts:
+                        if not part:
+                            continue
+                        if re.fullmatch(r'\s*[—–]\s*', part):
+                            translated_parts.append(part)
+                        else:
+                            part_result, _ = self.translate_one(part, {})
+                            translated_parts.append(part_result)
+                    result = ''.join(translated_parts)
+                except TranslationFailedError as split_error:
+                    last_error = split_error
+
+        if result is None:
+            # Provider cadangan untuk kondisi Google Translate sedang menolak
+            # request/rate-limited. Deep-translator menyertakan MyMemory;
+            # kegagalannya tetap ditangani tanpa merusak dokumen.
+            try:
+                from deep_translator import MyMemoryTranslator
+                fallback_source = (
+                    'english' if self.source in ('auto', 'en') else self.source
+                )
+                fallback_target = (
+                    'indonesian' if self.target == 'id' else self.target
+                )
+                fallback = MyMemoryTranslator(
+                    source=fallback_source, target=fallback_target
+                ).translate(t)
+                if fallback and not _looks_like_error_response(t, fallback):
+                    fallback_tokens = {
+                        token.casefold()
+                        for token in _RE_PROTECTION_TOKEN.findall(fallback)
+                    }
+                    if fallback_tokens == expected_tokens:
+                        result = fallback
+            except Exception as fallback_error:
+                last_error = fallback_error
+
+        if result is None:
+            safe_title = _TITLE_SAFE_FALLBACKS.get(
+                re.sub(r'\s+', ' ', text).strip().casefold()
+            )
+            if safe_title:
+                result = safe_title
+
+        if result is None:
+            preview = re.sub(r'\s+', ' ', text).strip()[:100]
+            # Jangan gagalkan seluruh pipeline karena satu request eksternal.
+            # Simpan teks sumber (token kamus tetap dipulihkan di bawah) dan
+            # laporkan sebagai peringatan pada ringkasan proses.
+            self.failed_texts.append(preview)
+            result = t
+        if token_map: result = self.custom_dict._apply_post(result, token_map)
         italic_terms_found = []
         if final_italic_map:
             _idict = self.italic_dict if self.italic_dict is not None else ItalicDictionary()
             result, italic_terms_found = _idict._apply_post(result, final_italic_map)
-
-        if failed:
-            preview = re.sub(r'\s+', ' ', original).strip()[:100]
-            self.failed_texts.append(preview)
-
         return result, italic_terms_found
 
 def _match_capitalization(original: str, translated: str) -> str:
@@ -1920,33 +1746,37 @@ class DocxFinalTranslatorEngine:
             italic_count = 0
             failed_paras = []
 
-            # Jalur utama dibuat benar-benar SEQUENTIAL seperti Generator SNI.
-            # Tidak memakai ThreadPoolExecutor walaupun max_workers=1.
-            tr = _Translator(
-                self.source_lang, self.target_lang,
-                self.custom_dict, self.italic_dict,
-            )
-
-            for index, para in enumerate(translation_queue):
-                before_failed = len(tr.failed_texts)
-                found = _translate_para(para, tr)
-                failed = len(tr.failed_texts) > before_failed
-
-                done += 1
-                italic_count += len(found)
-                if failed:
-                    failed_paras.append((index, para))
-                else:
-                    translated_count += 1
-
-                pct = 10 + int(done / max(total, 1) * 80)
-                _notify(
-                    progress_callback, pct,
-                    f"[translate Generator-SNI] {done}/{total} | "
-                    f"berhasil={translated_count} | "
-                    f"gagal={len(failed_paras)} | "
-                    f"[progres-total] {done}/{total + len(failed_paras)}",
+            def _translate_job(index_para):
+                index, para = index_para
+                worker_tr = _Translator(
+                    self.source_lang, self.target_lang,
+                    self.custom_dict, self.italic_dict,
                 )
+                found = _translate_para(para, worker_tr)
+                return index, para, found, bool(worker_tr.failed_texts)
+
+            # Tahap utama: tepat 4 worker translate.
+            with ThreadPoolExecutor(max_workers=4, thread_name_prefix='translate') as pool:
+                futures = [pool.submit(_translate_job, item)
+                           for item in enumerate(translation_queue)]
+                for future in as_completed(futures):
+                    index, para, found, failed = future.result()
+                    done += 1
+                    italic_count += len(found)
+                    if failed:
+                        failed_paras.append((index, para))
+                    else:
+                        translated_count += 1
+                    # Translate normal memakai rentang 10%--90%, dihitung
+                    # murni dari counter done/total (XXX/XXX).
+                    pct = 10 + int(done / max(total, 1) * 80)
+                    _notify(
+                        progress_callback, pct,
+                        f"[translate 4 worker] {done}/{total} | "
+                        f"berhasil={translated_count} | "
+                        f"gagal={len(failed_paras)} | "
+                        f"[progres-total] {done}/{total + len(failed_paras)}",
+                    )
 
             # Hanya bagian yang belum berhasil diterjemahkan yang diulang,
             # secara berurutan dengan tepat 1 worker.
@@ -1959,18 +1789,9 @@ class DocxFinalTranslatorEngine:
             )
             for recovery_done, (index, para) in enumerate(
                     sorted(failed_paras, key=lambda item: item[0]), start=1):
-                # Beri provider kesempatan pulih sebelum mengulang item yang gagal.
-                # Ini penting pada shared IP Streamlit Cloud setelah burst/429.
                 before = len(recovery_tr.failed_texts)
                 found = _translate_para(para, recovery_tr)
                 failed = len(recovery_tr.failed_texts) > before
-                if failed:
-                    # Client berikutnya dibuat baru agar session gagal tidak
-                    # terbawa ke paragraf recovery selanjutnya.
-                    recovery_tr = _Translator(
-                        self.source_lang, self.target_lang,
-                        self.custom_dict, self.italic_dict,
-                    )
                 if failed:
                     still_failed.append(para)
                 else:
@@ -1982,9 +1803,9 @@ class DocxFinalTranslatorEngine:
                 pct = 90 + int(recovery_done / max(recovery_total, 1) * 8)
                 _notify(
                     progress_callback, pct,
-                    f"[pemulihan Generator-SNI] {recovery_done}/{recovery_total} | "
+                    f"[pemulihan 1 worker] {recovery_done}/{recovery_total} | "
                     f"berhasil={recovery_success} | "
-                    f"gagal={len(still_failed)} "
+                    f"gagal={recovery_total - recovery_done + len(still_failed)} "
                     f"| [progres-total] {total + recovery_done}/"
                     f"{total + recovery_total}",
                 )
