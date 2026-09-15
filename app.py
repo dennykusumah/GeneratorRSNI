@@ -222,78 +222,88 @@ def _release_app_lock(owner_sid: str) -> None:
     _remove_lock_if_owned(owner_sid)
 
 def _show_busy_popup() -> None:
-    @st.dialog('WARNING!!!', width='small')
+    """Popup warning dengan WARNING!!! benar-benar rata tengah."""
+
+    @st.dialog(" ", width="small")
     def _busy_dialog():
         st.markdown(
             """
             <style>
-            /* Streamlit menaruh judul dialog di header tersendiri.
-               Selector lama hanya mengenai h2 di body sehingga WARNING!!!
-               tetap rata kiri. Targetkan header + heading secara langsung. */
-            div[data-testid="stDialog"] div[role="dialog"] header,
-            div[data-testid="stDialog"] div[role="dialog"] [data-testid="stDialogHeader"],
-            div[data-testid="stDialog"] [data-testid="stDialogHeader"] {
-                position: relative !important;
-                display: flex !important;
-                align-items: center !important;
-                justify-content: center !important;
-                width: 100% !important;
-            }
-
+            /* Sembunyikan teks title native. X tetap dipertahankan. */
             div[data-testid="stDialog"] div[role="dialog"] header h2,
             div[data-testid="stDialog"] div[role="dialog"] header h3,
-            div[data-testid="stDialog"] div[role="dialog"] [data-testid="stDialogHeader"] h2,
-            div[data-testid="stDialog"] div[role="dialog"] [data-testid="stDialogHeader"] h3,
             div[data-testid="stDialog"] [data-testid="stDialogHeader"] h2,
             div[data-testid="stDialog"] [data-testid="stDialogHeader"] h3 {
+                font-size: 0 !important;
+                line-height: 0 !important;
+                margin: 0 !important;
+                padding: 0 !important;
+            }
+
+            div[data-testid="stDialog"] div[role="dialog"] header,
+            div[data-testid="stDialog"] [data-testid="stDialogHeader"] {
+                min-height: 38px !important;
+                height: 38px !important;
+                padding-top: 0 !important;
+                padding-bottom: 0 !important;
+            }
+
+            /* WARNING dibuat sendiri agar tidak terpengaruh layout title Streamlit. */
+            .rsni-warning-title {
                 display: block !important;
                 width: 100% !important;
-                margin-left: 0 !important;
-                margin-right: 0 !important;
-                padding-left: 48px !important;
-                padding-right: 48px !important;
+                box-sizing: border-box !important;
+                margin: -4px 0 0 0 !important;
+                padding: 0 !important;
                 text-align: center !important;
+                font-family: 'Outfit', sans-serif !important;
+                font-size: 1.55rem !important;
+                line-height: 1.25 !important;
                 font-weight: 800 !important;
+                color: #111827 !important;
+                -webkit-text-fill-color: #111827 !important;
             }
 
-            /* Fallback untuk DOM Streamlit yang tidak memberi test-id pada header. */
-            div[data-testid="stDialog"] div[role="dialog"] > div:first-child:has(button) {
-                position: relative !important;
-                display: flex !important;
-                justify-content: center !important;
-                align-items: center !important;
-            }
-            div[data-testid="stDialog"] div[role="dialog"] > div:first-child:has(button) h2,
-            div[data-testid="stDialog"] div[role="dialog"] > div:first-child:has(button) h3 {
+            .rsni-warning-content {
+                display: block !important;
                 width: 100% !important;
-                padding-left: 48px !important;
-                padding-right: 48px !important;
+                box-sizing: border-box !important;
                 text-align: center !important;
-                font-weight: 800 !important;
+                padding: 2rem 0 0.75rem !important;
             }
 
-            /* Tombol X tetap di kanan dan tidak ikut menggeser titik tengah judul. */
-            div[data-testid="stDialog"] div[role="dialog"] header button,
-            div[data-testid="stDialog"] [data-testid="stDialogHeader"] button,
-            div[data-testid="stDialog"] div[role="dialog"] > div:first-child:has(button) > button {
-                position: absolute !important;
-                right: 16px !important;
-                top: 50% !important;
-                transform: translateY(-50%) !important;
+            .rsni-warning-hourglass {
+                font-size: 2rem !important;
+                line-height: 1 !important;
+                margin-bottom: 1.15rem !important;
+                text-align: center !important;
+            }
+
+            .rsni-warning-message {
+                display: block !important;
+                width: 100% !important;
+                margin: 0 !important;
+                padding: 0 !important;
+                text-align: center !important;
+                font-weight: 700 !important;
+            }
+
+            .rsni-warning-gap {
+                height: 1rem !important;
             }
             </style>
+
+            <div class="rsni-warning-title">WARNING!!!</div>
+            <div class="rsni-warning-content">
+                <div class="rsni-warning-hourglass">⏳</div>
+                <div class="rsni-warning-message">Aplikasi sedang digunakan oleh user lain.</div>
+                <div class="rsni-warning-gap"></div>
+                <div class="rsni-warning-message">Mohon menunggu beberapa saat lagi.</div>
+            </div>
             """,
             unsafe_allow_html=True,
         )
-        st.markdown(
-            '<div style="text-align:center;padding:0.35rem 0 0.8rem;">'
-            '<div style="font-size:2rem;margin-bottom:0.55rem;">⏳</div>'
-            '<div style="font-weight:700;">Aplikasi sedang digunakan oleh user lain.</div>'
-            '<div style="height:1rem;"></div>'
-            '<div style="font-weight:700;">Mohon menunggu beberapa saat lagi.</div>'
-            '</div>',
-            unsafe_allow_html=True,
-        )
+
     _busy_dialog()
 
 def _cleanup_temp_files(max_age_minutes: int = _MAX_AGE_MINUTES, silent: bool = True):
