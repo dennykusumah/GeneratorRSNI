@@ -629,6 +629,123 @@ div[data-testid="stFileUploader"] div[data-testid="stFileUploaderFile"] button s
     stroke: #111827 !important;
 }
 
+/* ── UPLOADER HARD FIX — Streamlit current/new DOM ──────────────────────
+   Target langsung ke FileData dan DeleteBtn, bukan hanya wrapper File. */
+
+/* Biarkan kartu file cukup lebar untuk metadata, jangan terkompres oleh tombol. */
+div[data-testid="stFileUploader"] div[data-testid="stFileUploaderFile"] {
+    display: flex !important;
+    align-items: center !important;
+    width: min(100%, 520px) !important;
+    min-width: 360px !important;
+    max-width: 100% !important;
+    background: #ffffff !important;
+    color: #111827 !important;
+    overflow: visible !important;
+}
+
+/* Wrapper metadata harus mendapat ruang tersendiri. */
+div[data-testid="stFileUploader"] [data-testid="stFileUploaderFileData"],
+div[data-testid="stFileUploader"] [data-testid*="FileData"] {
+    display: flex !important;
+    flex-direction: column !important;
+    justify-content: center !important;
+    flex: 1 1 auto !important;
+    min-width: 0 !important;
+    width: auto !important;
+    overflow: visible !important;
+    opacity: 1 !important;
+    visibility: visible !important;
+}
+
+/* Nama file: hitam pekat, satu baris, ellipsis hanya jika benar-benar panjang. */
+div[data-testid="stFileUploader"] [data-testid="stFileUploaderFileName"],
+div[data-testid="stFileUploader"] [data-testid="stFileUploaderFileName"] *,
+div[data-testid="stFileUploader"] [data-testid*="FileName"],
+div[data-testid="stFileUploader"] [data-testid*="FileName"] * {
+    display: block !important;
+    color: #111827 !important;
+    -webkit-text-fill-color: #111827 !important;
+    font-weight: 600 !important;
+    opacity: 1 !important;
+    visibility: visible !important;
+    white-space: nowrap !important;
+    overflow: hidden !important;
+    text-overflow: ellipsis !important;
+}
+
+/* Ukuran file: sedikit lebih lembut tetapi tetap kontras di putih. */
+div[data-testid="stFileUploader"] [data-testid="stFileUploaderFileSize"],
+div[data-testid="stFileUploader"] [data-testid="stFileUploaderFileSize"] *,
+div[data-testid="stFileUploader"] [data-testid*="FileSize"],
+div[data-testid="stFileUploader"] [data-testid*="FileSize"] * {
+    display: block !important;
+    color: #374151 !important;
+    -webkit-text-fill-color: #374151 !important;
+    opacity: 1 !important;
+    visibility: visible !important;
+}
+
+/* Fallback: semua teks di area FileData dibuat gelap. */
+div[data-testid="stFileUploader"] [data-testid*="FileData"] :is(div,p,span,small) {
+    color: #111827 !important;
+    -webkit-text-fill-color: #111827 !important;
+    opacity: 1 !important;
+    visibility: visible !important;
+}
+
+/* DELETE: hilangkan SELURUH kotak tombol, tetapi pertahankan ikon X. */
+div[data-testid="stFileUploader"] button[data-testid="stFileUploaderDeleteBtn"],
+div[data-testid="stFileUploader"] [data-testid="stFileUploaderDeleteBtn"] button,
+div[data-testid="stFileUploader"] button[aria-label*="Delete" i],
+div[data-testid="stFileUploader"] button[aria-label*="Remove" i] {
+    flex: 0 0 28px !important;
+    width: 28px !important;
+    min-width: 28px !important;
+    max-width: 28px !important;
+    height: 28px !important;
+    min-height: 28px !important;
+    padding: 0 !important;
+    margin: 0 8px 0 4px !important;
+    background: transparent !important;
+    background-color: transparent !important;
+    background-image: none !important;
+    border: none !important;
+    outline: none !important;
+    box-shadow: none !important;
+    border-radius: 0 !important;
+    transform: none !important;
+}
+
+div[data-testid="stFileUploader"] button[data-testid="stFileUploaderDeleteBtn"]:hover,
+div[data-testid="stFileUploader"] button[data-testid="stFileUploaderDeleteBtn"]:focus,
+div[data-testid="stFileUploader"] button[data-testid="stFileUploaderDeleteBtn"]:active,
+div[data-testid="stFileUploader"] [data-testid="stFileUploaderDeleteBtn"] button:hover,
+div[data-testid="stFileUploader"] [data-testid="stFileUploaderDeleteBtn"] button:focus,
+div[data-testid="stFileUploader"] [data-testid="stFileUploaderDeleteBtn"] button:active,
+div[data-testid="stFileUploader"] button[aria-label*="Delete" i]:hover,
+div[data-testid="stFileUploader"] button[aria-label*="Remove" i]:hover {
+    background: transparent !important;
+    background-color: transparent !important;
+    background-image: none !important;
+    border: none !important;
+    outline: none !important;
+    box-shadow: none !important;
+    transform: none !important;
+}
+
+/* X tetap terlihat. Jangan paksa fill pada ikon dokumen. */
+div[data-testid="stFileUploader"] button[data-testid="stFileUploaderDeleteBtn"] svg,
+div[data-testid="stFileUploader"] [data-testid="stFileUploaderDeleteBtn"] svg,
+div[data-testid="stFileUploader"] button[aria-label*="Delete" i] svg,
+div[data-testid="stFileUploader"] button[aria-label*="Remove" i] svg {
+    width: 18px !important;
+    height: 18px !important;
+    color: #111827 !important;
+    stroke: #111827 !important;
+    opacity: 1 !important;
+}
+
 /* ══════════════════════════════════════════
    INPUT FIELDS
 ══════════════════════════════════════════ */
