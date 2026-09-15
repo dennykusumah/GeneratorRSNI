@@ -5,6 +5,7 @@ Engine untuk merapikan dokumen Word sesuai standar ISO/SNI
 Digunakan oleh app.py untuk menu "2. Rapikan (Word -> ISO Std)"
 """
 
+from pipeline_utils import validate_docx, atomic_save_docx
 import os
 import re
 import zipfile
@@ -641,11 +642,10 @@ class DocxOptimizerEngine:
                 raise FileNotFoundError(f"File input tidak ditemukan: {input_path}")
             doc = Document(input_path)
 
-            if len(doc.sections) < 5:
-                raise ValueError(
-                    "Output Engine 6 harus memiliki minimal 5 section; "
-                    f"ditemukan {len(doc.sections)}."
-                )
+            # Jangan menolak dokumen hanya berdasarkan jumlah section.
+            # ISO/IEC dapat membawa section break tambahan yang sah; validasi
+            # struktural paket DOCX lebih stabil daripada hitungan absolut.
+            validate_docx(input_path)
 
             # Field REF dari dokumen ISO sering kehilangan bookmark setelah
             # trim/duplikasi section. Bekukan hasil yang sudah terlihat agar
@@ -1652,7 +1652,7 @@ class DocxOptimizerEngine:
                 setup_headers_footers(doc, doc_title, copyright_text)
 
 
-            doc.save(output_path)
+            atomic_save_docx(doc, output_path)
             return True, output_path
 
         except Exception as e:
