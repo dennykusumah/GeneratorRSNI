@@ -1144,8 +1144,8 @@ class TranslationFailedError(RuntimeError):
 # tidak menerima burst yang biasanya memicu rate-limit di tengah dokumen.
 _TRANSLATE_GATE_LOCK = threading.Lock()
 _TRANSLATE_NEXT_REQUEST = 0.0
-_TRANSLATE_MIN_INTERVAL = 0.18
-_TRANSLATE_ERROR_COOLDOWN = 1.5
+_TRANSLATE_MIN_INTERVAL = 0.80
+_TRANSLATE_ERROR_COOLDOWN = 4.0
 
 def _translation_gate_wait(extra_delay: float = 0.0) -> None:
     global _TRANSLATE_NEXT_REQUEST
@@ -1204,7 +1204,7 @@ class _Translator:
         }
         result = None
         last_error = None
-        for attempt in range(1, 6):
+        for attempt in range(1, 8):
             try:
                 _translation_gate_wait()
                 candidate = self._client.translate(t)
@@ -1236,8 +1236,8 @@ class _Translator:
                     self._client = self._cls(source=self.source, target=self.target)
                 except Exception:
                     pass
-                if attempt < 5:
-                    time.sleep(min(5.0, 0.75 * (2 ** (attempt - 1))) + random.uniform(0.05, 0.35))
+                if attempt < 7:
+                    time.sleep(min(12.0, 1.25 * (2 ** (attempt - 1))) + random.uniform(0.15, 0.65))
 
         if result is None:
             # Judul standar lazim terdiri dari beberapa klausa yang dipisahkan
@@ -1835,14 +1835,14 @@ class DocxFinalTranslatorEngine:
                 found = []
                 failed = True
                 # Tetap tepat 1 worker; tiga retry ini berlangsung sekuensial.
-                for recovery_attempt in range(1, 4):
+                for recovery_attempt in range(1, 7):
                     before = len(recovery_tr.failed_texts)
                     found = _translate_para(para, recovery_tr)
                     failed = len(recovery_tr.failed_texts) > before
                     if not failed:
                         break
-                    if recovery_attempt < 3:
-                        time.sleep(1.0 * recovery_attempt + random.uniform(0.1, 0.4))
+                    if recovery_attempt < 6:
+                        time.sleep(min(15.0, 2.0 * recovery_attempt) + random.uniform(0.2, 0.8))
                         recovery_tr = _Translator(
                             self.source_lang, self.target_lang,
                             self.custom_dict, self.italic_dict,
