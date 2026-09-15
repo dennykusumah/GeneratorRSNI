@@ -1,1405 +1,2026 @@
 """
-Engine9: StyleFinalizerEngine
-=================================
-Engine untuk menambahkan style custom "Judul" dan "Pasal" (sesuai spesifikasi
-Modify Style yang dibuat manual di Word oleh pengguna) ke dalam dokumen, lalu
-MENERAPKANNYA secara otomatis pada bagian-bagian dokumen yang sesuai.
+Engine8: DocTranslator
+=============================
+Perilaku yang dinonaktifkan:
+  - Tidak menyisipkan konten asli berbahasa Inggris sebelum Bibliografi.
+  - Tidak menghapus atau mengubah hyperlink. Paragraf yang mengandung
+    hyperlink dipertahankan utuh, termasuk teks, struktur, dan URL.
 
-Spesifikasi style (hasil dari Word "Modify Style"):
-
-  "Judul"  — based on Heading 1, style untuk paragraf berikutnya: Body Text
-             Font Arial 12pt Bold, rata tengah (center), outline level 1,
-             indentasi kiri/kanan 0, spasi sebelum/sesudah 0pt,
-             spasi baris single, TANPA auto-numbering.
-
-  "Pasal"  — based on Heading 1, style untuk paragraf berikutnya: Body Text
-             Font Arial 11pt Bold, rata kiri-kanan (justified),
-             spasi sebelum/sesudah 0pt, spasi baris single,
-             TANPA bullet/numbering Word (numId=0, dinonaktifkan eksplisit
-             baik di style maupun override per-paragraf). Nomor Pasal/Subpasal
-             TIDAK dibangkitkan oleh auto-numbering Word — nomor yang tampil
-             murni mengikuti teks literal apa adanya dari dokumen yang
-             diupload user (termasuk untuk subpasal di dalam Lampiran/Annex,
-             paragraf ber-style "a2"/"a3", mis. Lampiran B -> B.1, B.2, dst.,
-             angkanya tetap berasal dari teks asli, bukan dari list Word).
-
-Penerapan otomatis:
-
-  Style "Judul" -> heading halaman "Daftar Isi" (judul halaman itu sendiri,
-      BUKAN entri di dalam daftar isi), "Prakata", "Pendahuluan" (heading-nya,
-      BUKAN entri di dalam daftar isi), dan "Bibliografi".
-
-  Style "Pasal" -> semua Pasal (paragraf ber-style "Heading 1") dan Subpasal
-      (paragraf ber-style "Heading 2") yang BERBAHASA INDONESIA saja, KECUALI:
-        - Sub-subpasal ke bawah (Heading 3, Heading 4, dst.) — tidak disentuh.
-        - Subpasal (3.1, 3.2, ...) di bawah Pasal "Istilah dan Definisi" —
-          tetap dilewati (supaya tidak membanjiri Daftar Isi/ToC). TAPI
-          Pasal "Istilah dan Definisi" itu SENDIRI (mis. Pasal 3) TETAP
-          diberi style "Pasal" supaya ikut muncul di Daftar Isi (ToC
-          dibangun dari style "Judul" & "Pasal").
-        - Seluruh bagian berbahasa Inggris — dilewati sepenuhnya.
-      Style "Pasal" JUGA diterapkan pada subpasal tingkat pertama di dalam
-      Lampiran/Annex berbahasa Indonesia (paragraf ber-style "a2"), dengan penomoran
-      yang mengikuti huruf Lampirannya sendiri (mis. B.1, B.2, ... untuk
-      Lampiran B), BUKAN nomor Heading 1/2 dari badan dokumen utama.
-      Judul Lampiran itu sendiri (paragraf ber-style "ANNEX", mis.
-      "Lampiran B (informatif)") TIDAK disentuh — tetap memakai style
-      aslinya.
-
-Bagian lain dokumen (tabel, isi paragraf biasa, cover, entri daftar isi,
-header/footer, dst.) TIDAK diubah sama sekali.
-
-Deteksi batas bahasa Indonesia vs Inggris:
-  Dokumen hasil pipeline GeneratorRSNI selalu memiliki DUA paragraf ber-style
-  "Main Title 1" (judul utama halaman pertama isi dokumen): yang pertama
-  adalah judul berbahasa Indonesia (pembuka bagian ID), yang kedua adalah
-  judul berbahasa Inggris (pembuka bagian EN, hasil adopsi dua-bahasa).
-  Semua heading DI ANTARA kedua "Main Title 1" tsb. dianggap berbahasa
-  Indonesia; semua heading SETELAH "Main Title 1" kedua dianggap berbahasa
-  Inggris dan dilewati. Jika dokumen hanya punya satu bagian bahasa (tidak
-  ditemukan dua "Main Title 1"), seluruh heading diperlakukan sebagai
-  berbahasa Indonesia.
+Fitur utama:
+  - 2 SPREADSHEET TERPISAH:
+    1. KAMUS_SPREADSHEET_URL → untuk terjemahan istilah
+    2. ITALIC_SPREADSHEET_URL → daftar kata yang TIDAK diterjemahkan, OUTPUT MIRING
+  - Dual Title Sync, Note/Catatan, Annex fix, dll.
 """
 
-import os
 import re
 import copy
+import time
+import uuid
 import traceback
-import subprocess
-import shutil
-import tempfile
-from typing import Optional
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import csv
+import os
+import threading
+
+# RAM-only translation cache. Hilang otomatis saat proses Streamlit restart.
+_RAM_TRANSLATION_CACHE: dict[tuple[str, str, str], str] = {}
+_RAM_CACHE_LOCK = threading.RLock()
+_ADAPTIVE_LOCK = threading.RLock()
+_ADAPTIVE_MODE = False
+_ADAPTIVE_SUCCESS_STREAK = 0
+
 from docx import Document
-from docx.enum.style import WD_STYLE_TYPE
-from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_TAB_ALIGNMENT, WD_TAB_LEADER
-from docx.shared import Cm, Pt
-from docx.text.paragraph import Paragraph
+from docx.shared import Pt
+from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.oxml.ns import qn
-from docx.oxml import parse_xml, OxmlElement
-from docx.oxml.ns import nsdecls
+from docx.oxml import OxmlElement
+import lxml.etree as etree
+
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Konstanta
+# NAMESPACE & KONSTANTA
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Teks heading Pasal yang SUBPASAL-nya (Heading 2, mis. 3.1, 3.2, ...) harus
-# DILEWATI saat menerapkan style "Pasal" (supaya tidak membanjiri Daftar
-# Isi/ToC). Pasal itu sendiri (Heading 1, mis. "3  Istilah dan Definisi")
-# TETAP diberi style "Pasal" — lihat _collect_pasal_targets().
-_SKIP_SUBSECTION_TITLES = {
-    'istilah dan definisi',
-    'istilah dan definisi umum',
+_NS_W = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
+_W    = f'{{{_NS_W}}}'
+
+_RE_PURE_NUMBER = re.compile(r'^[\d\s\.\,\:\;\-\(\)\[\]\/\\\+\=\*\%\&\^\$\#\@\!\"\'`~<>{}|_]+$')
+_RE_COPYRIGHT = re.compile(r'©|BSN\s*\d{4}', re.IGNORECASE)
+# Paragraf pendek berupa nama/singkatan resmi yang berdiri sendiri
+# (mis. baris "BSN" saja pada kotak hak cipta) — tidak perlu, dan tidak
+# boleh, dikirim ke Google Translate. Dicocokkan hanya jika SELURUH isi
+# paragraf persis salah satu token ini (bukan sekadar mengandungnya).
+_RE_STANDALONE_ACRONYM = re.compile(r'^(BSN|SNI|ISO|IEC)$', re.IGNORECASE)
+
+_SKIP_STYLES = {
+    'caption', 'header', 'footer',
+    'toc 1', 'toc 2', 'toc 3', 'toc 4', 'toc 5',
+    'table of figures', 'footnote text', 'endnote text', 'macro text',
 }
+_BIBLIO_TITLE_STYLES = {'biblioti', 'bibliotitle', 'bibliography title'}
+_BIBLIO_KEYWORDS_EXACT = {
+    'bibliografi', 'bibliography',
+    'daftar acuan', 'daftar pustaka', 'daftar referensi',
+}
+_ANNEX_STYLE_IDS = {'ANNEX', 'Annex', 'annex'}
+# Paragraf yang ditandai engine6 (Prakata/Pendahuluan) — sudah final berbahasa
+# Indonesia, JANGAN diterjemahkan ulang di sini.
+_NO_TRANSLATE_STYLE_IDS = {'BSNNoTranslate'}
+_HEADING_STYLES_WITH_NUM = {
+    'Heading1', 'Heading2', 'Heading3',
+    'ANNEX', 'a2', 'a3',
+    'Heading4', 'Heading5', 'Heading6',
+}
+_TRANSLATE_DELAY = 0.15
+_EM_DASH = '—'
 
-# Teks heading halaman yang harus diberi style "Judul".
-_JUDUL_TARGET_TEXTS = {'daftar isi', 'prakata', 'pendahuluan', 'bibliografi'}
-_ENGINE5_MARKER = 'Engine5DuplicateStart'
-_TOC_STYLE_NAME = 'TOC 1'
-_TOC_FIELD_INSTR = ' TOC \\h \\z \\t "Judul;1;Pasal;1" '
-_TOC_MARK_BOOKMARK = 'Engine9TocField'
+# ─────────────────────────────────────────────────────────────────────────────
+# 2 URL SPREADSHEET TERPISAH
+# ─────────────────────────────────────────────────────────────────────────────
 
-
-def _norm(text: str) -> str:
-    """Normalisasi teks untuk dibandingkan: lower-case, trim whitespace/tab."""
-    return re.sub(r'\s+', ' ', (text or '').strip()).strip().lower()
-
-
-def _style_name(paragraph) -> str:
-    try:
-        return paragraph.style.name if paragraph.style is not None else ''
-    except Exception:
-        return ''
+KAMUS_SPREADSHEET_URL = "https://docs.google.com/spreadsheets/d/1BBPCMPwvbBk5LPdoDQwnjQzcPHv7_RDKENqeMsklF-8/edit?usp=sharing"
+ITALIC_SPREADSHEET_URL = "https://docs.google.com/spreadsheets/d/1NZm1HjsjxmflxnZlzV_O2XF75ZlMUOu8VVofsKfp_FA/edit#gid=0"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Generator nomor Pasal/Subpasal
-# ─────────────────────────────────────────────────────────────────────────────
-# Dokumen sumber (hasil convert dari template ISO) menomori Pasal/Subpasal
-# HANYA lewat auto-numbering Word (numId terhubung ke style Heading1/Heading2/
-# a2/a3 di numbering.xml) — angka itu TIDAK pernah tersimpan sebagai teks
-# literal di XML, hanya dihitung/ditampilkan oleh aplikasi Word saat dibuka.
-# python-docx (dan proses translate berbasis teks di Engine9) sama sekali
-# tidak melihat angka tsb. Karena numbering Word DIMATIKAN secara eksplisit
-# di _apply_pasal (numId=0, supaya tidak dobel dengan render Word lain),
-# nomor Pasal/Subpasal HARUS dibangkitkan & ditulis sebagai teks literal di
-# sini, mengikuti urutan kemunculan heading yang sama persis dengan yang
-# akan dihasilkan Word dari auto-numbering aslinya:
-#   - Setiap "Heading 1" -> nomor Pasal urut (1, 2, 3, ...), reset counter
-#     Subpasal ("Heading 2") setiap kali masuk Pasal baru.
-#   - Setiap "Heading 2" (Subpasal, non-skip) -> "<no Pasal induk>.<urut>"
-#     (mis. 4.1, 4.2, ...).
-#   - Setiap heading "ANNEX" (Lampiran) -> menaikkan huruf Lampiran
-#     (A, B, C, ...), reset counter subpasal Lampiran ('a2'/'a3').
-#   - Setiap "a2" (subpasal Lampiran, level 1) -> "<huruf>.<urut>" (mis.
-#     A.1, A.2, ...).
-#   - "a3" (mis. A.1.1) tidak diberi style Pasal dan tidak masuk TOC.
-_RE_LEADING_NUMBER = re.compile(r'^\s*[A-Za-z]?\d+(?:\.\d+)*\.?\s+')
-
-
-def _strip_existing_leading_number(paragraph) -> None:
-    """Buang prefix angka/no. Pasal yang MUNGKIN sudah ada sebagai teks
-    literal di run pertama paragraf (mis. jika dokumen sumber kebetulan
-    sudah punya nomor manual, atau proses ini dijalankan dua kali),
-    supaya nomor baru yang dibangkitkan _insert_number_run() tidak
-    dobel/duplikat (mis. "1    1    Ruang lingkup")."""
-    runs = paragraph.runs
-    if not runs:
-        return
-    first = runs[0]
-    text = first.text or ''
-    m = _RE_LEADING_NUMBER.match(text)
-    if not m:
-        return
-    remainder = text[m.end():]
-    if remainder:
-        first.text = remainder
-    else:
-        # Run pertama isinya cuma nomor -> hapus run itu supaya tidak
-        # menyisakan run kosong di depan.
-        r_el = first._element
-        parent = r_el.getparent()
-        if parent is not None:
-            parent.remove(r_el)
-
-
-def _insert_number_run(paragraph, number_text: str) -> None:
-    """Sisipkan run baru berisi '<number_text>    ' (nomor + 4 spasi,
-    mengikuti format asli SNI/ISO: "1    Ruang lingkup", "4.1    Umum",
-    dst.) sebagai run PALING AWAL di paragraf (persis setelah pPr &
-    bookmark, sebelum teks judul Pasal)."""
-    p_el = paragraph._p
-    r = OxmlElement('w:r')
-    t = OxmlElement('w:t')
-    t.set(qn('xml:space'), 'preserve')
-    t.text = f'{number_text}    '
-    r.append(t)
-    pPr = p_el.find(qn('w:pPr'))
-    insert_pos = list(p_el).index(pPr) + 1 if pPr is not None else 0
-    p_el.insert(insert_pos, r)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Style XML — "Judul" & "Pasal"
+# CUSTOM DICTIONARY (SPREADSHEET 1 - KAMUS TERJEMAHAN)
 # ─────────────────────────────────────────────────────────────────────────────
 
-_JUDUL_STYLE_XML = f'''<w:style {nsdecls("w")} w:type="paragraph" w:customStyle="1" w:styleId="Judul">
-  <w:name w:val="Judul"/>
-  <w:basedOn w:val="Heading1"/>
-  <w:next w:val="BodyText"/>
-  <w:qFormat/>
-  <w:pPr>
-    <w:numPr><w:ilvl w:val="0"/><w:numId w:val="0"/></w:numPr>
-    <w:outlineLvl w:val="0"/>
-    <w:spacing w:before="0" w:after="0" w:line="240" w:lineRule="auto"/>
-    <w:ind w:left="0" w:right="0" w:firstLine="0"/>
-    <w:jc w:val="center"/>
-  </w:pPr>
-  <w:rPr>
-    <w:rFonts w:ascii="Arial" w:hAnsi="Arial" w:cs="Arial"/>
-    <w:b/>
-    <w:sz w:val="24"/>
-    <w:szCs w:val="24"/>
-  </w:rPr>
-</w:style>'''
+class CustomDictionary:
+    """Kamus istilah: source → target (AKAN diterjemahkan)."""
+    
+    def __init__(self):
+        self._entries: dict[str, tuple[str, str]] = {}
 
-_PASAL_STYLE_XML = f'''<w:style {nsdecls("w")} w:type="paragraph" w:customStyle="1" w:styleId="Pasal">
-  <w:name w:val="Pasal"/>
-  <w:basedOn w:val="Heading1"/>
-  <w:next w:val="BodyText"/>
-  <w:qFormat/>
-  <w:pPr>
-    <w:numPr><w:ilvl w:val="0"/><w:numId w:val="0"/></w:numPr>
-    <w:spacing w:before="0" w:after="0" w:line="240" w:lineRule="auto"/>
-    <w:jc w:val="both"/>
-  </w:pPr>
-  <w:rPr>
-    <w:rFonts w:ascii="Arial" w:hAnsi="Arial" w:cs="Arial"/>
-    <w:b/>
-    <w:sz w:val="22"/>
-    <w:szCs w:val="22"/>
-  </w:rPr>
-</w:style>'''
+    def add_term(self, source: str, target: str) -> None:
+        s = source.strip()
+        t = target.strip()
+        if s and t:
+            self._entries[s.lower()] = (s, t)
 
+    def clear(self) -> None:
+        self._entries.clear()
 
-def _find_style_el(doc, style_id):
-    for st in doc.styles.element.findall(qn('w:style')):
-        if st.get(qn('w:styleId')) == style_id:
-            return st
-    return None
+    def load_defaults(self) -> int:
+        try:
+            return self.load_from_google_sheet(KAMUS_SPREADSHEET_URL)
+        except Exception:
+            return 0
 
+    def load_from_csv(self, filepath: str, src_col: str = 'source', 
+                      tgt_col: str = 'target', delimiter: str = ',', 
+                      encoding: str = 'utf-8-sig') -> int:
+        if not os.path.isfile(filepath): 
+            raise FileNotFoundError(f"File CSV tidak ditemukan: {filepath}")
+        count = 0
+        with open(filepath, newline='', encoding=encoding) as f:
+            sample = f.read(1024); f.seek(0)
+            has_header = csv.Sniffer().has_header(sample)
+            reader = csv.DictReader(f, delimiter=delimiter) if has_header else csv.reader(f, delimiter=delimiter)
+            for row in reader:
+                if has_header:
+                    src = row.get(src_col, row.get('source', '')).strip()
+                    tgt = row.get(tgt_col, row.get('target', '')).strip()
+                else:
+                    row = list(row)
+                    if len(row) < 2: continue
+                    src, tgt = row[0].strip(), row[1].strip()
+                if src and tgt:
+                    self._entries[src.lower()] = (src, tgt)
+                    count += 1
+        return count
 
-def _ensure_style(doc, style_id, style_xml):
-    """Tambahkan style ke styles.xml jika belum ada. Idempotent."""
-    if _find_style_el(doc, style_id) is not None:
-        return
-    new_style = parse_xml(style_xml)
-    doc.styles.element.append(new_style)
+    def load_from_excel(self, filepath: str, sheet_name: str | int = 0, 
+                        src_col: str = 'source', tgt_col: str = 'target') -> int:
+        if not os.path.isfile(filepath): 
+            raise FileNotFoundError(f"File Excel tidak ditemukan: {filepath}")
+        try: import pandas as pd
+        except ImportError: raise ImportError("Jalankan: pip install pandas openpyxl")
+        df = pd.read_excel(filepath, sheet_name=sheet_name, dtype=str).fillna('')
+        col_src = _find_col(df.columns.tolist(), [src_col, 'source', 'Inggris'])
+        col_tgt = _find_col(df.columns.tolist(), [tgt_col, 'target', 'Indonesia'])
+        if col_src is None: col_src = df.columns[0]
+        if col_tgt is None and len(df.columns) >= 2: col_tgt = df.columns[1]
+        if col_tgt is None: raise ValueError("Kolom target tidak ditemukan.")
+        count = 0
+        for _, row in df.iterrows():
+            src = str(row[col_src]).strip()
+            tgt = str(row[col_tgt]).strip()
+            if src and tgt and src.lower() not in ('nan', '') and tgt.lower() not in ('nan', ''):
+                self._entries[src.lower()] = (src, tgt); count += 1
+        return count
 
+    def load_from_google_sheet(self, url: str, src_col: str = 'source', 
+                               tgt_col: str = 'target', timeout: int = 15) -> int:
+        try: import urllib.request, io
+        except ImportError: raise ImportError("urllib tidak tersedia.")
+        csv_url = _google_sheet_to_csv_url(url)
+        try:
+            req = urllib.request.Request(csv_url, headers={'User-Agent': 'Mozilla/5.0'})
+            with urllib.request.urlopen(req, timeout=timeout) as resp: 
+                raw = resp.read().decode('utf-8-sig')
+        except Exception as e: raise ConnectionError(f"Gagal mengambil data: {e}")
+        f = io.StringIO(raw); reader = csv.DictReader(f); fieldnames = reader.fieldnames or []
+        col_src = _find_col(
+            fieldnames, [src_col, 'source', 'Inggris', 'Bahasa Inggris', 'English']
+        )
+        col_tgt = _find_col(
+            fieldnames, [tgt_col, 'target', 'Indonesia', 'Bahasa Indonesia']
+        )
+        if col_src is None and len(fieldnames) >= 1: col_src = fieldnames[0]
+        if col_tgt is None and len(fieldnames) >= 2: col_tgt = fieldnames[1]
+        if col_tgt is None: raise ValueError(f"Kolom target tidak ditemukan. Header: {fieldnames}")
+        count = 0
+        for row in reader:
+            src = str(row.get(col_src, '')).strip()
+            tgt = str(row.get(col_tgt, '')).strip()
+            if src and tgt and src.lower() not in ('', 'nan') and tgt.lower() not in ('', 'nan'):
+                self._entries[src.lower()] = (src, tgt); count += 1
+        return count
 
-def _resolve_num_id(doc, style_id, _depth=0):
-    """Telusuri rantai basedOn untuk menemukan w:numId yang berlaku pada style ini."""
-    if _depth > 8:
-        return None
-    st = _find_style_el(doc, style_id)
-    if st is None:
-        return None
-    pPr = st.find(qn('w:pPr'))
-    if pPr is not None:
-        numPr = pPr.find(qn('w:numPr'))
-        if numPr is not None:
-            numId_el = numPr.find(qn('w:numId'))
-            if numId_el is not None:
-                val = numId_el.get(qn('w:val'))
-                if val and val != '0':
-                    return val
-    based = st.find(qn('w:basedOn'))
-    if based is not None:
-        parent_id = based.get(qn('w:val'))
-        if parent_id and parent_id != style_id:
-            return _resolve_num_id(doc, parent_id, _depth + 1)
-    return None
+    def __len__(self) -> int: return len(self._entries)
+    def list_terms(self) -> list[tuple[str, str]]:
+        return [(s, t) for _, (s, t) in sorted(self._entries.items())]
 
+    def _apply_pre(self, text: str) -> tuple[str, dict]:
+        if not self._entries: return text, {}
+        token_map = {}; result = text.replace(' ', ' ')
+        sorted_entries = sorted(self._entries.items(), key=lambda x: len(x[0]), reverse=True)
+        for src_lower, (src_orig, tgt) in sorted_entries:
+            pattern = re.compile(r'(?<![A-Za-z0-9])' + re.escape(src_lower) + r'(?![A-Za-z0-9])', re.IGNORECASE)
+            if pattern.search(result):
+                # Token huruf-angka tanpa simbol @/_ jauh lebih stabil saat
+                # melewati Google Translate dan tetap mudah divalidasi.
+                token = f'ZXQTK{uuid.uuid4().hex[:12].upper()}QXZ'
+                token_map[token] = tgt
+                result = pattern.sub(token, result)
+        return result, token_map
 
-def _resolve_style_ilvl(doc, style_id, _depth=0):
-    """Telusuri rantai basedOn untuk menemukan w:ilvl yang dideklarasikan
-    langsung pada style ini (mis. 'a2' -> ilvl 1, 'a3' -> ilvl 2, sesuai
-    struktur multilevel list ANNEX di dokumen sumber). Default '0' jika
-    tidak ditemukan sama sekali di sepanjang rantai."""
-    if _depth > 8:
-        return '0'
-    st = _find_style_el(doc, style_id)
-    if st is None:
-        return '0'
-    pPr = st.find(qn('w:pPr'))
-    if pPr is not None:
-        numPr = pPr.find(qn('w:numPr'))
-        if numPr is not None:
-            ilvl_el = numPr.find(qn('w:ilvl'))
-            if ilvl_el is not None:
-                val = ilvl_el.get(qn('w:val'))
-                if val is not None:
-                    return val
-    based = st.find(qn('w:basedOn'))
-    if based is not None:
-        parent_id = based.get(qn('w:val'))
-        if parent_id and parent_id != style_id:
-            return _resolve_style_ilvl(doc, parent_id, _depth + 1)
-    return '0'
-
-
-def _clear_paragraph_direct_formatting(paragraph, drop_tags):
-    """Hapus elemen langsung tertentu dari pPr agar formatting style baru berlaku penuh."""
-    p_el = paragraph._p
-    pPr = p_el.find(qn('w:pPr'))
-    if pPr is None:
-        pPr = parse_xml(f'<w:pPr {nsdecls("w")}/>')
-        p_el.insert(0, pPr)
-    for tag in drop_tags:
-        el = pPr.find(qn(tag))
-        if el is not None:
-            pPr.remove(el)
-    return pPr
-
-
-def _strip_run_direct_formatting(paragraph):
-    """Hapus rPr langsung pada tiap run agar teks mengikuti rPr dari style
-    paragraf, TAPI pertahankan w:vertAlign (superscript/subscript) supaya
-    superscript pada teks (mis. m², catatan kaki angka) tidak ikut hilang
-    dan tetap berfungsi normal."""
-    for r in paragraph._p.findall(qn('w:r')):
-        rPr = r.find(qn('w:rPr'))
-        if rPr is None:
-            continue
-        vert = rPr.find(qn('w:vertAlign'))
-        if vert is not None:
-            # PENTING: run superscript/subscript berasal dari file input.
-            # Jangan menyisakan hanya w:vertAlign karena itu akan membuang
-            # font, bahasa, bold/italic, ukuran, character spacing, dll.
-            # Properti run asli harus tetap utuh sampai dokumen final.
-            continue
-        else:
-            r.remove(rPr)
-
-
-def _set_pstyle(paragraph, style_id):
-    p_el = paragraph._p
-    pPr = p_el.find(qn('w:pPr'))
-    if pPr is None:
-        pPr = parse_xml(f'<w:pPr {nsdecls("w")}/>')
-        p_el.insert(0, pPr)
-    pStyle = pPr.find(qn('w:pStyle'))
-    if pStyle is None:
-        pStyle = parse_xml(f'<w:pStyle {nsdecls("w")} w:val="{style_id}"/>')
-        pPr.insert(0, pStyle)
-    else:
-        pStyle.set(qn('w:val'), style_id)
-
-
-def _apply_judul(doc, paragraph, force_page_break_before=False):
-    _set_pstyle(paragraph, 'Judul')
-    pPr = _clear_paragraph_direct_formatting(
-        paragraph, ['w:jc', 'w:spacing', 'w:ind', 'w:outlineLvl', 'w:numPr']
-    )
-    if force_page_break_before and pPr.find(qn('w:pageBreakBefore')) is None:
-        pPr.append(parse_xml(f'<w:pageBreakBefore {nsdecls("w")}/>'))
-    _strip_run_direct_formatting(paragraph)
-
-
-def _apply_pasal(doc, paragraph, ilvl, num_id, number_text=None):
-    _set_pstyle(paragraph, 'Pasal')
-    pPr = _clear_paragraph_direct_formatting(
-        paragraph, ['w:jc', 'w:spacing', 'w:ind', 'w:numPr']
-    )
-    # Nonaktifkan bullet/numbering Word (numId=0) secara eksplisit per-paragraf.
-    # Nomor Pasal/Subpasal TIDAK lagi dibangkitkan oleh Word auto-numbering —
-    # sebagai gantinya, nomor yang BENAR (dihitung oleh _collect_pasal_targets
-    # berdasarkan urutan & level heading, lihat komentar di atas
-    # _RE_LEADING_NUMBER) dituliskan di sini sebagai teks literal, PERSIS
-    # meniru hasil auto-numbering Word yang asli (mis. "1", "4.2", "A.1").
-    numPr_xml = (
-        f'<w:numPr {nsdecls("w")}>'
-        f'<w:ilvl w:val="0"/><w:numId w:val="0"/>'
-        f'</w:numPr>'
-    )
-    pPr.insert(0, parse_xml(numPr_xml))
-
-    if number_text:
-        # Buang dulu nomor lama (jika ada, mis. sudah literal di sumber atau
-        # sisa dari proses sebelumnya) supaya tidak dobel, baru sisipkan
-        # nomor final yang benar di depan judul Pasal.
-        _strip_existing_leading_number(paragraph)
-        _insert_number_run(paragraph, number_text)
-
-    _strip_run_direct_formatting(paragraph)
+    def _apply_post(self, translated: str, token_map: dict) -> str:
+        result = translated
+        for token, tgt in token_map.items(): 
+            result = re.sub(re.escape(token), tgt, result, flags=re.IGNORECASE)
+        return result
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Engine utama
+# ITALIC DICTIONARY (SPREADSHEET 2 - KATA MIRING)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _split_run_and_italicize(run, term: str) -> bool:
-    """Pecah SATU run yang teksnya mengandung `term` di tengah/tepi teks lain
-    (bukan hanya sama persis) menjadi hingga 3 run: [sebelum][term][sesudah],
-    dengan run [term] dipaksa italic, sedangkan run sebelum/sesudah TETAP
-    memakai formatting asli run tsb (font, bold, size, dst — hanya teksnya
-    yang dipotong, tidak ada properti lain yang berubah).
-
-    Dirancang seaman mungkin: hanya menangani run dengan struktur sederhana
-    (satu elemen <w:t> per run, kasus normal untuk teks paragraf biasa).
-    Jika run punya struktur lain yang tidak terduga (mis. tab/break/drawing
-    di dalamnya), fungsi ini TIDAK melakukan apa-apa (aman, tidak mengubah
-    apa pun) — dikembalikan False supaya caller tahu belum tertangani.
-
-    Return True jika berhasil memecah & meng-italic-kan (atau run memang
-    sudah persis == term, tinggal di-italic-kan langsung tanpa split).
+class ItalicDictionary:
     """
-    text = run.text
-    if not text or term not in text:
-        return False
+    Daftar kata/frasa dari Spreadsheet 2.
+    TIDAK diterjemahkan, otomatis bercetak MIRING di dokumen output.
+    """
 
-    r_el = run._element
-    t_els = r_el.findall(qn('w:t'))
-    # Hanya tangani run dengan tepat satu <w:t> (kasus umum). Run dengan
-    # elemen lain (tab, br, drawing, dst.) atau >1 <w:t> dilewati demi
-    # keamanan struktur dokumen.
-    other_children = [c for c in r_el if c.tag != qn('w:rPr') and c.tag != qn('w:t')]
-    if len(t_els) != 1 or other_children:
-        return False
+    def __init__(self):
+        self._entries: dict[str, str] = {}
 
-    if text == term:
-        run.font.italic = True
-        return True
+    def add_term(self, term: str) -> None:
+        t = term.strip()
+        if t:
+            self._entries[t.lower()] = t
 
-    idx = text.find(term)
-    if idx == -1:
-        return False
-    before, after = text[:idx], text[idx + len(term):]
+    def clear(self) -> None:
+        self._entries.clear()
 
-    parent = r_el.getparent()
-    if parent is None:
-        return False
-    pos = list(parent).index(r_el)
+    def load_defaults(self) -> int:
+        try:
+            return self.load_from_google_sheet(ITALIC_SPREADSHEET_URL)
+        except Exception:
+            return 0
 
-    def _make_run(piece_text, force_italic):
-        new_r = copy.deepcopy(r_el)
-        new_t = new_r.find(qn('w:t'))
-        new_t.text = piece_text
-        new_t.set(qn('xml:space'), 'preserve')
-        if force_italic:
-            rPr = new_r.find(qn('w:rPr'))
-            if rPr is None:
-                rPr = OxmlElement('w:rPr')
-                new_r.insert(0, rPr)
-            if rPr.find(qn('w:i')) is None:
-                rPr.append(OxmlElement('w:i'))
-        return new_r
+    def load_from_csv(self, filepath: str, term_col: str = 'term', 
+                      delimiter: str = ',', encoding: str = 'utf-8-sig') -> int:
+        if not os.path.isfile(filepath): 
+            raise FileNotFoundError(f"File CSV tidak ditemukan: {filepath}")
+        count = 0
+        with open(filepath, newline='', encoding=encoding) as f:
+            sample = f.read(1024); f.seek(0)
+            has_header = csv.Sniffer().has_header(sample)
+            reader = csv.DictReader(f, delimiter=delimiter) if has_header else csv.reader(f, delimiter=delimiter)
+            skip_vals = {'nan', '', 'term', 'kata', 'italic', 'word', 'text'}
+            for row in reader:
+                if has_header:
+                    term = ''
+                    for col_name in [term_col, 'term', 'kata', 'italic', 'word', 'text']:
+                        if col_name in row:
+                            term = row.get(col_name, '').strip()
+                            break
+                    if not term and len(row) > 0:
+                        term = list(row.values())[0].strip()
+                else:
+                    row = list(row)
+                    if len(row) < 1: continue
+                    term = row[0].strip()
+                if term and term.lower() not in skip_vals:
+                    self._entries[term.lower()] = term; count += 1
+        return count
 
-    new_runs = []
-    if before:
-        new_runs.append(_make_run(before, force_italic=False))
-    new_runs.append(_make_run(term, force_italic=True))
-    if after:
-        new_runs.append(_make_run(after, force_italic=False))
+    def load_from_excel(self, filepath: str, sheet_name: str | int = 0, 
+                        term_col: str = 'term') -> int:
+        if not os.path.isfile(filepath): 
+            raise FileNotFoundError(f"File Excel tidak ditemukan: {filepath}")
+        try: import pandas as pd
+        except ImportError: raise ImportError("Jalankan: pip install pandas openpyxl")
+        df = pd.read_excel(filepath, sheet_name=sheet_name, dtype=str).fillna('')
+        col_term = None
+        for col_name in [term_col, 'term', 'kata', 'italic', 'word', 'text']:
+            if col_name in df.columns:
+                col_term = col_name; break
+        if col_term is None: col_term = df.columns[0]
+        count = 0
+        skip_vals = {'nan', '', 'term', 'kata', 'italic'}
+        for _, row in df.iterrows():
+            term = str(row[col_term]).strip()
+            if term and term.lower() not in skip_vals:
+                self._entries[term.lower()] = term; count += 1
+        return count
 
-    for offset, nr in enumerate(new_runs):
-        parent.insert(pos + offset, nr)
-    parent.remove(r_el)
+    def load_from_google_sheet(self, url: str, term_col: str = 'term', 
+                               timeout: int = 15) -> int:
+        try: import urllib.request, io
+        except ImportError: raise ImportError("urllib tidak tersedia.")
+        csv_url = _google_sheet_to_csv_url(url)
+        try:
+            req = urllib.request.Request(csv_url, headers={'User-Agent': 'Mozilla/5.0'})
+            with urllib.request.urlopen(req, timeout=timeout) as resp: 
+                raw = resp.read().decode('utf-8-sig')
+        except Exception as e: raise ConnectionError(f"Gagal mengambil data dari Spreadsheet Italic: {e}")
+        f = io.StringIO(raw); reader = csv.DictReader(f); fieldnames = reader.fieldnames or []
+        col_term = _find_col(
+            fieldnames,
+            [term_col, 'term', 'kata', 'italic', 'word', 'text',
+             'istilah asing', 'bahasa asing'],
+        )
+        if col_term is None and len(fieldnames) >= 1:
+            col_term = fieldnames[0]
+        if col_term is None: raise ValueError(f"Tidak ada kolom. Header: {fieldnames}")
+        count = 0
+        skip_vals = {'nan', '', 'term', 'kata', 'italic', 'word', 'text'}
+        for row in reader:
+            term = str(row.get(col_term, '')).strip()
+            if term and term.lower() not in skip_vals:
+                self._entries[term.lower()] = term; count += 1
+        return count
+
+    def __len__(self) -> int: return len(self._entries)
+    
+    def list_terms(self) -> list[str]:
+        return list(set(self._entries.values()))
+
+    def _apply_pre(self, text: str) -> tuple[str, dict]:
+        if not self._entries: return text, {}
+        token_map = {}
+        result = text
+        sorted_entries = sorted(self._entries.items(), key=lambda x: len(x[0]), reverse=True)
+        for term_lower, term_orig in sorted_entries:
+            pattern = re.compile(r'(?<![A-Za-z0-9])' + re.escape(term_lower) + r'(?![A-Za-z0-9])', re.IGNORECASE)
+            if pattern.search(result):
+                token = f'ZXQIT{uuid.uuid4().hex[:12].upper()}QXZ'
+                token_map[token] = term_orig
+                result = pattern.sub(token, result)
+        return result, token_map
+
+    def _apply_post(self, translated: str, italic_map: dict) -> tuple[str, list[str]]:
+        result = translated
+        italic_terms_found = []
+        for token, original in italic_map.items():
+            if re.search(re.escape(token), result, re.IGNORECASE):
+                result = re.sub(re.escape(token), original, result, flags=re.IGNORECASE)
+                if original not in italic_terms_found:
+                    italic_terms_found.append(original)
+        return result, italic_terms_found
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SHARED HELPERS
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _find_col(columns: list, candidates: list) -> str | None:
+    normalized = {
+        re.sub(r'[^a-z0-9]+', '', str(col).casefold()): col
+        for col in columns
+    }
+    for candidate in candidates:
+        key = re.sub(r'[^a-z0-9]+', '', str(candidate).casefold())
+        if key in normalized:
+            return normalized[key]
+    return None
+
+def _google_sheet_to_csv_url(url: str) -> str:
+    url = url.strip()
+    if 'output=csv' in url or 'format=csv' in url: return url
+    if 'docs.google.com/spreadsheets' not in url: return url
+    m = re.search(r'/spreadsheets/d/([a-zA-Z0-9_-]+)', url)
+    if not m: raise ValueError(f"Tidak dapat mengekstrak Sheet ID: {url}")
+    sheet_id = m.group(1)
+    gid_match = re.search(r'[#&?]gid=(\d+)', url)
+    gid_param = f'&gid={gid_match.group(1)}' if gid_match else ''
+    return f'https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=csv{gid_param}'
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# HELPER FUNCTIONS
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _skip_text(text: str) -> bool:
+    t = text.strip()
+    if len(t) < 3: return True
+    if _RE_PURE_NUMBER.fullmatch(t): return True
+    if _RE_COPYRIGHT.search(t): return True
+    if _RE_STANDALONE_ACRONYM.fullmatch(t): return True
+    return False
+
+def _skip_paragraph(para, past_bibliography: bool = False) -> bool:
+    if past_bibliography: return True
+    if not para.text.strip(): return True
+    if _get_para_style_id(para) in _NO_TRANSLATE_STYLE_IDS: return True
+    for tag in [f'{_W}drawing', f'{_W}pict']:
+        if para._element.find('.//' + tag) is not None: return True
+    style_name = (para.style.name or '').lower() if para.style is not None else ''
+    if any(style_name.startswith(s) for s in _SKIP_STYLES): return True
+    return False
+
+def _is_biblio_title_para(para) -> bool:
+    style_id = ''
+    try:
+        pStyle = para._element.find(f'{_W}pPr/{_W}pStyle')
+        if pStyle is not None: style_id = pStyle.get(f'{_W}val', '').lower()
+    except Exception: pass
+    if style_id in _BIBLIO_TITLE_STYLES: return True
+    txt = para.text.strip().lower()
+    return bool(txt) and not txt[0].isdigit() and txt in _BIBLIO_KEYWORDS_EXACT
+
+def _get_para_style_id(para) -> str:
+    pStyle = para._element.find(f'{_W}pPr/{_W}pStyle')
+    return pStyle.get(f'{_W}val', '') if pStyle is not None else ''
+
+def _get_style_id(el) -> str:
+    pStyle = el.find(f'{_W}pPr/{_W}pStyle')
+    return pStyle.get(f'{_W}val', '') if pStyle is not None else 'Normal'
+
+def _has_inline_sectpr(para) -> bool:
+    pPr = para._element.find(f'{_W}pPr')
+    return pPr is not None and pPr.find(f'{_W}sectPr') is not None
+
+def _all_runs_italic(para) -> bool:
+    text_runs = [r for r in para.runs if r.text.strip()]
+    if not text_runs: return False
+    para_style_italic = False
+    try:
+        if para.style and para.style.font and para.style.font.italic: para_style_italic = True
+    except Exception: pass
+    for run in text_runs:
+        italic = False
+        if run.font.italic is True: italic = True
+        if not italic:
+            rPr = run._element.find(f'{_W}rPr')
+            if rPr is not None:
+                i_el = rPr.find(f'{_W}i')
+                if i_el is not None:
+                    val = i_el.get(f'{_W}val', 'true')
+                    if val.lower() not in ('false', '0'): italic = True
+        if not italic and para_style_italic:
+            rPr = run._element.find(f'{_W}rPr')
+            if rPr is not None:
+                i_el = rPr.find(f'{_W}i')
+                if i_el is not None:
+                    val = i_el.get(f'{_W}val', 'true')
+                    if val.lower() not in ('false', '0'): italic = True
+                else: italic = True
+            else: italic = True
+        if not italic: return False
     return True
 
 
-def _enforce_italic_terms(doc, terms: list[str]) -> None:
-    """Jaring pengaman terakhir: paksa teks yang PERSIS sama dengan salah
-    satu `terms` (mis. "Red Green Blue") agar SELALU tampil italic, apa pun
-    yang terjadi di tahap-tahap sebelumnya (terjemahan, dsb). Dijalankan
-    paling akhir (sebelum doc.save) di StyleFinalizerEngine supaya jadi
-    jaminan final.
+# ─────────────────────────────────────────────────────────────────────────────
+# PROTEKSI ISTILAH/JUDUL ASING YANG SUDAH MIRING DI SUMBER
+# ─────────────────────────────────────────────────────────────────────────────
+# Di dokumen ISO, judul dokumen acuan (mis. pada klausul "Acuan normatif")
+# dan istilah asing lain biasanya SUDAH dicetak miring di file sumber.
+# Sesuai konvensi SNI, bagian ini TIDAK diterjemahkan dan tetap dicetak
+# miring pada dokumen hasil. Sebelumnya bagian ini "hilang" karena
+# _translate_para menggabungkan semua run menjadi satu string polos
+# sebelum diterjemahkan, sehingga info format miring per-run dibuang dan
+# teksnya ikut diterjemahkan seperti teks biasa. Fungsi di bawah ini
+# mendeteksi run miring tersebut dan melindunginya dengan mekanisme
+# token yang sama seperti "Kamus Istilah Asing" (spreadsheet).
 
-    Menangani DUA kasus:
-      1. Run yang teksnya PERSIS == term -> langsung di-italic-kan (cepat,
-         seperti semula).
-      2. Term muncul sebagai BAGIAN dari run yang lebih besar (mis. hasil
-         penggabungan run oleh proses lain) -> run tsb dipecah supaya
-         hanya bagian term-nya yang italic, sisanya tetap memakai
-         formatting asli tanpa berubah.
-    Tidak mengubah paragraf/run lain yang tidak mengandung salah satu term.
+def _get_para_style_italic(para) -> bool:
+    try:
+        if para.style and para.style.font and para.style.font.italic: return True
+    except Exception: pass
+    return False
+
+def _run_effective_italic(run, para_style_italic: bool) -> bool:
+    if run.font.italic is True: return True
+    if run.font.italic is False: return False
+    rPr = run._element.find(f'{_W}rPr')
+    if rPr is not None:
+        i_el = rPr.find(f'{_W}i')
+        if i_el is not None:
+            val = i_el.get(f'{_W}val', 'true')
+            return val.lower() not in ('false', '0')
+        return para_style_italic
+    return para_style_italic
+
+def _extract_source_italic_map(text_runs, para_style_italic: bool) -> tuple[str, dict]:
     """
-    for para in doc.paragraphs:
-        for run in list(para.runs):
-            text = run.text
-            if not text:
-                continue
-            for term in terms:
-                if term in text:
-                    _split_run_and_italicize(run, term)
-                    break
-
-
-def _enforce_empty_daftar_isi_page(doc) -> None:
-    """Jaring pengaman terakhir: pastikan halaman "Daftar Isi" SELALU kosong
-    (tanpa entri/teks apa pun di bawah judulnya), apa pun yang terjadi di
-    tahap-tahap sebelumnya (mis. field TOC yang ter-update otomatis, atau
-    proses lain yang tanpa sengaja menambahkan teks). Dijalankan paling
-    akhir (sebelum doc.save) di StyleFinalizerEngine.
-
-    Cakupan: dari paragraf TEPAT SETELAH judul "Daftar Isi" (kemunculan
-    pertama di seluruh dokumen), berhenti pada batas TERDEKAT dari:
-      1. paragraf "Prakata" atau "Pendahuluan" (heading halaman
-         berikutnya — PENTING: di pipeline ini, DI + Prakata +
-         Pendahuluan berbagi SATU section/sectPr yang sama, letaknya
-         jauh di akhir Pendahuluan — bukan tepat setelah Daftar Isi.
-         Maka deteksi sectPr SAJA tidak cukup & pernah salah menghapus
-         seluruh isi Prakata/Pendahuluan; heading berikutnya harus jadi
-         batas utama).
-      2. paragraf ber-style Heading (badan dokumen utama sudah mulai).
-      3. paragraf yang memuat <w:sectPr> (akhir section, jaga-jaga bila
-         Prakata/Pendahuluan belum ada sama sekali).
-      4. batas pengaman keras (_MAX_SCAN paragraf) supaya proses TIDAK
-         PERNAH menyapu ke bagian dokumen yang jauh meski 1–3 gagal
-         terdeteksi.
-    Hanya TEKS run yang dihapus (run/paragraf itu sendiri tidak
-    dihapus), supaya format/struktur dokumen tidak berubah.
+    Gabungkan run menjadi satu teks (seperti semula), TAPI bagian yang
+    sudah diformat miring di sumber diganti token dulu agar tidak ikut
+    diterjemahkan. token_map: token -> teks asli (verbatim, akan
+    dikembalikan + dicetak miring setelah proses terjemahan selesai).
     """
-    _MAX_SCAN = 8   # lebih dari cukup: DI hanya berisi judul + 3 paragraf kosong
-    _BOUNDARY_TITLES = {'prakata', 'pendahuluan'}
+    segments = []
+    for _, r in text_runs:
+        is_ital = _run_effective_italic(r, para_style_italic)
+        t = r.text or ''
+        if segments and segments[-1][1] == is_ital:
+            segments[-1] = [segments[-1][0] + t, is_ital]
+        else:
+            segments.append([t, is_ital])
 
-    paras = doc.paragraphs
-    di_idx = None
-    for i, p in enumerate(paras):
-        if _norm(p.text) == 'daftar isi':
-            di_idx = i
-            break
-    if di_idx is None:
+    token_map = {}
+    out_parts = []
+    for seg_text, is_ital in segments:
+        stripped = seg_text.strip()
+        if is_ital and len(stripped) >= 3 and not _RE_PURE_NUMBER.fullmatch(stripped):
+            token = f'ZXQSRC{uuid.uuid4().hex[:12].upper()}QXZ'
+            token_map[token] = seg_text
+            out_parts.append(token)
+        else:
+            out_parts.append(seg_text)
+    return ''.join(out_parts), token_map
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PROTEKSI PANGKAT (SUPERSCRIPT) & INDEKS (SUBSCRIPT)
+# ─────────────────────────────────────────────────────────────────────────────
+# Dokumen ISO sering memuat notasi teknis dengan pangkat/indeks, misalnya
+# "kWm⁻²" atau rumus kimia semacam "CO₂". Sebelumnya _translate_para
+# menggabungkan seluruh run paragraf menjadi satu string polos sebelum
+# dikirim ke mesin terjemahan, sehingga informasi w:vertAlign (superscript/
+# subscript) per-run ikut hilang dan hasil akhirnya tampil rata (tidak lagi
+# berupa pangkat/indeks) — baik pada dokumen hasil format (Inggris) maupun
+# hasil terjemahan (Indonesia). Fungsi-fungsi berikut melindungi teks yang
+# berformat superscript/subscript dengan mekanisme token yang sama seperti
+# proteksi miring di atas, agar formatnya bisa dikembalikan persis setelah
+# proses terjemahan selesai.
+
+def _run_vertalign(run) -> str | None:
+    """Kembalikan 'superscript', 'subscript', atau None sesuai format run."""
+    try:
+        if run.font.superscript:
+            return 'superscript'
+        if run.font.subscript:
+            return 'subscript'
+    except Exception:
+        pass
+    # Fallback baca langsung XML — beberapa run tidak selalu terbaca lewat
+    # properti python-docx bila nilai w:vertAlign bukan True/False sederhana.
+    rPr = run._element.find(f'{_W}rPr')
+    if rPr is not None:
+        va_el = rPr.find(f'{_W}vertAlign')
+        if va_el is not None:
+            val = va_el.get(f'{_W}val', '')
+            if val == 'superscript': return 'superscript'
+            if val == 'subscript': return 'subscript'
+    return None
+
+
+def _extract_source_format_map(text_runs, para_style_italic: bool) -> tuple[str, dict]:
+    """
+    Versi gabungan dari _extract_source_italic_map yang JUGA melindungi
+    superscript/subscript. Menggabungkan run menjadi satu teks, tapi:
+      - Segmen superscript/subscript SELALU dilindungi token (berapa pun
+        panjangnya — bisa cuma 1 karakter seperti pangkat "2"), supaya
+        teks & formatnya persis sama setelah diterjemahkan.
+      - Segmen miring (tanpa superscript/subscript) tetap memakai aturan
+        lama (istilah/judul asing yang sudah miring di sumber).
+    token_map: token -> {'text': teks asli, 'italic': bool, 'vtype': str|None}
+    """
+    segments = []
+    for _, r in text_runs:
+        is_ital = _run_effective_italic(r, para_style_italic)
+        vtype = _run_vertalign(r)
+        key = (is_ital, vtype)
+        t = r.text or ''
+        if segments and segments[-1][1] == key:
+            segments[-1][0] += t
+        else:
+            segments.append([t, key])
+
+    token_map = {}
+    out_parts = []
+    for seg_text, (is_ital, vtype) in segments:
+        stripped = seg_text.strip()
+        if not stripped:
+            out_parts.append(seg_text)
+            continue
+        protect = False
+        if vtype is not None:
+            protect = True
+        elif is_ital and len(stripped) >= 3 and not _RE_PURE_NUMBER.fullmatch(stripped):
+            protect = True
+        if protect:
+            token = f'ZXQSRC{uuid.uuid4().hex[:12].upper()}QXZ'
+            token_map[token] = {'text': seg_text, 'italic': is_ital, 'vtype': vtype}
+            out_parts.append(token)
+        else:
+            out_parts.append(seg_text)
+    return ''.join(out_parts), token_map
+
+
+def _detokenize_with_formatting(text: str, token_map: dict) -> tuple[str, list]:
+    """
+    Kembalikan token @@SRC_...@@ pada `text` menjadi teks aslinya (verbatim),
+    sekaligus catat posisi (start, end, italic, vtype) di teks HASIL agar
+    formatnya (miring/superscript/subscript) bisa diterapkan secara presisi
+    saat membangun ulang run — tanpa perlu mencari-cari substring lagi.
+    """
+    if not token_map:
+        return text, []
+    pattern = re.compile(
+        '|'.join(re.escape(t) for t in token_map.keys()), re.IGNORECASE
+    )
+    token_map_folded = {token.casefold(): info for token, info in token_map.items()}
+    spans = []
+    chunks = []
+    cur_len = 0
+    last_end = 0
+    for m in pattern.finditer(text):
+        plain = text[last_end:m.start()]
+        chunks.append(plain)
+        cur_len += len(plain)
+        info = token_map_folded[m.group(0).casefold()]
+        orig_text = info['text']
+        spans.append((cur_len, cur_len + len(orig_text), info.get('italic', False), info.get('vtype')))
+        chunks.append(orig_text)
+        cur_len += len(orig_text)
+        last_end = m.end()
+    chunks.append(text[last_end:])
+    return ''.join(chunks), spans
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# DETEKSI HYPERLINK
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _has_hyperlinks(para) -> bool:
+    """Cek apakah paragraf memiliki hyperlink."""
+    return para._element.find(f'{_W}hyperlink') is not None
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ITALIC FORMATTING
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _apply_mixed_formatting_to_para(para, text: str, italic_terms: list[str],
+                                     font_name: str = None, font_size: int = None,
+                                     format_spans: list = None) -> None:
+    """
+    Terapkan formatting ke paragraf hasil terjemahan:
+      - `format_spans`: posisi PRESISI (start, end, italic, vtype) hasil
+        dari _detokenize_with_formatting — dipakai untuk mengembalikan
+        superscript/subscript (dan miring sumber) persis seperti aslinya.
+      - `italic_terms`: daftar istilah (dari Kamus Istilah Asing) yang perlu
+        dicari lagi posisinya di teks (pendekatan lama, best-effort, hanya
+        untuk MIRING, tidak pernah untuk superscript/subscript).
+    """
+    format_spans = format_spans or []
+
+    # Posisi yang sudah dipakai oleh format_spans (presisi) — istilah kamus
+    # tidak boleh menimpa area ini.
+    covered = [(s, e) for s, e, _, _ in format_spans]
+
+    def _overlaps_covered(s, e):
+        for cs, ce in covered:
+            if s < ce and e > cs:
+                return True
+        return False
+
+    dict_positions = []
+    if italic_terms:
+        text_lower = text.lower()
+        for term in italic_terms:
+            term_lower = term.lower()
+            start = 0
+            while True:
+                idx = text_lower.find(term_lower, start)
+                if idx == -1: break
+                dict_positions.append((idx, idx + len(term)))
+                start = idx + 1
+        dict_positions.sort(key=lambda x: x[0])
+        filtered_dict = []
+        last_end = -1
+        for start, end in dict_positions:
+            if start >= last_end and not _overlaps_covered(start, end):
+                filtered_dict.append((start, end, True, None))
+                last_end = end
+        dict_positions = filtered_dict
+
+    all_spans = sorted(list(format_spans) + dict_positions, key=lambda x: x[0])
+
+    if not all_spans:
+        if para.runs:
+            para.runs[0].text = text
+            for r in para.runs[1:]: r.text = ''
+        else:
+            para.add_run(text)
         return
 
-    scanned = 0
-    for p in paras[di_idx + 1:]:
-        if scanned >= _MAX_SCAN:
-            break
-        scanned += 1
+    segments = []
+    last_pos = 0
+    for start, end, is_italic, vtype in all_spans:
+        if start < last_pos:
+            continue  # lewati span yang tumpang tindih (seharusnya sudah difilter)
+        if start > last_pos:
+            segments.append((text[last_pos:start], False, None))
+        segments.append((text[start:end], is_italic, vtype))
+        last_pos = end
 
-        norm_text = _norm(p.text)
-        if norm_text in _BOUNDARY_TITLES:
-            break
-        style_name = (p.style.name or '') if p.style is not None else ''
-        if style_name.lower().startswith('heading'):
-            break
+    if last_pos < len(text):
+        segments.append((text[last_pos:], False, None))
 
-        pPr = p._p.find(qn('w:pPr'))
-        has_sectpr = pPr is not None and pPr.find(qn('w:sectPr')) is not None
-        for run in p.runs:
-            run.text = ''
-        if has_sectpr:
+    # Salin direct run formatting dari Engine 7 (font, ukuran, bold, warna,
+    # underline, language, dll.) sebagai basis semua run baru. Style paragraf,
+    # numbering, indent, spacing, alignment, dan page-break tidak pernah diubah.
+    source_runs = list(para.runs)
+    base_rpr = None
+    for source_run in source_runs:
+        if source_run.text.strip() and not _run_effective_italic(
+            source_run, _get_para_style_italic(para)
+        ):
+            if source_run._element.rPr is not None:
+                base_rpr = copy.deepcopy(source_run._element.rPr)
             break
+    if base_rpr is None:
+        for source_run in source_runs:
+            if source_run.text.strip() and source_run._element.rPr is not None:
+                base_rpr = copy.deepcopy(source_run._element.rPr)
+                break
+
+    for run in source_runs:
+        run._element.getparent().remove(run._element)
+
+    for seg_text, is_italic, vtype in segments:
+        if not seg_text: continue
+
+        run = para.add_run(seg_text)
+        if base_rpr is not None:
+            if run._element.rPr is not None:
+                run._element.remove(run._element.rPr)
+            run._element.insert(0, copy.deepcopy(base_rpr))
+        else:
+            run.font.name = font_name or 'Arial'
+            if font_size:
+                run.font.size = Pt(font_size)
+
+        run.italic = bool(is_italic)
+        run.font.superscript = False
+        run.font.subscript = False
+        if vtype == 'superscript':
+            run.font.superscript = True
+        elif vtype == 'subscript':
+            run.font.subscript = True
 
 
-class StyleFinalizerEngine:
+# ─────────────────────────────────────────────────────────────────────────────
+# FITUR 1: REKONSTRUKSI ANNEX
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _fix_annex_style_para(para, annex_letter: str = None) -> str:
+    """Rekonstruksi paragraf judul Annex/Lampiran menjadi 'Lampiran X'.
+    Mengembalikan huruf Lampiran (mis. 'A', 'B', 'C') yang benar-benar dipakai,
+    supaya pemanggil bisa menyinkronkan penomoran sub-pasal (a2/a3) di bawahnya
+    dengan huruf yang sama persis (lihat _fix_annex_sub_para)."""
+    sid = _get_para_style_id(para)
+    if sid not in _ANNEX_STYLE_IDS: return annex_letter
+    full_text = ''.join(r.text for r in para.runs if r.text is not None).strip()
+    if not full_text: return annex_letter
+    tag_norm = None; title_part = full_text
+    for t in ['(informatif)', '(normatif)', '(informative)', '(normative)', '(informasi)']:
+        idx = full_text.lower().find(t)
+        if idx != -1:
+            tag_norm = '(normatif)' if 'norm' in t.lower() else '(informatif)'
+            title_part = full_text[:idx] + " " + full_text[idx + len(t):]
+            break
+    annex_label = None
+    resolved_letter = annex_letter
+    m_annex = re.match(r'^(?:Annex|Lampiran)\s+([A-Z0-9\.]+)\s*', title_part, flags=re.IGNORECASE)
+    if m_annex:
+        resolved_letter = m_annex.group(1).upper()
+        annex_label = f'Lampiran {resolved_letter}'
+        title_part = title_part[m_annex.end():].strip()
+    elif annex_letter:
+        resolved_letter = annex_letter.upper()
+        annex_label = f'Lampiran {resolved_letter}'
+        title_part = re.sub(r'^(?:Annex|Lampiran)\s*\S*\s*', '', title_part, flags=re.IGNORECASE).strip()
+    else:
+        title_part = re.sub(r'^(?:Annex|Lampiran)\s*\S*\s*', '', title_part, flags=re.IGNORECASE).strip()
+    title_part = title_part.lstrip('\n').strip()
+    pPr = para._element.find(f'{_W}pPr')
+    if pPr is None: pPr = etree.SubElement(para._element, f'{_W}pPr')
+    old_numPr = pPr.find(f'{_W}numPr')
+    if old_numPr is not None: pPr.remove(old_numPr)
+    pPr.insert(0, etree.fromstring(f'<w:numPr xmlns:w="{_NS_W}"><w:ilvl w:val="0"/><w:numId w:val="0"/></w:numPr>'))
+    for child in list(para._element):
+        if child is not pPr: para._element.remove(child)
+    def mk(text, bold=False):
+        esc = text.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+        b = '<w:b/><w:bCs/>' if bold else ''
+        return etree.fromstring(f'<w:r xmlns:w="{_NS_W}"><w:rPr><w:rFonts w:ascii="Arial" w:hAnsi="Arial" w:cs="Arial"/>{b}<w:sz w:val="24"/><w:szCs w:val="24"/></w:rPr><w:t xml:space="preserve">{esc}</w:t></w:r>')
+    new_runs = []
+    if annex_label: new_runs.extend([mk(annex_label, True), etree.fromstring(f'<w:r xmlns:w="{_NS_W}"><w:br/></w:r>')])
+    else: new_runs.append(etree.fromstring(f'<w:r xmlns:w="{_NS_W}"><w:br/></w:r>'))
+    if tag_norm: new_runs.append(mk(tag_norm, True))
+    if title_part: new_runs.extend([etree.fromstring(f'<w:r xmlns:w="{_NS_W}"><w:br/></w:r>'), mk(title_part, True)])
+    for run_el in new_runs: para._element.append(run_el)
+    return resolved_letter
+
+
+def _fix_annex_sub_para(para, number_prefix: str) -> None:
+    """Sisipkan nomor pasal literal (mis. 'B.1    ') di depan judul sub-pasal
+    Annex/Lampiran (style 'a2'/'a3') dan matikan numPr bawaan Word di paragraf
+    tsb.
+
+    BUG YANG DIPERBAIKI: paragraf judul Annex (style ANNEX) sengaja dimatikan
+    penomoran otomatisnya oleh _fix_annex_style_para (numId di-set ke 0) agar
+    teks 'Lampiran A/B/C' bisa ditulis manual. Tapi ini membuat counter level-0
+    dari daftar bertingkat (multilevel list) milik style 'a2'/'a3' TIDAK PERNAH
+    di-restart ketika masuk Lampiran baru -- akibatnya nomor pasal di Lampiran
+    B, C, dst tetap numeric lanjut dari Lampiran A namun hurufnya nyangkut di
+    'A' (mis. 'A.6', 'A.7' ... padahal seharusnya 'B.1', 'B.2', ...). Solusinya
+    sama seperti judul Annex: matikan numPr paragraf ini dan tulis nomor pasal
+    (huruf Lampiran + nomor urut yang di-reset di python) sebagai teks literal.
     """
-    Menambahkan style "Judul" & "Pasal" ke dokumen lalu menerapkannya secara
-    otomatis pada heading halaman (Judul) dan Pasal/Subpasal berbahasa
-    Indonesia (Pasal), tanpa mengubah bagian dokumen lainnya.
-    """
+    pPr = para._element.find(f'{_W}pPr')
+    if pPr is None:
+        pPr = etree.SubElement(para._element, f'{_W}pPr')
+        para._element.insert(0, pPr)
+    old_numPr = pPr.find(f'{_W}numPr')
+    if old_numPr is not None: pPr.remove(old_numPr)
+    pPr.insert(0, etree.fromstring(f'<w:numPr xmlns:w="{_NS_W}"><w:ilvl w:val="0"/><w:numId w:val="0"/></w:numPr>'))
 
-    def apply(self, input_docx: str, output_docx: str) -> tuple[bool, str]:
-        try:
-            doc = Document(input_docx)
-
-            # 1) Pastikan style "Judul" & "Pasal" tersedia di styles.xml
-            _ensure_style(doc, 'Judul', _JUDUL_STYLE_XML)
-            _ensure_style(doc, 'Pasal', _PASAL_STYLE_XML)
-
-            paras = doc.paragraphs
-            n = len(paras)
-
-            def style_name(p):
-                return p.style.name if p.style is not None else ''
-
-            # 2) Petakan nomor section (1-based) dan cari marker Engine5.
-            # Marker adalah batas mutlak: semua pasal/subpasal setelah marker
-            # merupakan duplikasi bahasa Inggris dan TIDAK boleh disentuh.
-            section_by_idx = []
-            section_no = 1
-            marker_idx = n
-            for i, paragraph in enumerate(paras):
-                section_by_idx.append(section_no)
-                for bm in paragraph._p.iter(qn('w:bookmarkStart')):
-                    if bm.get(qn('w:name')) == _ENGINE5_MARKER:
-                        marker_idx = min(marker_idx, i)
-                pPr = paragraph._p.find(qn('w:pPr'))
-                if pPr is not None and pPr.find(qn('w:sectPr')) is not None:
-                    section_no += 1
-
-            # 3) Kumpulkan target style "Judul" sesuai section.
-            judul_targets = {}  # idx -> force_page_break_before
-            annex_indices = set(
-                i for i in range(n)
-                if style_name(paras[i]) == 'ANNEX'
-                or re.match(r'^\s*(?:lampiran|annex)\s+[A-Z0-9]', paras[i].text or '', re.I)
-            )
-            for i, paragraph in enumerate(paras):
-                folded = _norm(paragraph.text)
-                sec = section_by_idx[i]
-                # Section 3: hanya heading halaman front matter.
-                if sec == 3 and folded in {'daftar isi', 'prakata', 'pendahuluan'}:
-                    judul_targets[i] = False
-                # Content Indonesia: hanya judul Lampiran sebelum marker.
-                elif sec >= 4 and i < marker_idx and re.match(r'^lampiran\s+[a-z0-9]', folded):
-                    judul_targets[i] = True
-                # Bibliografi adalah pengecualian yang berada sesudah salinan
-                # Engine5 tetapi tetap harus masuk style Judul/TOC.
-                elif sec >= 4 and folded == 'bibliografi':
-                    judul_targets[i] = style_name(paragraph) == 'Biblio Title'
-
-            for idx, force_pb in judul_targets.items():
-                _apply_judul(doc, paras[idx], force_page_break_before=force_pb)
-
-            # 4) Kumpulkan target style "Pasal": seluruh Pasal/Subpasal pada
-            # Content Indonesia sebelum marker, termasuk a2 di Lampiran.
-            heading1_num_id = _resolve_num_id(doc, 'Heading1')
-            heading2_num_id = _resolve_num_id(doc, 'Heading2') or heading1_num_id
-
-            # Subpasal di dalam Lampiran/Annex ('a2'/'a3'): numId & ilvl
-            # style-nya SENDIRI (bukan Heading1/2) hanya dipakai sebagai
-            # PENANDA bahwa paragraf tsb memang bagian dari list Lampiran
-            # (untuk menentukan target). Nomor yang tampil TIDAK lagi
-            # dibangkitkan dari numId ini — auto-numbering Word dinonaktifkan
-            # di _apply_pasal, nomor mengikuti teks literal dokumen asli
-            # (mis. B.1, B.2, ... untuk Lampiran B, apa adanya dari teks).
-            annex_a2_num_id = _resolve_num_id(doc, 'a2')
-            annex_a2_ilvl = _resolve_style_ilvl(doc, 'a2')
-
-            pasal_targets = []  # (idx, ilvl, num_id, number_text)
-            # Counter untuk membangkitkan nomor Pasal/Subpasal (lihat
-            # penjelasan lengkap di komentar atas _RE_LEADING_NUMBER).
-            h1_counter = 0          # nomor Pasal (Heading 1) berjalan
-            h2_counter = 0          # nomor Subpasal (Heading 2), reset tiap Pasal baru
-            annex_letter = None       # huruf Lampiran/Annex aktif, mis. A, B, C
-            annex_sub_counter = 0      # nomor 'a2' (mis. B.1, B.2, ...), reset tiap Annex baru
-            for i in range(n):
-                sname = style_name(paras[i])
-                if i in annex_indices:
-                    # Ambil huruf dari judul aktual, BUKAN dari counter global.
-                    # Dengan demikian:
-                    #   Lampiran A -> A.1, A.2, ...
-                    #   Lampiran B -> B.1, B.2, ...
-                    #   Annex A    -> A.1, A.2, ...
-                    #   Annex B    -> B.1, B.2, ...
-                    # dan bagian Inggris tidak berubah menjadi C/D hanya karena
-                    # bagian Indonesia sudah memiliki Annex A/B yang sama.
-                    m_annex = re.search(
-                        r'\b(?:Lampiran|Annex)\s+([A-Z])(?:\b|\s|$)',
-                        paras[i].text.strip(),
-                        flags=re.IGNORECASE
-                    )
-                    annex_letter = m_annex.group(1).upper() if m_annex else annex_letter
-                    annex_sub_counter = 0
-                    continue
-
-                # Hanya section Content Indonesia dan selalu sebelum marker.
-                if section_by_idx[i] < 4 or i >= marker_idx:
-                    continue
-                if sname in ('@Pasal', 'Pasal'):
-                    # Migrasi style lama. Pertahankan nomor literal yang telah
-                    # dibuat Engine7/8, termasuk A.1/A.1.1 pada Lampiran.
-                    m_num = re.match(r'^\s*([A-Z]?\d+(?:\.\d+)*)\.?\s+', paras[i].text or '', re.I)
-                    if m_num:
-                        number = m_num.group(1).upper()
-                        level = number.count('.')
-                        if level <= 1:
-                            pasal_targets.append((i, level, None, number))
-                        else:
-                            # Bersihkan hasil Engine9 lama/idempotent: Pasal
-                            # tingkat 3 tidak boleh tetap memakai style Pasal,
-                            # karena field TOC Word mengambil style tersebut.
-                            _set_pstyle(paras[i], 'a3' if number[0].isalpha() else 'Heading3')
-                    else:
-                        pasal_targets.append((i, 0, None, None))
-                elif sname == 'Heading 1':
-                    h1_counter += 1
-                    h2_counter = 0
-                    pasal_targets.append((i, 0, heading1_num_id, str(h1_counter)))
-                elif sname == 'Heading 2':
-                    h2_counter += 1
-                    pasal_targets.append((i, 1, heading2_num_id, f'{h1_counter}.{h2_counter}'))
-                elif sname.lower() == 'a2' and annex_letter:
-                    annex_sub_counter += 1
-                    pasal_targets.append(
-                        (i, annex_a2_ilvl, annex_a2_num_id,
-                         f'{annex_letter}.{annex_sub_counter}')
-                    )
-                # a3/Heading 3+ (mis. A.1.1/1.1.1) sengaja tidak disentuh
-                # Judul Lampiran sendiri (style "ANNEX") sengaja tidak disentuh
-
-            for idx, ilvl, num_id, number_text in pasal_targets:
-                _apply_pasal(doc, paras[idx], ilvl, num_id, number_text)
-
-            # 6) Jaring pengaman terakhir: pastikan "Red Green Blue" pada
-            #    Prakata SELALU tercetak italic — jaminan final sebelum
-            #    dokumen disimpan.
-            #    CATATAN: _enforce_empty_daftar_isi_page() SENGAJA TIDAK
-            #    dipanggil lagi di sini. Engine5 (DaftarIsiEngine) kini
-            #    menyisipkan field TOC asli Word di halaman Daftar Isi
-            #    (lihat engine5.py) supaya daftar isi terisi otomatis —
-            #    memanggil fungsi ini akan menghapus kembali isi field
-            #    tersebut sehingga halaman Daftar Isi kosong lagi.
-            #    Fungsi itu sendiri dibiarkan ada (tidak dihapus) di bawah
-            #    supaya tidak mengubah bagian lain dari engine ini.
-            _enforce_italic_terms(doc, ['Red Green Blue'])
-
-            doc.save(output_docx)
-
-            msg = (
-                f'OK: {len(judul_targets)} heading/Lampiran -> "Judul", '
-                f'{len(pasal_targets)} pasal/subpasal -> "Pasal".'
-            )
-            return True, msg
-
-        except Exception as e:
-            import traceback
-            return False, f'StyleFinalizerEngine Error: {str(e)}\n{traceback.format_exc()}'
-
-
-def apply_custom_styles(input_docx: str, output_docx: str) -> tuple[bool, str]:
-    """Shortcut fungsi-level untuk StyleFinalizerEngine().apply(...)."""
-    return StyleFinalizerEngine().apply(input_docx, output_docx)
-
-
-class TableOfContentsEngine:
-    """Engine 9 final: buat style Judul/Pasal lalu sisipkan TOC Word."""
-
-    @staticmethod
-    def _ensure_toc_style(doc: Document):
-        style = None
-        for candidate in (_TOC_STYLE_NAME, 'toc 1'):
-            try:
-                style = doc.styles[candidate]
-                break
-            except KeyError:
-                pass
-        if style is None:
-            style = doc.styles.add_style(_TOC_STYLE_NAME, WD_STYLE_TYPE.PARAGRAPH)
-        try:
-            style.base_style = doc.styles['Normal']
-            style.next_paragraph_style = doc.styles['Normal']
-        except KeyError:
-            pass
-
-        # Bangun ulang pPr/rPr secara deterministik agar properti lama dari
-        # template (bold, indent, alignment, space-before) tidak tersisa.
-        style_el = style.element
-        priority = style_el.find(qn('w:uiPriority'))
-        if priority is None:
-            priority = OxmlElement('w:uiPriority')
-            style_el.insert(3, priority)
-        priority.set(qn('w:val'), '39')
-
-        pPr = style_el.get_or_add_pPr()
-        for child in list(pPr):
-            pPr.remove(child)
-        tabs = OxmlElement('w:tabs')
-        left_tab = OxmlElement('w:tab')
-        left_tab.set(qn('w:val'), 'left')
-        left_tab.set(qn('w:pos'), '720')       # 1,27 cm
-        tabs.append(left_tab)
-        right_tab = OxmlElement('w:tab')
-        right_tab.set(qn('w:val'), 'right')
-        right_tab.set(qn('w:leader'), 'dot')
-        right_tab.set(qn('w:pos'), '9752')     # 17,2 cm
-        tabs.append(right_tab)
-        pPr.append(tabs)
-        pPr.append(OxmlElement('w:suppressAutoHyphens'))
-        spacing = OxmlElement('w:spacing')
-        spacing.set(qn('w:after'), '120')      # 6 pt
-        spacing.set(qn('w:line'), '240')       # single
-        spacing.set(qn('w:lineRule'), 'auto')
-        pPr.append(spacing)
-
-        rPr = style_el.get_or_add_rPr()
-        for child in list(rPr):
-            rPr.remove(child)
-        fonts = OxmlElement('w:rFonts')
-        fonts.set(qn('w:ascii'), 'Arial')
-        fonts.set(qn('w:hAnsi'), 'Arial')
-        rPr.append(fonts)
-        return style
-
-    @staticmethod
-    def _add_fld_char(run, kind: str, dirty: bool = False):
-        fld = OxmlElement('w:fldChar')
-        fld.set(qn('w:fldCharType'), kind)
-        if dirty:
-            fld.set(qn('w:dirty'), 'true')
-        run._r.append(fld)
-
-    @staticmethod
-    def _remove_existing_toc(doc: Document):
-        for bookmark in list(doc.element.body.iter(qn('w:bookmarkStart'))):
-            if bookmark.get(qn('w:name')) != _TOC_MARK_BOOKMARK:
-                continue
-            node = bookmark
-            while node is not None and node.tag != qn('w:p'):
-                node = node.getparent()
-            if node is not None and node.getparent() is not None:
-                node.getparent().remove(node)
-            break
-
-    @staticmethod
-    def _clear_cached_toc_entries(title: Paragraph):
-        """Hapus hasil TOC lama di antara judul dan page break/Prakata.
-
-        Saat field TOC pernah diperbarui Word, hasilnya dapat menjadi banyak
-        paragraf ``TOC 1``. Menghapus paragraf field bertanda bookmark saja
-        tidak cukup dan dapat mendorong TOC baru ke halaman berikutnya.
-        """
-        node = title._p.getnext()
-        while node is not None:
-            next_node = node.getnext()
-            if node.tag in (qn('w:bookmarkStart'), qn('w:bookmarkEnd')):
-                # Beberapa Word/LibreOffice menyimpan bookmark TOC sebagai
-                # sibling paragraf, bukan di dalam paragraf field.
-                bookmark_name = node.get(qn('w:name')) or ''
-                if node.tag == qn('w:bookmarkEnd') or bookmark_name == _TOC_MARK_BOOKMARK:
-                    node.getparent().remove(node)
-                    node = next_node
-                    continue
-                break
-            # Word lazim membungkus seluruh hasil TOC dalam w:sdt. Hapus
-            # wrapper itu sebagai satu unit agar semua cache entri ikut hilang.
-            if node.tag == qn('w:sdt'):
-                has_toc_field = any(
-                    ' TOC ' in f' {instr.text or ""} '
-                    for instr in node.iter(qn('w:instrText'))
-                )
-                toc_styles = [
-                    style.get(qn('w:val')) or ''
-                    for style in node.iter(qn('w:pStyle'))
-                ]
-                if has_toc_field or any(
-                    value.lower().replace(' ', '') == 'toc1'
-                    for value in toc_styles
-                ):
-                    node.getparent().remove(node)
-                    node = next_node
-                    continue
-                break
-            if node.tag != qn('w:p'):
-                break
-            text = ''.join(t.text or '' for t in node.iter(qn('w:t'))).strip()
-            pPr = node.find(qn('w:pPr'))
-            has_page_break = bool(
-                node.xpath('.//w:br[@w:type="page"] | ./w:pPr/w:pageBreakBefore')
-            )
-            has_sectpr = pPr is not None and pPr.find(qn('w:sectPr')) is not None
-            if _norm(text) in {'prakata', 'pendahuluan'} or has_page_break or has_sectpr:
-                break
-            pstyle = pPr.find(qn('w:pStyle')) if pPr is not None else None
-            style_id = pstyle.get(qn('w:val')) if pstyle is not None else ''
-            is_toc = style_id.lower().replace(' ', '') == 'toc1'
-            has_toc_field = any(
-                ' TOC ' in f' {instr.text or ""} '
-                for instr in node.iter(qn('w:instrText'))
-            )
-            if not text or is_toc or has_toc_field:
-                node.getparent().remove(node)
-            else:
-                break
-            node = next_node
-
-    @staticmethod
-    def _force_update_fields(doc: Document):
-        settings = doc.settings.element
-        node = settings.find(qn('w:updateFields'))
-        if node is None:
-            node = OxmlElement('w:updateFields')
-            settings.append(node)
-        node.set(qn('w:val'), 'true')
-
-    @staticmethod
-    def _disable_update_fields_after_finalization(docx_path: str) -> None:
-        """Jangan biarkan Word menghitung ulang semua field saat file dibuka.
-
-        Engine9 sendiri sudah membuka dokumen di Word, melakukan repaginasi,
-        membangun TOC, dan menyimpan nomor halaman final. Bila
-        ``w:updateFields`` tetap ``true``, Word dapat mengulang pembaruan saat
-        dokumen baru dibuka (sebelum pagination tampilan stabil) dan menimpa
-        hasil tersimpan menjadi i/1. PAGE field di footer tetap bekerja tanpa
-        opsi global ini.
-        """
-        doc = Document(docx_path)
-        settings = doc.settings.element
-        node = settings.find(qn('w:updateFields'))
-        if node is not None:
-            node.set(qn('w:val'), 'false')
-        doc.save(docx_path)
-
-    @staticmethod
-    def _collect_entries(doc: Document, toc_title: Paragraph):
-        entries = []
-        for paragraph in doc.paragraphs:
-            if paragraph._p is toc_title._p:
-                continue
-            if _style_name(paragraph) not in ('Judul', 'Pasal'):
-                continue
-            text = re.sub(r'\s+', ' ', paragraph.text or '').strip()
-            if _style_name(paragraph) == 'Pasal':
-                match = re.match(r'^([A-Z]?\d+(?:\.\d+)*)\b', text, re.I)
-                # Pertahanan berlapis untuk dokumen lama: meskipun style
-                # Pasal tingkat 3 masih tertinggal, jangan masukkan 1.1.1,
-                # A.1.1, dan level yang lebih dalam ke TOC.
-                if match and match.group(1).count('.') > 1:
-                    continue
-            if text:
-                entries.append((text, '…'))
-        return entries
-
-    def _build_toc_paragraph(self, doc: Document):
-        paragraph = doc.add_paragraph()
-        paragraph.style = self._ensure_toc_style(doc)
-        self._add_fld_char(paragraph.add_run(), 'begin', dirty=True)
-        instr_run = paragraph.add_run()
-        instr = OxmlElement('w:instrText')
-        instr.set(qn('xml:space'), 'preserve')
-        instr.text = _TOC_FIELD_INSTR
-        instr_run._r.append(instr)
-        self._add_fld_char(paragraph.add_run(), 'separate')
-        self._add_fld_char(paragraph.add_run(), 'end')
-        start = OxmlElement('w:bookmarkStart')
-        start.set(qn('w:id'), '9001')
-        start.set(qn('w:name'), _TOC_MARK_BOOKMARK)
-        end = OxmlElement('w:bookmarkEnd')
-        end.set(qn('w:id'), '9001')
-        pPr = paragraph._p.find(qn('w:pPr'))
-        paragraph._p.insert(1 if pPr is not None else 0, start)
-        paragraph._p.append(end)
-        return paragraph
-
-    @staticmethod
-    def _toc_anchor_after_three_blank_paragraphs(title: Paragraph):
-        """Letakkan TOC sesudah tepat tiga paragraf kosong setelah judul.
-
-        Template CNT sudah menyediakan tiga paragraf kosong. Jika salah satu
-        tidak ada, tambahkan hanya yang kurang; konten lain tidak disentuh.
-        """
-        # Judul dan tiga blank harus tetap bersama dengan awal TOC pada
-        # halaman yang sama. Blank dibuat ulang secara deterministik.
-        title_pPr = title._p.get_or_add_pPr()
-        for tag in ('w:pageBreakBefore',):
-            old = title_pPr.find(qn(tag))
-            if old is not None:
-                title_pPr.remove(old)
-        if title_pPr.find(qn('w:keepNext')) is None:
-            title_pPr.append(OxmlElement('w:keepNext'))
-
-        anchor = title._p
-        blank_count = 0
-        while blank_count < 3:
-            blank = OxmlElement('w:p')
-            pPr = OxmlElement('w:pPr')
-            pPr.append(OxmlElement('w:keepNext'))
-            spacing = OxmlElement('w:spacing')
-            spacing.set(qn('w:before'), '0')
-            spacing.set(qn('w:after'), '0')
-            spacing.set(qn('w:line'), '240')
-            spacing.set(qn('w:lineRule'), 'auto')
-            pPr.append(spacing)
-            blank.append(pPr)
-            anchor.addnext(blank)
-            anchor = blank
-            blank_count += 1
-        return anchor
-
-    @staticmethod
-    def _update_toc_page_numbers_with_word(docx_path: str) -> None:
-        """Paksa Microsoft Word menghitung pagination lalu menjalankan
-        *Update page numbers only* pada seluruh TOC sebelum file dikembalikan.
-
-        ``w:updateFields`` hanya meminta Word memperbarui field saat dokumen
-        dibuka. Karena itu Engine9 harus benar-benar membuka dokumen melalui
-        Word, melakukan Repaginate(), UpdatePageNumbers(), lalu Save/Close.
-        """
-        if not docx_path or not os.path.isfile(docx_path):
-            raise FileNotFoundError(f'File untuk update TOC tidak ditemukan: {docx_path}')
-        if os.name != 'nt':
-            TableOfContentsEngine._update_toc_page_numbers_on_linux(docx_path)
+    # Jangan tambah dobel kalau paragraf ini sudah pernah diberi prefix (idempoten).
+    first_run = None
+    for r in para._element.findall(f'{_W}r'):
+        t = r.find(f'{_W}t')
+        if t is not None and t.text:
+            first_run = r; break
+    if first_run is not None:
+        t_el = first_run.find(f'{_W}t')
+        if t_el is not None and t_el.text and re.match(r'^[A-Z]\.\d+(\.\d+)?\s{2,}', t_el.text):
             return
 
-        abs_path = os.path.abspath(docx_path)
-        pywin32_error = None
+    font_name = 'Arial'; sz_val = '22'
+    for run in para.runs:
+        if run.text and run.text.strip():
+            if run.font.name: font_name = run.font.name
+            if run.font.size: sz_val = str(int(run.font.size.pt * 2))
+            break
+    esc = number_prefix.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+    new_run = etree.fromstring(
+        f'<w:r xmlns:w="{_NS_W}"><w:rPr><w:rFonts w:ascii="{font_name}" w:hAnsi="{font_name}"/>'
+        f'<w:sz w:val="{sz_val}"/><w:szCs w:val="{sz_val}"/></w:rPr>'
+        f'<w:t xml:space="preserve">{esc}</w:t></w:r>')
+    pPr.addnext(new_run)
 
-        # Metode utama: Word COM via pywin32.
-        try:
-            import pythoncom
-            import win32com.client
 
-            pythoncom.CoInitialize()
-            word = None
-            doc = None
-            try:
-                word = win32com.client.DispatchEx('Word.Application')
-                word.Visible = False
-                word.DisplayAlerts = 0
-                try:
-                    word.Options.Pagination = True
-                except Exception:
-                    pass
-                try:
-                    word.AutomationSecurity = 3  # msoAutomationSecurityForceDisable
-                except Exception:
-                    pass
+# ─────────────────────────────────────────────────────────────────────────────
+# FITUR 2: EM DASH TO BULLETS
+# ─────────────────────────────────────────────────────────────────────────────
 
-                doc = word.Documents.Open(
-                    abs_path,
-                    ConfirmConversions=False,
-                    ReadOnly=False,
-                    AddToRecentFiles=False,
-                    Visible=False,
-                    OpenAndRepair=True,
-                    NoEncodingDialog=True,
-                )
-                try:
-                    doc.Activate()
-                    word.ActiveWindow.View.Type = 3  # wdPrintView
-                    word.ActiveWindow.View.ShowFieldCodes = False
-                except Exception:
-                    pass
-                doc.Repaginate()
+def _get_or_create_emdash_numid(doc: Document) -> str:
+    try:
+        np = doc.part.numbering_part
+        if np is None: return None
+        nxml = np._element; target_abstract_id = None
+        for ab in nxml.findall(f'{_W}abstractNum'):
+            for lvl in ab.findall(f'{_W}lvl'):
+                txt_el = lvl.find(f'{_W}lvlText')
+                if txt_el is not None and txt_el.get(f'{_W}val') == _EM_DASH:
+                    target_abstract_id = ab.get(f'{_W}abstractNumId'); break
+            if target_abstract_id: break
+        if target_abstract_id:
+            existing_nums = nxml.findall(f'{_W}num')
+            max_num_id = max((int(n.get(f'{_W}numId', 0)) for n in existing_nums), default=0)
+            new_num_id = str(max_num_id + 1)
+            nxml.append(etree.fromstring(f'<w:num xmlns:w="{_NS_W}" w:numId="{new_num_id}"><w:abstractNumId w:val="{target_abstract_id}"/></w:num>'))
+            return new_num_id
+        existing_abstracts = nxml.findall(f'{_W}abstractNum')
+        max_abstract_id = max((int(a.get(f'{_W}abstractNumId', 0)) for a in existing_abstracts), default=0)
+        new_abstract_id = str(max_abstract_id + 1)
+        existing_nums = nxml.findall(f'{_W}num')
+        max_num_id = max((int(n.get(f'{_W}numId', 0)) for n in existing_nums), default=0)
+        new_num_id = str(max_num_id + 1)
+        nxml.insert(0, etree.fromstring(f'<w:abstractNum xmlns:w="{_NS_W}" w:abstractNumId="{new_abstract_id}"><w:multiLevelType w:val="hybridMultilevel"/><w:lvl w:ilvl="0"><w:start w:val="1"/><w:numFmt w:val="bullet"/><w:lvlText w:val="{_EM_DASH}"/><w:lvlJc w:val="left"/><w:pPr><w:ind w:left="360" w:hanging="360"/></w:pPr><w:rPr><w:rFonts w:ascii="Symbol" w:hAnsi="Symbol" w:hint="default"/></w:rPr></w:lvl></w:abstractNum>'))
+        nxml.append(etree.fromstring(f'<w:num xmlns:w="{_NS_W}" w:numId="{new_num_id}"><w:abstractNumId w:val="{new_abstract_id}"/></w:num>'))
+        return new_num_id
+    except Exception as e: print(f"[Engine9] Error numbering: {e}"); return None
 
-                toc_count = int(doc.TablesOfContents.Count)
-                if toc_count < 1:
-                    # Field TOC mentah kadang belum masuk koleksi TablesOfContents
-                    # sebelum field tersebut dimaterialisasi Word.
-                    for i in range(1, int(doc.Fields.Count) + 1):
-                        fld = doc.Fields.Item(i)
-                        try:
-                            code = str(fld.Code.Text or '').strip().upper()
-                        except Exception:
-                            code = ''
-                        if code == 'TOC' or code.startswith('TOC '):
-                            fld.Update()
-                    doc.Repaginate()
-                    toc_count = int(doc.TablesOfContents.Count)
+def _convert_emdash_to_bullets(doc: Document) -> None:
+    num_id = _get_or_create_emdash_numid(doc)
+    if not num_id: return
+    for para in doc.paragraphs:
+        sid = _get_para_style_id(para)
+        if sid in _ANNEX_STYLE_IDS or sid.startswith('Heading'): continue
+        text = para.text.strip()
+        if text.startswith(_EM_DASH):
+            for r in para.runs:
+                if _EM_DASH in r.text: r.text = r.text.replace(_EM_DASH, "", 1).lstrip(); break
+            pPr = para._element.find(f'{_W}pPr')
+            if pPr is None: pPr = etree.SubElement(para._element, f'{_W}pPr')
+            old_num = pPr.find(f'{_W}numPr')
+            if old_num is not None: pPr.remove(old_num)
+            pPr.insert(0, etree.fromstring(f'<w:numPr xmlns:w="{_NS_W}"><w:ilvl w:val="0"/><w:numId w:val="{num_id}"/></w:numPr>'))
+            old_ind = pPr.find(f'{_W}ind')
+            if old_ind is not None: pPr.remove(old_ind)
+            pPr.insert(1, etree.fromstring(f'<w:ind xmlns:w="{_NS_W}" w:left="360" w:hanging="360"/>'))
 
-                if toc_count < 1:
-                    raise RuntimeError('Microsoft Word tidak menemukan objek Table of Contents.')
 
-                # WAJIB materialisasikan ulang seluruh entry. Range.Text pada
-                # field TOC baru tidak selalu kosong (dapat berisi karakter
-                # field/bookmark), sehingga pengujian ``if not result_text``
-                # sebelumnya salah melewati Update(). Akibatnya Word hanya
-                # memperbarui cache PAGEREF lama dan semua entry menjadi i/1.
-                for i in range(1, toc_count + 1):
-                    toc = doc.TablesOfContents.Item(i)
-                    try:
-                        toc.Range.Fields.Locked = False
-                    except Exception:
-                        pass
-                    toc.Update()
+# ─────────────────────────────────────────────────────────────────────────────
+# FITUR 3: FIX NOTE / CATATAN
+# ─────────────────────────────────────────────────────────────────────────────
 
-                # Pembentukan TOC dapat menggeser isi beberapa halaman. Ulangi
-                # pagination + UpdatePageNumbers sampai hasil stabil.
-                previous = None
-                for _ in range(4):
-                    doc.Repaginate()
-                    for i in range(1, int(doc.TablesOfContents.Count) + 1):
-                        doc.TablesOfContents.Item(i).UpdatePageNumbers()
-                    current = tuple(
-                        str(doc.TablesOfContents.Item(i).Range.Text or '')
-                        for i in range(1, int(doc.TablesOfContents.Count) + 1)
-                    )
-                    if current == previous:
-                        break
-                    previous = current
+def _fix_note_para(para, force_upper: bool | None = None) -> None:
+    raw_text = para.text or ''
+    full_text = raw_text.strip()
+    if not full_text: return
+    txt_lower = full_text.lower()
+    if not (txt_lower.startswith('note') or txt_lower.startswith('catatan')): return
+    original_label = re.match(r'^(NOTE|Note|note|CATATAN|Catatan|catatan)', full_text)
+    use_upper = force_upper if force_upper is not None else bool(
+        original_label and original_label.group(1).isupper()
+    )
+    if txt_lower.startswith('note'):
+        m = re.match(r'^(NOTE|Note|note)', full_text)
+        if m: full_text = ('CATATAN' if use_upper else 'Catatan') + full_text[len(m.group(1)):]
+    elif txt_lower.startswith('catatan'):
+        m = re.match(r'^(CATATAN|Catatan|catatan)', full_text)
+        if m: full_text = ('CATATAN' if use_upper else 'Catatan') + full_text[len(m.group(1)):]
+    full_text = re.sub(r'((?:CATATAN|Catatan)(?:\s+\d+)?\s+)(untuk\s+masuk|untuk\s+dimasukkan|untuk\s+diterapkan)', lambda mo: mo.group(1) + 'untuk entri', full_text)
+    m_colon = re.match(r'^((?:NOTE|CATATAN|Catatan)[^:]*:)\s*', full_text, re.IGNORECASE)
+    if m_colon: bold_part, normal_part = m_colon.group(1).rstrip(), full_text[m_colon.end():]
+    else:
+        words = full_text.split(None, 1); bold_part = words[0]; normal_part = words[1] if len(words) > 1 else ''
+    if not normal_part.strip(): return
+    # Pertahankan rPr setiap run kalimat (termasuk w:vertAlign untuk pangkat
+    # dan indeks), tetapi paksa kalimat setelah label menjadi tidak tebal.
+    # Posisi kalimat dihitung dari teks sebelum label NOTE/CATATAN dinormalkan.
+    stripped_before = raw_text.strip()
+    leading = len(raw_text) - len(raw_text.lstrip())
+    if m_colon:
+        normal_start = leading + m_colon.end()
+    else:
+        first_word = re.match(r'^\S+\s*', stripped_before)
+        normal_start = leading + (first_word.end() if first_word else 0)
 
-                # Jangan pernah mengembalikan file bila Word ternyata masih
-                # menyimpan nomor dummy yang sama untuk TOC panjang.
-                for i in range(1, int(doc.TablesOfContents.Count) + 1):
-                    lines = [x.strip() for x in str(doc.TablesOfContents.Item(i).Range.Text or '').splitlines() if x.strip()]
-                    page_values = []
-                    for line in lines:
-                        match = re.search(r'(?:\t|\s)([ivxlcdm]+|\d+)\s*$', line, re.I)
-                        if match:
-                            page_values.append(match.group(1).lower())
-                    if len(page_values) >= 8 and len(set(page_values)) < 2:
-                        raise RuntimeError('Validasi TOC gagal: semua nomor halaman masih sama.')
+    source_segments = []
+    cursor = 0
+    label_rpr = None
+    for run in list(para.runs):
+        run_text = run.text or ''
+        run_start, run_end = cursor, cursor + len(run_text)
+        if label_rpr is None and run_text.strip() and run._element.rPr is not None:
+            label_rpr = copy.deepcopy(run._element.rPr)
+        cut = max(normal_start, run_start)
+        if cut < run_end:
+            piece = run_text[cut - run_start:]
+            if piece:
+                rpr = copy.deepcopy(run._element.rPr) if run._element.rPr is not None else None
+                source_segments.append((piece, rpr))
+        cursor = run_end
 
-                doc.Save()
-                return
-            finally:
-                if doc is not None:
-                    try:
-                        doc.Close(SaveChanges=True)
-                    except Exception:
-                        pass
-                if word is not None:
-                    try:
-                        word.Quit()
-                    except Exception:
-                        pass
-                pythoncom.CoUninitialize()
-        except Exception as exc:
-            pywin32_error = exc
+    # Bila perubahan label membuat pemetaan posisi tidak cocok, teks kalimat
+    # tetap aman; format basis diambil dari run pertama yang tersedia.
+    preserved_text = ''.join(piece for piece, _ in source_segments).lstrip()
+    if preserved_text != normal_part.lstrip():
+        base = source_segments[0][1] if source_segments else label_rpr
+        source_segments = [(normal_part.lstrip(), base)]
+    else:
+        while source_segments and not source_segments[0][0].strip():
+            source_segments.pop(0)
+        if source_segments:
+            source_segments[0] = (source_segments[0][0].lstrip(), source_segments[0][1])
 
-        # Fallback: PowerShell COM. Tidak membutuhkan paket pywin32, tetapi
-        # tetap membutuhkan Windows dan Microsoft Word terpasang.
-        escaped = abs_path.replace("'", "''")
-        ps_script = rf'''
-$ErrorActionPreference = 'Stop'
-$word = $null
-$doc = $null
-try {{
-    $word = New-Object -ComObject Word.Application
-    $word.Visible = $false
-    $word.DisplayAlerts = 0
-    try {{ $word.Options.Pagination = $true }} catch {{}}
-    try {{ $word.AutomationSecurity = 3 }} catch {{}}
+    for run in list(para.runs):
+        run._element.getparent().remove(run._element)
 
-    $doc = $word.Documents.Open('{escaped}')
-    try {{
-        $doc.Activate()
-        $word.ActiveWindow.View.Type = 3
-        $word.ActiveWindow.View.ShowFieldCodes = $false
-    }} catch {{}}
-    $doc.Repaginate()
+    run_b = para.add_run(bold_part)
+    if label_rpr is not None:
+        if run_b._element.rPr is not None:
+            run_b._element.remove(run_b._element.rPr)
+        run_b._element.insert(0, copy.deepcopy(label_rpr))
+    run_b.bold = True
 
-    $tocCount = $doc.TablesOfContents.Count
-    if ($tocCount -lt 1) {{
-        for ($j = 1; $j -le $doc.Fields.Count; $j++) {{
-            $field = $doc.Fields.Item($j)
-            $code = ''
-            try {{ $code = ($field.Code.Text).Trim().ToUpperInvariant() }} catch {{}}
-            if ($code -eq 'TOC' -or $code.StartsWith('TOC ')) {{
-                [void]$field.Update()
-            }}
-        }}
-        $doc.Repaginate()
-        $tocCount = $doc.TablesOfContents.Count
-    }}
+    for index, (piece, rpr) in enumerate(source_segments):
+        if not piece:
+            continue
+        run_n = para.add_run(('    ' if index == 0 else '') + piece)
+        if rpr is not None:
+            if run_n._element.rPr is not None:
+                run_n._element.remove(run_n._element.rPr)
+            run_n._element.insert(0, copy.deepcopy(rpr))
+        run_n.bold = False
 
-    if ($tocCount -lt 1) {{
-        throw 'Microsoft Word tidak menemukan objek Table of Contents.'
-    }}
+def _fix_all_notes(doc: Document) -> None:
+    for para in doc.paragraphs: _fix_note_para(para)
+    for table in doc.tables:
+        for row in table.rows:
+            for cell in row.cells:
+                for para in cell.paragraphs: _fix_note_para(para)
 
-    # Selalu bangun ulang entry terlebih dahulu. Range.Text bukan indikator
-    # yang andal bahwa result field TOC sudah termaterialisasi.
-    for ($i = 1; $i -le $tocCount; $i++) {{
-        $toc = $doc.TablesOfContents.Item($i)
-        try {{ $toc.Range.Fields.Locked = $false }} catch {{}}
-        [void]$toc.Update()
-    }}
 
-    $previous = $null
-    for ($pass = 1; $pass -le 4; $pass++) {{
-        $doc.Repaginate()
-        $tocCount = $doc.TablesOfContents.Count
-        for ($i = 1; $i -le $tocCount; $i++) {{
-            [void]$doc.TablesOfContents.Item($i).UpdatePageNumbers()
-        }}
-        $current = ''
-        for ($i = 1; $i -le $tocCount; $i++) {{
-            $current += [string]$doc.TablesOfContents.Item($i).Range.Text
-        }}
-        if ($null -ne $previous -and $current -eq $previous) {{ break }}
-        $previous = $current
-    }}
+_INITIAL_CLAUSE_HEADINGS = {
+    'scope': 'Ruang lingkup',
+    'normative references': 'Acuan normatif',
+    'terms and definitions': 'Istilah dan definisi',
+}
 
-    for ($i = 1; $i -le $tocCount; $i++) {{
-        $values = New-Object System.Collections.Generic.List[string]
-        $lines = ([string]$doc.TablesOfContents.Item($i).Range.Text) -split "`r?`n"
-        foreach ($line in $lines) {{
-            if ($line -match '(?:\t|\s)([ivxlcdm]+|\d+)\s*$') {{
-                [void]$values.Add($Matches[1].ToLowerInvariant())
-            }}
-        }}
-        if ($values.Count -ge 8 -and @($values | Select-Object -Unique).Count -lt 2) {{
-            throw 'Validasi TOC gagal: semua nomor halaman masih sama.'
-        }}
-    }}
 
-    $doc.Save()
-}}
-finally {{
-    if ($doc -ne $null) {{ try {{ $doc.Close($true) }} catch {{}} }}
-    if ($word -ne $null) {{ try {{ $word.Quit() }} catch {{}} }}
-    if ($doc -ne $null) {{ [void][Runtime.InteropServices.Marshal]::ReleaseComObject($doc) }}
-    if ($word -ne $null) {{ [void][Runtime.InteropServices.Marshal]::ReleaseComObject($word) }}
-    [GC]::Collect()
-    [GC]::WaitForPendingFinalizers()
-}}
-'''
-        try:
-            completed = subprocess.run(
-                ['powershell.exe', '-NoProfile', '-NonInteractive',
-                 '-ExecutionPolicy', 'Bypass', '-Command', ps_script],
-                capture_output=True, text=True, timeout=180, check=False,
-            )
-        except Exception as ps_exc:
-            raise RuntimeError(
-                'Gagal menjalankan Update page numbers only melalui Microsoft Word. '
-                f'pywin32: {pywin32_error}; PowerShell: {ps_exc}'
-            ) from ps_exc
+def _normalize_initial_clause_heading(para, source_text: str) -> None:
+    """Pastikan kapitalisasi tiga judul pasal awal mengikuti sentence case."""
+    source = re.sub(r'\s+', ' ', source_text or '').strip()
+    match = re.match(
+        r'^(\d+(?:\.\d+)*)\s+(Scope|Normative references|Terms and definitions)$',
+        source, re.IGNORECASE,
+    )
+    if not match:
+        return
+    target = f"{match.group(1)}    {_INITIAL_CLAUSE_HEADINGS[match.group(2).casefold()]}"
+    if para.runs:
+        para.runs[0].text = target
+        for run in para.runs[1:]:
+            run.text = ''
+    else:
+        para.add_run(target)
 
-        if completed.returncode != 0:
-            detail = (completed.stderr or completed.stdout or '').strip()
-            raise RuntimeError(
-                'Microsoft Word gagal menjalankan Update page numbers only pada TOC. '
-                f'pywin32: {pywin32_error}; PowerShell: {detail}'
-            )
 
-    @staticmethod
-    def _roman(number: int) -> str:
-        values = ((1000, 'm'), (900, 'cm'), (500, 'd'), (400, 'cd'),
-                  (100, 'c'), (90, 'xc'), (50, 'l'), (40, 'xl'),
-                  (10, 'x'), (9, 'ix'), (5, 'v'), (4, 'iv'), (1, 'i'))
-        result = []
-        number = max(1, int(number))
-        for value, symbol in values:
-            while number >= value:
-                result.append(symbol)
-                number -= value
-        return ''.join(result)
+_CLAUSE_PREFIX_RE = re.compile(
+    r'^(?P<number>(?:\d+(?:\.\d+)*|[A-Z]\.(?:\d+)(?:\.\d+)*))(?P<gap>[ \t]+)(?=\S)'
+)
 
-    @staticmethod
-    def _pdf_pages(docx_path: str):
-        """Render DOCX dengan LibreOffice dan kembalikan teks setiap halaman."""
-        soffice = shutil.which('libreoffice') or shutil.which('soffice')
-        if not soffice:
-            raise RuntimeError(
-                'LibreOffice tidak ditemukan. Tambahkan "libreoffice-writer" '
-                'ke packages.txt pada Streamlit Cloud.'
-            )
-        try:
-            from pypdf import PdfReader
-        except Exception as exc:
-            raise RuntimeError('Paket pypdf diperlukan untuk menghitung halaman TOC.') from exc
 
-        with tempfile.TemporaryDirectory(prefix='engine9_pdf_') as tmp:
-            profile = os.path.join(tmp, 'profile')
-            completed = subprocess.run(
-                [soffice, f'-env:UserInstallation=file://{profile}', '--headless',
-                 '--convert-to', 'pdf', '--outdir', tmp, os.path.abspath(docx_path)],
-                capture_output=True, text=True, timeout=240, check=False,
-            )
-            pdf_path = os.path.join(
-                tmp, os.path.splitext(os.path.basename(docx_path))[0] + '.pdf'
-            )
-            if completed.returncode != 0 or not os.path.isfile(pdf_path):
-                detail = (completed.stderr or completed.stdout or '').strip()
-                raise RuntimeError(f'LibreOffice gagal menghitung pagination: {detail}')
-            reader = PdfReader(pdf_path)
-            pages = [re.sub(r'\s+', ' ', page.extract_text() or '').strip().lower()
-                     for page in reader.pages]
-            outline = []
+def _replace_run_text_range(para, start: int, end: int, replacement: str) -> None:
+    """Ganti rentang teks tanpa membangun ulang run atau mengubah rPr."""
+    cursor = 0
+    inserted = False
+    for run in para.runs:
+        value = run.text or ''
+        run_start, run_end = cursor, cursor + len(value)
+        if run_end <= start or run_start >= end:
+            cursor = run_end
+            continue
+        left = value[:max(0, start - run_start)]
+        right = value[max(0, end - run_start):] if end < run_end else ''
+        middle = replacement if not inserted else ''
+        run.text = left + middle + right
+        inserted = True
+        cursor = run_end
 
-            def collect(items):
-                for item in items or []:
-                    if isinstance(item, list):
-                        collect(item)
-                        continue
-                    try:
-                        name = re.sub(r'\s+', ' ', str(item.title)).strip()
-                        page_no = reader.get_destination_page_number(item)
-                    except Exception:
-                        continue
-                    if name and page_no is not None:
-                        outline.append((_norm(name), int(page_no)))
 
-            collect(reader.outline)
-            return pages, outline
+def _normalize_clause_heading_spacing(para) -> bool:
+    """Pastikan nomor pasal/subpasal/subsubpasal diikuti tepat 4 spasi.
 
-    @staticmethod
-    def _write_static_toc(docx_path: str, entries) -> None:
-        """Ganti field TOC dengan paragraf statis ber-tab leader titik."""
-        doc = Document(docx_path)
-        field_p = None
-        for paragraph in doc.paragraphs:
-            instruction = ''.join(
-                node.text or '' for node in paragraph._p.iter(qn('w:instrText'))
-            )
-            if ' TOC ' in f' {instruction} ':
-                field_p = paragraph
-                break
-        if field_p is None:
-            # Iterasi kedua dan selanjutnya: hapus TOC statis yang ditandai.
-            marked = [p for p in doc.paragraphs
-                      if p._p.get(qn('w:rsidRPr')) == 'E9000001']
-            if not marked:
-                raise RuntimeError('Field/hasil TOC tidak ditemukan untuk ditulis.')
-            anchor = marked[0]._p
-            for p in marked:
-                if p._p is not anchor:
-                    p._p.getparent().remove(p._p)
-            field_p = marked[0]
+    Berlaku untuk heading isi utama (mis. 4, 4.1, 4.1.2) dan Lampiran
+    (mis. A.1, A.1.1), sambil mempertahankan seluruh format run Engine 7.
+    """
+    text = para.text or ''
+    match = _CLAUSE_PREFIX_RE.match(text)
+    if not match:
+        return False
+    style_id = _get_para_style_id(para)
+    style_name = para.style.name if para.style is not None else ''
+    style_key = f'{style_id} {style_name}'.casefold()
+    looks_like_clause_style = (
+        style_id in _HEADING_STYLES_WITH_NUM
+        or any(token in style_key for token in ('pasal', 'clause', 'heading'))
+        or style_id.casefold() in {'a2', 'a3'}
+    )
+    if not looks_like_clause_style:
+        return False
+    if match.group('gap') != '    ':
+        _replace_run_text_range(para, match.start('gap'), match.end('gap'), '    ')
+    return True
 
-        anchor = field_p._p
-        # Kosongkan paragraf anchor lalu gunakan sebagai entry pertama.
-        for child in list(anchor):
-            if child.tag != qn('w:pPr'):
-                anchor.remove(child)
 
-        style = TableOfContentsEngine._ensure_toc_style(doc)
-        for index, (title, page_label) in enumerate(entries):
-            if index == 0:
-                paragraph = field_p
+def _normalize_all_clause_heading_spacing(doc: Document) -> None:
+    for para in doc.paragraphs:
+        _normalize_clause_heading_spacing(para)
+    for table in doc.tables:
+        for row in table.rows:
+            for cell in row.cells:
+                for para in cell.paragraphs:
+                    _normalize_clause_heading_spacing(para)
+
+
+def _mark_untranslated_paragraph_red(para) -> None:
+    """Warnai teks sumber yang gagal diterjemahkan tanpa merusak format run.
+
+    Operasi dilakukan langsung pada ``w:rPr`` sehingga bold, italic,
+    superscript, subscript, ukuran font, dan struktur tabel tetap utuh.
+    """
+    for run_element in para._element.iter(qn('w:r')):
+        # Run tanpa teks (misalnya hanya drawing/field) tidak perlu diwarnai.
+        if not any((node.text or '') for node in run_element.iter(qn('w:t'))):
+            continue
+        run_properties = run_element.find(qn('w:rPr'))
+        if run_properties is None:
+            run_properties = OxmlElement('w:rPr')
+            run_element.insert(0, run_properties)
+        for old_color in list(run_properties.findall(qn('w:color'))):
+            run_properties.remove(old_color)
+        color = OxmlElement('w:color')
+        color.set(qn('w:val'), 'FF0000')
+        run_properties.append(color)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# BIBLIOGRAFI & AUTONUMBERING
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _el_text(el) -> str: return ''.join(t.text or '' for t in el.findall(f'.//{_W}t')).strip()
+def _is_bibliography_el(el) -> bool:
+    if el.tag != f'{_W}p': return False
+    sid = _get_style_id(el).lower()
+    if sid in _BIBLIO_TITLE_STYLES: return True
+    text = _el_text(el).lower().strip()
+    if not text or text[0].isdigit(): return False
+    return text in _BIBLIO_KEYWORDS_EXACT
+
+
+def _notify(cb, pct: int, msg: str) -> None:
+    if cb:
+        try: cb(pct, msg)
+        except Exception: pass
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PROTEKSI: DETEKSI HASIL "TERJEMAHAN" YANG SEBENARNYA HALAMAN ERROR
+# ─────────────────────────────────────────────────────────────────────────────
+# deep_translator (Google Translate gratis) kadang TIDAK melempar exception
+# saat diblokir/limit rate — ia malah mengembalikan teks halaman error mentah
+# (mis. "500. That's an error. ... That's all we know.") seolah itu hasil
+# terjemahan valid. Tanpa validasi, teks sampah ini langsung menimpa isi
+# dokumen. Fungsi ini mendeteksi pola tersebut agar hasil semacam itu
+# DIBUANG dan teks asli dipertahankan, bukan diganti dengan sampah.
+_RE_ERROR_RESPONSE = re.compile(
+    r"that'?s an error|that'?s all we know|server error|"
+    r"unusual traffic|please try again later|"
+    r"<html|<!doctype|\b50[0-9]\b.{0,15}error|\berror\b.{0,15}\b50[0-9]\b",
+    re.IGNORECASE
+)
+
+def _looks_like_error_response(original: str, translated: str) -> bool:
+    if not translated:
+        return False
+    if _RE_ERROR_RESPONSE.search(translated):
+        return True
+    # Hasil "terjemahan" yang tiba-tiba jauh lebih panjang dari teks aslinya
+    # (mis. paragraf 3 kata jadi ratusan karakter) juga mencurigakan —
+    # kemungkinan besar itu bukan terjemahan, tapi halaman/pesan lain.
+    if len(original) <= 20 and len(translated) > 150:
+        return True
+    return False
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TRANSLATOR WRAPPER
+# ─────────────────────────────────────────────────────────────────────────────
+
+_RE_PROTECTION_TOKEN = re.compile(
+    r'ZXQ(?:TK|IT|SRC)[A-F0-9]{12}QXZ', re.IGNORECASE
+)
+
+_TITLE_SAFE_FALLBACKS = {
+    'railway applications — fire protection on railway vehicles — part 1: general':
+        'Aplikasi perkeretaapian — Perlindungan kebakaran pada sarana '
+        'perkeretaapian — Bagian 1: Umum',
+}
+
+
+class TranslationFailedError(RuntimeError):
+    """Mencegah dokumen setengah diterjemahkan tetap disimpan."""
+
+
+def _canonicalize_cache_tokens(text: str) -> tuple[str, list[str]]:
+    """Normalkan token UUID agar cache RAM reusable antar percobaan."""
+    tokens = _RE_PROTECTION_TOKEN.findall(text or '')
+    counters = {'TK': 0, 'IT': 0, 'SRC': 0}
+    canonical = text or ''
+    for token in tokens:
+        m = re.match(r'ZXQ(TK|IT|SRC)', token, re.I)
+        kind = (m.group(1) if m else 'SRC').upper()
+        counters[kind] += 1
+        repl = f'ZXQ{kind}{counters[kind]:012X}QXZ'
+        canonical = re.sub(re.escape(token), repl, canonical, count=1, flags=re.I)
+    return canonical, tokens
+
+
+def _restore_cache_tokens(text: str, current_tokens: list[str]) -> str:
+    counters = {'TK': 0, 'IT': 0, 'SRC': 0}
+    out = text
+    for token in current_tokens:
+        m = re.match(r'ZXQ(TK|IT|SRC)', token, re.I)
+        kind = (m.group(1) if m else 'SRC').upper()
+        counters[kind] += 1
+        canonical = f'ZXQ{kind}{counters[kind]:012X}QXZ'
+        out = re.sub(re.escape(canonical), token, out, count=1, flags=re.I)
+    return out
+
+
+def _suspicious_english_residue(source: str, translated: str, target: str) -> bool:
+    """Tolak hasil campuran seperti 'These dapat be represented ...'."""
+    if target != 'id':
+        return False
+    common = {
+        'the','these','this','can','be','represented','by','a','an','of','in','to',
+        'from','with','for','and','or','is','are','was','were','applied','area',
+        'average','power','output','period','followed','immediately','same','source',
+        'generating','radiant','flux','nominal','value','range','flaming'
+    }
+    src = set(re.findall(r"[A-Za-z]{2,}", _RE_PROTECTION_TOKEN.sub('', source).lower()))
+    dst = set(re.findall(r"[A-Za-z]{2,}", _RE_PROTECTION_TOKEN.sub('', translated).lower()))
+    survivors = src & dst & common
+    return len(survivors) >= 4
+
+
+def _split_translation_chunks(text: str, max_chars: int = 180) -> list[str]:
+    """Pecah teks panjang tanpa memotong token proteksi."""
+    if len(text) <= max_chars:
+        return [text]
+    atoms = re.split(r'(ZXQ(?:TK|IT|SRC)[A-F0-9]{12}QXZ)', text, flags=re.I)
+    chunks, buf = [], ''
+    for atom in atoms:
+        if not atom:
+            continue
+        if _RE_PROTECTION_TOKEN.fullmatch(atom):
+            if len(buf) + len(atom) > max_chars and buf.strip():
+                chunks.append(buf); buf = ''
+            buf += atom
+            continue
+        # Pecah di batas frasa/kalimat/whitespace terdekat.
+        pieces = re.split(r'(?<=[.;:])\s+|(?=\s+(?:followed immediately by|with an average|applied to)\s+)', atom, flags=re.I)
+        for piece in pieces:
+            if not piece:
+                continue
+            if len(buf) + len(piece) <= max_chars:
+                buf += piece
             else:
-                paragraph = doc.add_paragraph()
-                new_p = paragraph._p
-                anchor.addnext(new_p)
-                anchor = new_p
-            paragraph.style = style
-            paragraph._p.set(qn('w:rsidRPr'), 'E9000001')
-            paragraph.add_run(title)
-            paragraph.add_run('\t' + page_label)
-        doc.save(docx_path)
+                if buf.strip(): chunks.append(buf)
+                buf = piece
+    if buf.strip(): chunks.append(buf)
+    return chunks or [text]
 
-    @staticmethod
-    def _update_toc_page_numbers_on_linux(docx_path: str) -> None:
-        """Hitung TOC secara deterministik di Streamlit Cloud/Linux.
 
-        LibreOffice dipakai hanya sebagai layout engine. Nomor halaman dicari
-        dari PDF hasil render dan ditulis ke TOC statis; jadi tidak bergantung
-        pada dukungan LibreOffice terhadap field TOC khusus Microsoft Word.
-        """
-        doc = Document(docx_path)
-        title = next((p for p in doc.paragraphs if _norm(p.text) == 'daftar isi'), None)
-        if title is None:
-            raise RuntimeError('Heading Daftar isi tidak ditemukan.')
-        source_entries = [(re.sub(r'\s+', ' ', title.text).strip(), '…')]
-        source_entries.extend(TableOfContentsEngine._collect_entries(doc, title))
-        if not source_entries:
-            raise RuntimeError('Tidak ada Judul/Pasal untuk membangun TOC.')
+class _Translator:
+    def __init__(self, source: str = 'auto', target: str = 'id', 
+                 custom_dict: CustomDictionary | None = None,
+                 italic_dict: ItalicDictionary | None = None):
+        try: from deep_translator import GoogleTranslator
+        except ImportError: raise ImportError("Jalankan: pip install deep-translator")
+        self._cls = GoogleTranslator
+        self.source = source; self.target = target
+        self.custom_dict = custom_dict; self.italic_dict = italic_dict
+        self._client = self._cls(source=self.source, target=self.target)
+        self.failed_texts: list[str] = []
 
-        # Materialisasikan seluruh baris terlebih dahulu agar panjang TOC sudah
-        # ikut memengaruhi pagination pada render berikutnya.
-        labels = ['i' if not re.match(r'^1(?:\s|\.)', text) else '1'
-                  for text, _ in source_entries]
-        TableOfContentsEngine._write_static_toc(
-            docx_path, [(item[0], labels[i]) for i, item in enumerate(source_entries)]
-        )
+    def translate_one(self, text: str, italic_map: dict = None) -> tuple[str, list[str]]:
+        global _ADAPTIVE_MODE, _ADAPTIVE_SUCCESS_STREAK
+        t = text.strip()
+        if not t or _skip_text(t): return text, []
+        token_map = {}
+        if self.custom_dict and len(self.custom_dict) > 0:
+            t, token_map = self.custom_dict._apply_pre(t)
+        final_italic_map = italic_map or {}
 
-        previous = None
-        for _ in range(4):
-            pages, outline = TableOfContentsEngine._pdf_pages(docx_path)
-            normalized_titles = [_norm(text) for text, _ in source_entries]
-            content_index = next((i for i, text in enumerate(normalized_titles)
-                                  if re.match(r'^1(?:\s|\.)', text)), None)
-            if content_index is None:
-                raise RuntimeError('Awal halaman TOC/konten tidak dapat dideteksi.')
+        # CACHE-FIRST, RAM ONLY. Token UUID dinormalisasi agar cache tetap
+        # cocok pada retry/pemulihan walaupun token proteksi dibuat ulang.
+        cache_text, current_tokens = _canonicalize_cache_tokens(t)
+        cache_key = (self.source, self.target, cache_text)
+        with _RAM_CACHE_LOCK:
+            cached = _RAM_TRANSLATION_CACHE.get(cache_key)
+        if cached is not None:
+            result = _restore_cache_tokens(cached, current_tokens)
+            if token_map: result = self.custom_dict._apply_post(result, token_map)
+            italic_terms_found = []
+            if final_italic_map:
+                _idict = self.italic_dict if self.italic_dict is not None else ItalicDictionary()
+                result, italic_terms_found = _idict._apply_post(result, final_italic_map)
+            return result, italic_terms_found
 
-            # Style Judul/Pasal memiliki outline level 1, sehingga ekspor PDF
-            # LibreOffice membawa destination bookmark yang menunjuk tepat ke
-            # halaman heading asli (bukan teks duplikat di halaman TOC).
-            found_pages = []
-            for heading in normalized_titles:
-                match_page = next((page for name, page in outline if name == heading), None)
-                if match_page is None:
-                    # Toleransi untuk perbedaan tanda baca/line wrapping pada
-                    # judul bookmark hasil ekspor.
-                    match_page = next((page for name, page in outline
-                                       if heading in name or name in heading), None)
-                if match_page is None:
-                    raise RuntimeError(f'Halaman heading tidak ditemukan: {heading[:80]}')
-                found_pages.append(match_page)
+        # Jika seluruh teks sudah dicakup Kamus SNI, hasil kamus adalah hasil
+        # final. Ini berlaku untuk satu token ("Introduction") maupun beberapa
+        # token yang hanya dipisahkan tanda baca, angka bagian, atau em dash
+        # (judul Cover). Rangkaian token semacam itu tidak memiliki bahasa
+        # alami untuk diterjemahkan dan sering ditolak Google Translate.
+        uncovered = _RE_PROTECTION_TOKEN.sub('', t)
+        uncovered_words = re.findall(r'[A-Za-zÀ-ÿ]{2,}', uncovered)
+        if token_map and not uncovered_words:
+            result = self.custom_dict._apply_post(t, token_map)
+            italic_terms_found = []
+            if final_italic_map:
+                result, italic_terms_found = self.italic_dict._apply_post(
+                    result, final_italic_map
+                )
+            return result, italic_terms_found
 
-            toc_page = found_pages[0]
-            content_page = found_pages[content_index]
-            labels = [
-                (TableOfContentsEngine._roman(page - toc_page + 1)
-                 if i < content_index else str(page - content_page + 1))
-                for i, page in enumerate(found_pages)
-            ]
-            state = tuple(labels)
-            TableOfContentsEngine._write_static_toc(
-                docx_path, [(item[0], labels[i]) for i, item in enumerate(source_entries)]
-            )
-            if state == previous:
+        expected_tokens = {
+            token.casefold() for token in _RE_PROTECTION_TOKEN.findall(t)
+        }
+        result = None
+        last_error = None
+        for attempt in range(1, 5):
+            try:
+                with _ADAPTIVE_LOCK:
+                    adaptive_now = _ADAPTIVE_MODE
+                if adaptive_now:
+                    time.sleep(0.65)
+                candidate = self._client.translate(t)
+                if not candidate or _looks_like_error_response(t, candidate):
+                    raise ValueError('respons layanan terjemahan tidak valid')
+                if _suspicious_english_residue(t, candidate, self.target):
+                    raise ValueError('hasil terjemahan masih bercampur teks Inggris')
+                returned_tokens = {
+                    token.casefold()
+                    for token in _RE_PROTECTION_TOKEN.findall(candidate)
+                }
+                if returned_tokens != expected_tokens:
+                    raise ValueError('token kamus/format berubah atau hilang')
+
+                source_plain = _RE_PROTECTION_TOKEN.sub('', t)
+                result_plain = _RE_PROTECTION_TOKEN.sub('', candidate)
+                if (
+                    re.search(r'[A-Za-z]{3}', source_plain)
+                    and re.sub(r'\s+', ' ', source_plain).strip().casefold()
+                    == re.sub(r'\s+', ' ', result_plain).strip().casefold()
+                ):
+                    raise ValueError('teks dikembalikan tanpa diterjemahkan')
+                result = candidate
                 break
-            previous = state
+            except Exception as exc:
+                last_error = exc
+                with _ADAPTIVE_LOCK:
+                    _ADAPTIVE_MODE = True
+                    _ADAPTIVE_SUCCESS_STREAK = 0
+                try:
+                    self._client = self._cls(source=self.source, target=self.target)
+                except Exception:
+                    pass
+                if attempt < 4:
+                    time.sleep(0.8 * attempt)
 
-        if len(labels) >= 8 and len(set(labels)) < 2:
-            raise RuntimeError('Validasi TOC Linux gagal: nomor halaman masih seragam.')
+        if result is not None:
+            with _ADAPTIVE_LOCK:
+                if _ADAPTIVE_MODE:
+                    _ADAPTIVE_SUCCESS_STREAK += 1
+                    if _ADAPTIVE_SUCCESS_STREAK >= 2:
+                        _ADAPTIVE_MODE = False
+                        _ADAPTIVE_SUCCESS_STREAK = 0
 
-    def insert_toc(self, input_docx: str, output_docx: str) -> str:
-        if not input_docx or not os.path.isfile(input_docx):
-            raise FileNotFoundError(f'File input tidak ditemukan: {input_docx}')
-        ok, message = StyleFinalizerEngine().apply(input_docx, output_docx)
-        if not ok:
-            raise RuntimeError(message)
-        doc = Document(output_docx)
-        title = next((p for p in doc.paragraphs if _norm(p.text) == 'daftar isi'), None)
-        if title is None:
-            raise ValueError('Heading "Daftar isi" tidak ditemukan di section 3.')
-        self._remove_existing_toc(doc)
-        self._clear_cached_toc_entries(title)
-        toc = self._build_toc_paragraph(doc)
-        anchor = self._toc_anchor_after_three_blank_paragraphs(title)
-        anchor.addnext(toc._p)
-        self._force_update_fields(doc)
-        doc.save(output_docx)
+        # Fallback penting untuk paragraf panjang (terutama NOTE/CATATAN dengan
+        # banyak superscript): pecah menjadi request kecil, tetapi token format
+        # tidak pernah dipotong. Ini mencegah satu NOTE panjang menggagalkan E8.
+        if result is None and len(t) > 180:
+            chunks = _split_translation_chunks(t, 180)
+            if len(chunks) > 1:
+                chunk_results = []
+                failed_before = len(self.failed_texts)
+                for chunk in chunks:
+                    part, _ = self.translate_one(chunk, {})
+                    chunk_results.append(part)
+                candidate = ''.join(chunk_results)
+                if (len(self.failed_texts) == failed_before and candidate and
+                        not _suspicious_english_residue(t, candidate, self.target)):
+                    result = candidate
 
-        # Jangan sediakan file untuk download sebelum Word benar-benar selesai
-        # menghitung pagination dan menjalankan "Update page numbers only".
-        self._update_toc_page_numbers_with_word(output_docx)
-        # Hasil COM di atas adalah hasil final. Cegah Word mengulang Update All
-        # saat pengguna membuka file dan merusak nomor tersimpan menjadi i/1.
-        self._disable_update_fields_after_finalization(output_docx)
-        return output_docx
+        if result is None:
+            # Judul standar lazim terdiri dari beberapa klausa yang dipisahkan
+            # em dash. Jika layanan menolak judul panjang sebagai satu request,
+            # coba setiap klausa secara mandiri lalu gabungkan kembali dengan
+            # tanda pisah asli. Ini juga membuat bagian yang sudah dicakup
+            # kamus langsung diselesaikan lokal per klausa.
+            title_parts = re.split(r'(\s*[—–]\s*)', t)
+            if len(title_parts) > 1:
+                translated_parts = []
+                try:
+                    for part in title_parts:
+                        if not part:
+                            continue
+                        if re.fullmatch(r'\s*[—–]\s*', part):
+                            translated_parts.append(part)
+                        else:
+                            part_result, _ = self.translate_one(part, {})
+                            translated_parts.append(part_result)
+                    result = ''.join(translated_parts)
+                except TranslationFailedError as split_error:
+                    last_error = split_error
 
-    def process(self, input_docx: Optional[str] = None,
-                output_docx: Optional[str] = None, **_kwargs):
-        output_docx = output_docx or 'hasil_RSNI.docx'
-        try:
-            path = self.insert_toc(input_docx, output_docx)
-            return True, path, (
-                'Engine 9 selesai: style custom Judul/Pasal diterapkan hanya '
-                'pada bagian Indonesia, TOC dibuat dari "Judul,1,Pasal,1", '
-                'dan nomor halaman TOC sudah dihitung berdasarkan pagination final.'
+        if result is None:
+            # Provider cadangan untuk kondisi Google Translate sedang menolak
+            # request/rate-limited. Deep-translator menyertakan MyMemory;
+            # kegagalannya tetap ditangani tanpa merusak dokumen.
+            try:
+                from deep_translator import MyMemoryTranslator
+                fallback_source = (
+                    'english' if self.source in ('auto', 'en') else self.source
+                )
+                fallback_target = (
+                    'indonesian' if self.target == 'id' else self.target
+                )
+                fallback = MyMemoryTranslator(
+                    source=fallback_source, target=fallback_target
+                ).translate(t)
+                if fallback and not _looks_like_error_response(t, fallback):
+                    fallback_tokens = {
+                        token.casefold()
+                        for token in _RE_PROTECTION_TOKEN.findall(fallback)
+                    }
+                    if fallback_tokens == expected_tokens:
+                        result = fallback
+            except Exception as fallback_error:
+                last_error = fallback_error
+
+        if result is None:
+            safe_title = _TITLE_SAFE_FALLBACKS.get(
+                re.sub(r'\s+', ' ', text).strip().casefold()
             )
-        except Exception as exc:
-            return False, None, f'Engine9 Error: {exc}\n{traceback.format_exc()}'
+            if safe_title:
+                result = safe_title
+
+        if result is None:
+            preview = re.sub(r'\s+', ' ', text).strip()[:100]
+            # Jangan gagalkan seluruh pipeline karena satu request eksternal.
+            self.failed_texts.append(preview)
+            result = t
+        else:
+            # Simpan hanya hasil yang benar-benar sukses. Cache RAM tidak pernah
+            # ditulis ke disk/GitHub dan otomatis hilang saat Streamlit restart.
+            canonical_result, _ = _canonicalize_cache_tokens(result)
+            with _RAM_CACHE_LOCK:
+                _RAM_TRANSLATION_CACHE[cache_key] = canonical_result
+        if token_map: result = self.custom_dict._apply_post(result, token_map)
+        italic_terms_found = []
+        if final_italic_map:
+            _idict = self.italic_dict if self.italic_dict is not None else ItalicDictionary()
+            result, italic_terms_found = _idict._apply_post(result, final_italic_map)
+        return result, italic_terms_found
+
+def _match_capitalization(original: str, translated: str) -> str:
+    orig = original.strip(); tran = translated.strip()
+    if not orig or not tran: return translated
+    letters = [c for c in orig if c.isalpha()]
+    if not letters: return translated
+    upper_ratio = sum(1 for c in letters if c.isupper()) / len(letters)
+    if upper_ratio >= 0.8: return tran.upper()
+    if orig[0].isupper(): return tran[0].upper() + tran[1:] if len(tran) > 1 else tran.upper()
+    return tran
 
 
-DaftarIsiTocEngine = TableOfContentsEngine
-Engine9 = TableOfContentsEngine
-__all__ = [
-    'StyleFinalizerEngine', 'TableOfContentsEngine', 'DaftarIsiTocEngine',
-    'Engine9', 'apply_custom_styles'
-]
+def _translate_para(para, tr, past_bibliography: bool = False) -> list[str]:
+    """
+    Terjemahkan paragraf biasa. Paragraf yang memiliki hyperlink sengaja
+    dipertahankan utuh supaya teks, urutan run, relationship, dan URL asli
+    tidak terhapus atau berubah.
+    """
+    if _skip_paragraph(para, past_bibliography): return []
+
+    if _has_hyperlinks(para):
+        return []
+    
+    # 2. Proses TEKS NORMAL (bukan hyperlink)
+    text_runs = [(i, r) for i, r in enumerate(para.runs) if r.text and r.text.strip()]
+    
+    if not text_runs: return []
+    
+    combined_raw = ''.join(r.text for _, r in text_runs)
+    combined = combined_raw.strip()
+    if _skip_text(combined): return []
+    
+    # Get font
+    font_name = 'Arial'; font_size = None
+    for run in para.runs:
+        if run.text.strip():
+            if run.font.name: font_name = run.font.name
+            if run.font.size: font_size = run.font.size.pt if run.font.size else None
+            break
+    
+    # Teks asli (SEBELUM proteksi token apa pun) — dipakai untuk mencocokkan
+    # kapitalisasi hasil terjemahan, agar token proteksi (huruf besar semua)
+    # tidak ikut dihitung dan salah membuat seluruh paragraf jadi HURUF BESAR.
+    original_for_case = combined
+    source_note_upper = bool(re.match(r'^NOTE(?:\s|\t|:)', combined))
+
+    # Proteksi 1: istilah/judul asing yang SUDAH miring di dokumen sumber
+    # (mis. judul standar acuan pada klausul "Acuan normatif"), SERTA
+    # seluruh teks berformat superscript/subscript (pangkat/indeks) —
+    # keduanya tidak diterjemahkan dan formatnya dikembalikan persis
+    # seperti sumber setelah proses terjemahan selesai.
+    para_style_italic = _get_para_style_italic(para)
+    combined_with_src_tokens, format_token_map = _extract_source_format_map(text_runs, para_style_italic)
+    combined = combined_with_src_tokens.strip()
+
+    # Proteksi 2: kamus istilah asing dari spreadsheet ("Kamus Istilah Asing")
+    if tr.italic_dict and len(tr.italic_dict) > 0:
+        combined, dict_italic_map = tr.italic_dict._apply_pre(combined)
+    else:
+        dict_italic_map = {}
+
+    # Terjemahkan (token @@SRC_...@@ dari proteksi superscript/subscript
+    # ikut terkirim dan diharapkan lolos utuh dari mesin terjemahan, sama
+    # seperti token proteksi miring lain yang sudah terbukti aman).
+    translated, italic_terms_found = tr.translate_one(combined, dict_italic_map)
+    time.sleep(_TRANSLATE_DELAY)
+    if not translated or translated == combined: return []
+    translated = _match_capitalization(original_for_case, translated)
+
+    # Kembalikan token superscript/subscript/miring-sumber menjadi teks asli,
+    # sekaligus dapatkan posisi presisi untuk membangun ulang run.
+    translated, format_spans = _detokenize_with_formatting(translated, format_token_map)
+
+    # Apply formatting ke teks normal
+    if italic_terms_found or format_spans:
+        _apply_mixed_formatting_to_para(para, translated, italic_terms_found, font_name, font_size,
+                                         format_spans=format_spans)
+    else:
+        if para.runs:
+            para.runs[0].text = translated
+            for r in para.runs[1:]: r.text = ''
+        else:
+            para.add_run(translated)
+
+    _normalize_initial_clause_heading(para, original_for_case)
+    if source_note_upper or re.match(
+        r'^(?:NOTE|Note|note|CATATAN|Catatan|catatan)(?:\s|\t|:)',
+        para.text.strip(),
+    ):
+        _fix_note_para(para, force_upper=source_note_upper)
+    
+    return italic_terms_found
+
+
+def _translate_table(table, tr) -> None:
+    for row in table.rows:
+        for cell in row.cells:
+            for para in cell.paragraphs: _translate_para(para, tr)
+
+
+def _is_translation_candidate(para) -> bool:
+    """Seleksi lokal murni; tidak pernah memanggil layanan terjemahan."""
+    if _skip_paragraph(para):
+        return False
+    if _has_hyperlinks(para):
+        return False
+    text_runs = [r for r in para.runs if r.text and r.text.strip()]
+    if not text_runs:
+        return False
+    combined = ''.join(r.text for r in text_runs).strip()
+    return bool(combined) and not _skip_text(combined)
+
+
+def _build_translation_queue(doc: Document, para_targets: set,
+                             table_targets: set) -> tuple[list, int, int]:
+    """Hitung seluruh skip lebih dahulu dan hasilkan antrean riil terjemahan.
+
+    Pemindaian hanya membaca XML DOCX di memori, sehingga tidak menunggu API,
+    tidak melakukan sleep, dan biasanya selesai jauh di bawah 10 detik.
+    Nilai total antrean inilah yang dipakai sebagai penyebut ``xx/yyy``.
+    """
+    queue = []
+    seen = set()
+    inspected = skipped = 0
+
+    body = doc.element.body
+    para_map = {p._element: p for p in doc.paragraphs}
+    table_map = {t._element: t for t in doc.tables}
+
+    for child in body:
+        if child in para_map:
+            inspected += 1
+            para = para_map[child]
+            if para._element in para_targets and _is_translation_candidate(para):
+                if para._element not in seen:
+                    queue.append(para)
+                    seen.add(para._element)
+            else:
+                skipped += 1
+        elif child in table_map:
+            table = table_map[child]
+            if table._element not in table_targets:
+                # Tabel di zona skip dihitung sebagai satu unit struktur.
+                inspected += 1
+                skipped += 1
+                continue
+            for row in table.rows:
+                for cell in row.cells:
+                    for para in cell.paragraphs:
+                        if para._element in seen:
+                            continue
+                        seen.add(para._element)
+                        inspected += 1
+                        if _is_translation_candidate(para):
+                            queue.append(para)
+                        else:
+                            skipped += 1
+
+    return queue, inspected, skipped
+
+def _translate_hf(hf_part, tr) -> None:
+    if hf_part is None: return
+    try:
+        for para in hf_part.paragraphs:
+            if _RE_COPYRIGHT.search(para.text or ''): continue
+            _translate_para(para, tr)
+        for table in hf_part.tables: _translate_table(table, tr)
+    except Exception: pass
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SINKRONISASI JUDUL
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _extract_cover_titles(doc: Document) -> tuple[str, str]:
+    id_title = ""; en_title = ""
+    for para in doc.paragraphs:
+        if _has_inline_sectpr(para): break
+        text = para.text.strip()
+        if not text: continue
+        is_bold = False; is_italic = False; max_size = 0
+        for run in para.runs:
+            if run.text.strip():
+                if run.font.bold: is_bold = True
+                if run.font.italic: is_italic = True
+                sz = run.font.size
+                if sz and sz.pt > max_size: max_size = sz.pt
+        if not id_title:
+            if max_size >= 16 and is_bold and not is_italic: id_title = text; continue
+        if id_title and not en_title:
+            if max_size >= 14 and is_italic: en_title = text
+    return id_title, en_title
+
+def _sync_body_title(doc: Document, cover_id: str) -> bool:
+    if not cover_id: return False
+    _BODY_TITLE_STYLES = {'main title 2', 'main title2', 'maintitle2', 'boxedtitle', 'boxed title', 'body title'}
+    _RE_H1 = re.compile(r'^\d+\s+\S')
+    paras = doc.paragraphs; sect_idx = -1; h1_idx = -1
+    for i, p in enumerate(paras):
+        if sect_idx == -1 and _has_inline_sectpr(p): sect_idx = i
+        txt = p.text.strip()
+        style_name = (p.style.name or '').lower() if p.style is not None else ''
+        if txt and _RE_H1.match(txt) and 'heading' in style_name: h1_idx = i; break
+    start = sect_idx + 1 if sect_idx != -1 else 0
+    end = h1_idx if h1_idx != -1 else start + 20
+    if end > len(paras): end = len(paras)
+    for i in range(start, end):
+        style_name = (
+            (paras[i].style.name or '').lower().strip()
+            if paras[i].style is not None else ''
+        )
+        if style_name in _BODY_TITLE_STYLES and paras[i].text.strip():
+            _replace_para_text(paras[i], cover_id); return True
+    for i in range(start, end):
+        txt = paras[i].text.strip()
+        if txt and any(r.bold for r in paras[i].runs if r.text.strip()) and paras[i].alignment == WD_ALIGN_PARAGRAPH.CENTER:
+            _replace_para_text(paras[i], cover_id); return True
+    return False
+
+def _replace_para_text(para, new_text: str) -> None:
+    fn = 'Arial'; fs = None
+    for r in para.runs:
+        if r.text.strip():
+            if r.font.name: fn = r.font.name
+            if r.font.size: fs = r.font.size
+            break
+    for r in list(para.runs): r._element.getparent().remove(r._element)
+    nr = para.add_run(new_text); nr.bold = True; nr.font.name = fn
+    if fs: nr.font.size = fs
+    para.alignment = WD_ALIGN_PARAGRAPH.CENTER
+
+def _sync_foreword_title(doc: Document, cover_id: str, cover_en: str, tr=None) -> None:
+    """Ganti hanya kelompok italic pertama tanpa membangun ulang paragraf.
+
+    Dengan cara ini seluruh run formatting hasil Engine 7 tetap utuh. Kelompok
+    italic kedua (judul asli setelah referensi ISO) sengaja tidak diubah.
+    """
+    if not cover_id:
+        return
+    translated_title = cover_id
+    if tr is not None and cover_en and cover_id.casefold() == cover_en.casefold():
+        candidate, _ = tr.translate_one(cover_en)
+        if candidate:
+            translated_title = candidate
+    for para in doc.paragraphs:
+        text = re.sub(r'\s+', ' ', para.text or '').strip()
+        if not re.match(r'^SNI\s+[^,]+,', text, re.IGNORECASE):
+            continue
+        in_first_group = False
+        first_run = None
+        for run in para.runs:
+            has_text = bool(run.text.strip())
+            is_italic = _run_effective_italic(
+                run, _get_para_style_italic(para)
+            )
+            if has_text and is_italic and first_run is None:
+                first_run = run
+                first_run.text = translated_title
+                in_first_group = True
+                continue
+            if in_first_group:
+                if is_italic:
+                    run.text = ''
+                elif has_text:
+                    return
+        if first_run is not None:
+            return
+
+
+def _translation_targets(doc: Document) -> tuple[set, set]:
+    """Tentukan paragraf dan tabel yang boleh diterjemahkan oleh Engine 8.
+
+    Zona mengikuti kontrak keluaran Engine 5--7:
+    - Cover: hanya judul Indonesia paling atas (bold, >= 16 pt, non-italic).
+    - Section 3: heading dan seluruh isi Introduction jika bagian itu tersedia.
+      Standar yang langsung dimulai dari Content (mis. CISPR 32) tetap valid.
+    - Area Content asli: seluruh elemen sebelum bookmark duplikasi Engine 5,
+      kecuali paragraf style ``RefNorm``.
+    - Bibliography: hanya heading-nya.
+    - Copyright, Daftar isi, isi Prakata, salinan Engine 5, entri Bibliography,
+      dan section informasi perumus tidak menjadi target.
+    """
+    para_targets: set = set()
+    table_targets: set = set()
+    body = doc.element.body
+    para_map = {p._element: p for p in doc.paragraphs}
+    table_map = {t._element: t for t in doc.tables}
+
+    section_no = 1
+    in_introduction = False
+    in_original_content = False
+    duplicate_started = False
+    cover_title_found = False
+
+    for child in body:
+        if child in para_map:
+            para = para_map[child]
+            text = re.sub(r'\s+', ' ', para.text or '').strip()
+            folded = text.casefold()
+            style_id = _get_para_style_id(para).casefold()
+            bookmarks = {
+                mark.get(qn('w:name'), '')
+                for mark in para._element.xpath('.//w:bookmarkStart')
+            }
+
+            if 'Engine5DuplicateStart' in bookmarks:
+                duplicate_started = True
+                in_original_content = False
+
+            if section_no == 1 and not cover_title_found and text:
+                is_bold = any(r.bold for r in para.runs if r.text.strip())
+                is_italic = any(r.italic for r in para.runs if r.text.strip())
+                max_size = max(
+                    (r.font.size.pt for r in para.runs
+                     if r.text.strip() and r.font.size),
+                    default=0,
+                )
+                if is_bold and not is_italic and max_size >= 16:
+                    para_targets.add(para._element)
+                    cover_title_found = True
+
+            elif section_no == 3:
+                if folded == 'introduction':
+                    in_introduction = True
+                if in_introduction:
+                    para_targets.add(para._element)
+
+            elif section_no >= 4 and not duplicate_started:
+                # Semua section layout Content asli tetap masuk sampai marker
+                # Engine 5. Section informasi perumus selalu berada sesudah
+                # marker dan karena itu otomatis tidak pernah masuk target.
+                in_original_content = True
+                if style_id != 'refnorm':
+                    para_targets.add(para._element)
+
+            if duplicate_started and folded in _BIBLIO_KEYWORDS_EXACT:
+                para_targets.add(para._element)
+
+            if _has_inline_sectpr(para):
+                section_no += 1
+                if section_no >= 4:
+                    in_introduction = False
+
+        elif child in table_map:
+            if (section_no == 3 and in_introduction) or (
+                section_no >= 4 and in_original_content and not duplicate_started
+            ):
+                table_targets.add(table_map[child]._element)
+
+    if not cover_title_found:
+        raise ValueError('Judul atas Cover tidak ditemukan.')
+    # Introduction memang opsional. Engine 1--4 secara sah menghasilkan front
+    # matter tanpa Introduction untuk standar yang langsung dimulai dari pasal
+    # Content, misalnya CISPR 32. Dalam kasus itu target section 3 cukup kosong
+    # dan penerjemahan tetap dilanjutkan ke area Content pada section 4+.
+    if not duplicate_started:
+        raise ValueError(
+            'Bookmark Engine5DuplicateStart tidak ditemukan; output Engine 5 '
+            'diperlukan agar konten duplikat dapat di-skip dengan aman.'
+        )
+    return para_targets, table_targets
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MAIN ENGINE (FIXED)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class DocxFinalTranslatorEngine:
+    """
+    Engine gabungan dengan dua spreadsheet terpisah.
+    Hyperlink dipertahankan utuh dan konten asli tidak disisipkan ulang.
+    """
+    
+    def __init__(self, source_lang: str = 'auto', target_lang: str = 'id', 
+                 custom_dict: CustomDictionary | None = None,
+                 italic_dict: ItalicDictionary | None = None):
+        self.source_lang = source_lang
+        self.target_lang = target_lang
+        self.custom_dict = custom_dict
+        self.italic_dict = italic_dict
+        self._custom_dict_provided = custom_dict is not None
+        self._italic_dict_provided = italic_dict is not None
+
+    def set_dictionary(self, d: CustomDictionary) -> None:
+        self.custom_dict = d
+        self._custom_dict_provided = True
+    def set_italic_dictionary(self, d: ItalicDictionary) -> None:
+        self.italic_dict = d
+        self._italic_dict_provided = True
+    def get_dictionary(self) -> CustomDictionary:
+        if self.custom_dict is None: self.custom_dict = CustomDictionary()
+        return self.custom_dict
+    def get_italic_dictionary(self) -> ItalicDictionary:
+        if self.italic_dict is None: self.italic_dict = ItalicDictionary()
+        return self.italic_dict
+
+    def translate(self, input_docx: str, output_docx: str, progress_callback=None, 
+                  translate_headers: bool = False) -> tuple[bool, str]:
+        try:
+            # app.py membuat engine tanpa parameter kamus. Karena itu Engine 8
+            # wajib mengambil kedua spreadsheet sendiri pada setiap proses,
+            # sehingga perubahan Google Sheet langsung dipakai dan bukan hanya
+            # ditampilkan sebagai angka pada dashboard.
+            if not self._custom_dict_provided:
+                self.custom_dict = CustomDictionary()
+                sni_count = self.custom_dict.load_from_google_sheet(
+                    KAMUS_SPREADSHEET_URL
+                )
+            else:
+                sni_count = len(self.custom_dict)
+            if not self._italic_dict_provided:
+                self.italic_dict = ItalicDictionary()
+                italic_count_loaded = self.italic_dict.load_from_google_sheet(
+                    ITALIC_SPREADSHEET_URL
+                )
+            else:
+                italic_count_loaded = len(self.italic_dict)
+
+            intro_entry = self.custom_dict._entries.get('introduction')
+            if not intro_entry or intro_entry[1].strip().casefold() != 'pendahuluan':
+                raise ValueError(
+                    'Kamus SNI tidak memuat pasangan '
+                    'Introduction → Pendahuluan.'
+                )
+            required_italic = {
+                'iso online browsing platform', 'iec electropedia'
+            }
+            missing_italic = sorted(
+                term for term in required_italic
+                if term not in self.italic_dict._entries
+            )
+            if missing_italic:
+                raise ValueError(
+                    'Kamus istilah asing belum memuat: '
+                    + ', '.join(missing_italic)
+                )
+
+            info = f"{len(self.custom_dict) if self.custom_dict else 0} kamus"
+            if self.italic_dict: info += f", {len(self.italic_dict)} miring"
+            _notify(
+                progress_callback, 2,
+                f"Kamus siap: SNI={sni_count}, istilah asing={italic_count_loaded}"
+            )
+            
+            _notify(progress_callback, 5, "Init translator...")
+            # Satu instance translator tidak dibagi lintas thread. Setiap worker
+            # memiliki client sendiri agar aman dan benar-benar berjalan paralel.
+            tr = _Translator(self.source_lang, self.target_lang, self.custom_dict, self.italic_dict)
+            doc = Document(input_docx)
+
+            scan_started = time.perf_counter()
+            para_targets, table_targets = _translation_targets(doc)
+            translation_queue, inspected_count, skipped_count = (
+                _build_translation_queue(doc, para_targets, table_targets)
+            )
+            scan_seconds = time.perf_counter() - scan_started
+            if scan_seconds >= 10:
+                raise RuntimeError(
+                    f'Pra-pemindaian skip memerlukan {scan_seconds:.2f} detik; '
+                    'batas maksimum adalah 10 detik.'
+                )
+
+            total = len(translation_queue)
+            _notify(
+                progress_callback, 5,
+                f"[pra-scan] skip={skipped_count} dari {inspected_count} "
+                f"({scan_seconds:.2f} detik) | antrean terjemahan=0/{total} "
+                f"| [progres-total] 0/{total}",
+            )
+
+            done = translated_count = 0
+            italic_count = 0
+            failed_paras = []
+
+            def _translate_job(index_para):
+                index, para = index_para
+                worker_tr = _Translator(
+                    self.source_lang, self.target_lang,
+                    self.custom_dict, self.italic_dict,
+                )
+                found = _translate_para(para, worker_tr)
+                return index, para, found, bool(worker_tr.failed_texts)
+
+            # Tahap utama: tepat 4 worker translate.
+            with ThreadPoolExecutor(max_workers=4, thread_name_prefix='translate') as pool:
+                futures = [pool.submit(_translate_job, item)
+                           for item in enumerate(translation_queue)]
+                for future in as_completed(futures):
+                    index, para, found, failed = future.result()
+                    done += 1
+                    italic_count += len(found)
+                    if failed:
+                        failed_paras.append((index, para))
+                    else:
+                        translated_count += 1
+                    # Translate normal memakai rentang 10%--90%, dihitung
+                    # murni dari counter done/total (XXX/XXX).
+                    pct = 10 + int(done / max(total, 1) * 80)
+                    _notify(
+                        progress_callback, pct,
+                        f"[translate 4 worker] {done}/{total} | "
+                        f"berhasil={translated_count} | "
+                        f"gagal={len(failed_paras)} | "
+                        f"[progres-total] {done}/{total + len(failed_paras)}",
+                    )
+
+            # Hanya bagian yang belum berhasil diterjemahkan yang diulang,
+            # secara berurutan dengan tepat 1 worker.
+            recovery_total = len(failed_paras)
+            still_failed = []
+            recovery_success = 0
+            recovery_tr = _Translator(
+                self.source_lang, self.target_lang,
+                self.custom_dict, self.italic_dict,
+            )
+            for recovery_done, (index, para) in enumerate(
+                    sorted(failed_paras, key=lambda item: item[0]), start=1):
+                before = len(recovery_tr.failed_texts)
+                found = _translate_para(para, recovery_tr)
+                failed = len(recovery_tr.failed_texts) > before
+                if failed:
+                    still_failed.append(para)
+                else:
+                    recovery_success += 1
+                    translated_count += 1
+                    italic_count += len(found)
+                # Pemulihan memakai rentang 90%--98%, dihitung murni dari
+                # counter recovery_done/recovery_total (YY/YY).
+                pct = 90 + int(recovery_done / max(recovery_total, 1) * 8)
+                _notify(
+                    progress_callback, pct,
+                    f"[pemulihan 1 worker] {recovery_done}/{recovery_total} | "
+                    f"berhasil={recovery_success} | "
+                    f"gagal={recovery_total - recovery_done + len(still_failed)} "
+                    f"| [progres-total] {total + recovery_done}/"
+                    f"{total + recovery_total}",
+                )
+
+            # Dipakai ringkasan dan UI peringatan. Dokumen parsial tetap
+            # disimpan agar dapat di-download atau dipaksa lanjut ke Engine 9.
+            tr.failed_texts = [
+                re.sub(r'\s+', ' ', para.text or '').strip()[:100]
+                for para in still_failed
+            ]
+            for para in still_failed:
+                _mark_untranslated_paragraph_red(para)
+
+            # Tidak menjalankan formatting global di sini. Dengan demikian
+            # Copyright, Daftar isi, salinan Engine 5, Bibliography entries,
+            # dan informasi perumus benar-benar tidak tersentuh Engine 8.
+
+            _notify(progress_callback, 98, "Sinkronisasi judul...")
+            fid, fen = _extract_cover_titles(doc)
+            if fid:
+                _sync_foreword_title(doc, fid, fen, tr=tr)
+
+            # Normalisasi terakhir untuk seluruh heading pasal pada konten dan
+            # Lampiran. Operasi hanya mengganti karakter pemisah di run yang
+            # sudah ada sehingga format Engine 7 tetap dipertahankan.
+            _normalize_all_clause_heading_spacing(doc)
+
+            _notify(progress_callback, 98, "Saving...")
+            doc.save(output_docx)
+
+            if still_failed:
+                return False, (
+                    f"{len(still_failed)} bagian masih belum berhasil "
+                    "diterjemahkan setelah pemulihan 1 worker. Dokumen parsial "
+                    "Engine 8 sudah disimpan; teks sumber yang gagal diberi "
+                    "font merah dan dapat di-download atau "
+                    "dipaksa lanjut ke Engine 9."
+                )
+            
+            summary = f"✅ Done!"
+            if italic_count > 0: summary += f" Miring: {italic_count}."
+            summary += (
+                f" Paragraf diterjemahkan: {translated_count}; "
+                f"unit diperiksa: {inspected_count}; "
+                f"zona/unit di-skip pra-scan: {skipped_count}."
+            )
+            if tr.failed_texts:
+                summary += (
+                    f" Peringatan: {len(tr.failed_texts)} bagian dipertahankan "
+                    "karena seluruh layanan terjemahan sedang tidak merespons."
+                )
+            _notify(progress_callback, 100, summary)
+            return True, output_docx
+
+        except ImportError as e: return False, f"Dependensi: {e}"
+        except Exception as e: return False, f"Engine8 Error: {str(e)}\n{traceback.format_exc()}"
+
+
+class SelectiveTranslationEngine(DocxFinalTranslatorEngine):
+    """Adaptor API Engine 8 yang digunakan oleh ``app.py``.
+
+    Implementasi penerjemahan tetap berasal dari
+    :class:`DocxFinalTranslatorEngine`. Kelas ini menyediakan nama kelas dan
+    metode ``process()`` yang diharapkan pipeline aplikasi, termasuk bentuk
+    nilai balik ``(berhasil, path_output, pesan)``.
+    """
+
+    def process(
+        self,
+        input_docx: str,
+        output_docx: str,
+        progress_callback=None,
+        translate_headers: bool = False,
+    ) -> tuple[bool, str, str]:
+        success, result = self.translate(
+            input_docx=input_docx,
+            output_docx=output_docx,
+            progress_callback=progress_callback,
+            translate_headers=translate_headers,
+        )
+        if success:
+            return True, result, "Penerjemahan selektif selesai."
+        return False, output_docx, result
