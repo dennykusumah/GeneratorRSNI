@@ -1423,6 +1423,16 @@ div[data-testid="stFileUploader"] [data-testid*="FileSize"] * {
     visibility: hidden !important;
 }
 
+/* STABILISASI JARAK UPLOADER -> PENGATURAN
+   st.markdown metadata fallback membuat satu stElementContainer tambahan hanya
+   setelah file dipilih. Kompensasi 1rem menjaga posisi Pengaturan identik. */
+.section-label.settings-after-upload {
+    margin-top: 0.60rem !important;
+}
+.section-label.settings-no-upload {
+    margin-top: 1.60rem !important;
+}
+
 </style>
 """, unsafe_allow_html=True)
 
@@ -1701,7 +1711,11 @@ if uploaded_file is not None:
     )
     st.markdown(_meta_html, unsafe_allow_html=True)
 
-st.markdown('<div class="section-label">⚙️ Pengaturan</div>', unsafe_allow_html=True)
+_settings_gap_class = "settings-after-upload" if uploaded_file is not None else "settings-no-upload"
+st.markdown(
+    f'<div class="section-label {_settings_gap_class}">⚙️ Pengaturan</div>',
+    unsafe_allow_html=True,
+)
 col_set1, col_set2 = st.columns([2, 3])
 with col_set1:
     doc_title = st.text_input("📄 No. SNI", value="SNI ISO XXXXX-X:XXXX", key="title_main")
