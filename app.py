@@ -1521,6 +1521,84 @@ div[class*="st-key-upl_main"] {
     padding-bottom: 0 !important;
 }
 
+
+/* =====================================================================
+   FINAL V2 — metadata benar-benar di tengah kartu + spacing upload stabil
+   ===================================================================== */
+
+/* Nama + ukuran file adalah overlay, jadi TIDAK boleh menambah tinggi layout. */
+.uploaded-file-inline-meta {
+    position: relative !important;
+    z-index: 50 !important;
+    height: 0 !important;
+    min-height: 0 !important;
+    max-height: 0 !important;
+    margin: 0 0 0 66px !important;
+    padding: 0 !important;
+    width: 120px !important;
+    overflow: visible !important;
+    pointer-events: none !important;
+
+    /* Turunkan dari revisi sebelumnya (-47px) supaya dua baris tepat
+       di tengah vertikal kartu putih. */
+    transform: translateY(-39px) !important;
+
+    display: flex !important;
+    flex-direction: column !important;
+    align-items: flex-start !important;
+    justify-content: center !important;
+    gap: 1px !important;
+}
+
+.uploaded-file-inline-meta .uf-name {
+    margin: 0 !important;
+    padding: 0 !important;
+    line-height: 14px !important;
+    min-height: 14px !important;
+}
+.uploaded-file-inline-meta .uf-size {
+    margin: 0 !important;
+    padding: 0 !important;
+    line-height: 12px !important;
+    min-height: 12px !important;
+}
+
+/* Container markdown overlay juga wajib 0 tinggi. */
+div[data-testid="stMarkdownContainer"]:has(.uploaded-file-inline-meta),
+div[data-testid="stElementContainer"]:has(.uploaded-file-inline-meta) {
+    height: 0 !important;
+    min-height: 0 !important;
+    max-height: 0 !important;
+    margin: 0 !important;
+    padding: 0 !important;
+    overflow: visible !important;
+}
+
+/* KUNCI tinggi/spacing area uploader.
+   File list bawaan Streamlit tidak boleh menambah margin bawah. */
+div[class*="st-key-upl_main"] {
+    margin-bottom: -1.05rem !important;
+    padding-bottom: 0 !important;
+}
+
+div[class*="st-key-upl_main"] div[data-testid="stFileUploader"],
+div[class*="st-key-upl_main"] div[data-testid="stFileUploader"] > section {
+    margin-bottom: 0 !important;
+    padding-bottom: 0 !important;
+}
+
+/* Hilangkan tambahan vertical gap yang muncul hanya setelah file ter-upload. */
+div[class*="st-key-upl_main"] div[data-testid="stFileUploader"] > div:not(:first-child),
+div[class*="st-key-upl_main"] div[data-testid="stFileUploaderFile"] {
+    margin-bottom: 0 !important;
+}
+
+/* Elemen sesudah uploader tidak boleh terdorong oleh state file. */
+div[class*="st-key-upl_main"] + div[data-testid="stElementContainer"] {
+    margin-top: 0 !important;
+    padding-top: 0 !important;
+}
+
 </style>
 """, unsafe_allow_html=True)
 
