@@ -14,6 +14,8 @@ Fitur utama:
 """
 
 import re
+import random
+import threading
 import copy
 import time
 import uuid
@@ -1137,6 +1139,30 @@ class TranslationFailedError(RuntimeError):
     """Mencegah dokumen setengah diterjemahkan tetap disimpan."""
 
 
+# Pembatas adaptif bersama untuk mencegah lonjakan request dari 4 worker.
+# Empat worker tetap aktif, tetapi awal request dijarakkan agar provider web
+# tidak menerima burst yang biasanya memicu rate-limit di tengah dokumen.
+_TRANSLATE_GATE_LOCK = threading.Lock()
+_TRANSLATE_NEXT_REQUEST = 0.0
+_TRANSLATE_MIN_INTERVAL = 0.18
+_TRANSLATE_ERROR_COOLDOWN = 1.5
+
+def _translation_gate_wait(extra_delay: float = 0.0) -> None:
+    global _TRANSLATE_NEXT_REQUEST
+    with _TRANSLATE_GATE_LOCK:
+        now = time.monotonic()
+        wait = max(0.0, _TRANSLATE_NEXT_REQUEST - now)
+        if wait:
+            time.sleep(wait)
+        jitter = random.uniform(0.0, 0.06)
+        _TRANSLATE_NEXT_REQUEST = time.monotonic() + _TRANSLATE_MIN_INTERVAL + extra_delay + jitter
+
+def _translation_gate_penalize(attempt: int) -> None:
+    global _TRANSLATE_NEXT_REQUEST
+    penalty = min(6.0, _TRANSLATE_ERROR_COOLDOWN * max(1, attempt))
+    with _TRANSLATE_GATE_LOCK:
+        _TRANSLATE_NEXT_REQUEST = max(_TRANSLATE_NEXT_REQUEST, time.monotonic() + penalty)
+
 class _Translator:
     def __init__(self, source: str = 'auto', target: str = 'id', 
                  custom_dict: CustomDictionary | None = None,
@@ -1178,8 +1204,9 @@ class _Translator:
         }
         result = None
         last_error = None
-        for attempt in range(1, 5):
+        for attempt in range(1, 6):
             try:
+                _translation_gate_wait()
                 candidate = self._client.translate(t)
                 if not candidate or _looks_like_error_response(t, candidate):
                     raise ValueError('respons layanan terjemahan tidak valid')
@@ -1202,8 +1229,15 @@ class _Translator:
                 break
             except Exception as exc:
                 last_error = exc
-                if attempt < 4:
-                    time.sleep(0.8 * attempt)
+                _translation_gate_penalize(attempt)
+                # Buat ulang client setelah respons gagal/rate-limit agar
+                # koneksi/session bermasalah tidak dipakai terus-menerus.
+                try:
+                    self._client = self._cls(source=self.source, target=self.target)
+                except Exception:
+                    pass
+                if attempt < 5:
+                    time.sleep(min(5.0, 0.75 * (2 ** (attempt - 1))) + random.uniform(0.05, 0.35))
 
         if result is None:
             # Judul standar lazim terdiri dari beberapa klausa yang dipisahkan
@@ -1746,16 +1780,25 @@ class DocxFinalTranslatorEngine:
             italic_count = 0
             failed_paras = []
 
+            worker_local = threading.local()
+
             def _translate_job(index_para):
                 index, para = index_para
-                worker_tr = _Translator(
-                    self.source_lang, self.target_lang,
-                    self.custom_dict, self.italic_dict,
-                )
+                # Satu client persisten per worker: tetap thread-safe, tetapi
+                # tidak membuat ratusan koneksi/client baru sepanjang dokumen.
+                if not hasattr(worker_local, 'translator'):
+                    worker_local.translator = _Translator(
+                        self.source_lang, self.target_lang,
+                        self.custom_dict, self.italic_dict,
+                    )
+                worker_tr = worker_local.translator
+                before_failed = len(worker_tr.failed_texts)
                 found = _translate_para(para, worker_tr)
-                return index, para, found, bool(worker_tr.failed_texts)
+                failed = len(worker_tr.failed_texts) > before_failed
+                return index, para, found, failed
 
-            # Tahap utama: tepat 4 worker translate.
+            # Tahap utama: tepat 4 worker translate. Request tetap dipacing
+            # adaptif untuk menghindari burst/rate-limit di tengah dokumen.
             with ThreadPoolExecutor(max_workers=4, thread_name_prefix='translate') as pool:
                 futures = [pool.submit(_translate_job, item)
                            for item in enumerate(translation_queue)]
@@ -1783,45 +1826,39 @@ class DocxFinalTranslatorEngine:
             recovery_total = len(failed_paras)
             still_failed = []
             recovery_success = 0
-            # Pemulihan tetap TEPAT 1 worker (sekuensial), tetapi setiap
-            # paragraf mendapat client GoogleTranslator baru pada tiap retry.
-            # Ini penting karena client yang sudah terkena rate-limit/error
-            # sering terus gagal walaupun request berikutnya sebenarnya valid.
-            # Retry dilakukan di dalam worker yang sama, jadi TIDAK menambah
-            # paralelisme dan tetap aman terhadap pembatasan provider.
-            recovery_retry_per_item = 3
+            recovery_tr = _Translator(
+                self.source_lang, self.target_lang,
+                self.custom_dict, self.italic_dict,
+            )
             for recovery_done, (index, para) in enumerate(
                     sorted(failed_paras, key=lambda item: item[0]), start=1):
                 found = []
                 failed = True
-                for recovery_attempt in range(1, recovery_retry_per_item + 1):
-                    recovery_tr = _Translator(
-                        self.source_lang, self.target_lang,
-                        self.custom_dict, self.italic_dict,
-                    )
+                # Tetap tepat 1 worker; tiga retry ini berlangsung sekuensial.
+                for recovery_attempt in range(1, 4):
+                    before = len(recovery_tr.failed_texts)
                     found = _translate_para(para, recovery_tr)
-                    failed = bool(recovery_tr.failed_texts)
+                    failed = len(recovery_tr.failed_texts) > before
                     if not failed:
                         break
-                    if recovery_attempt < recovery_retry_per_item:
-                        # Backoff hanya pada pemulihan. Worker tetap 1.
-                        time.sleep(1.25 * recovery_attempt)
-
+                    if recovery_attempt < 3:
+                        time.sleep(1.0 * recovery_attempt + random.uniform(0.1, 0.4))
+                        recovery_tr = _Translator(
+                            self.source_lang, self.target_lang,
+                            self.custom_dict, self.italic_dict,
+                        )
                 if failed:
                     still_failed.append(para)
                 else:
                     recovery_success += 1
                     translated_count += 1
                     italic_count += len(found)
-
-                # Pemulihan memakai rentang 90%--98%. Label worker diambil
-                # dari jumlah worker yang benar-benar aktif pada fase ini.
-                recovery_workers = 1
+                # Pemulihan memakai rentang 90%--98%, dihitung murni dari
+                # counter recovery_done/recovery_total (YY/YY).
                 pct = 90 + int(recovery_done / max(recovery_total, 1) * 8)
                 _notify(
                     progress_callback, pct,
-                    f"[pemulihan {recovery_workers} worker] "
-                    f"{recovery_done}/{recovery_total} | "
+                    f"[pemulihan 1 worker] {recovery_done}/{recovery_total} | "
                     f"berhasil={recovery_success} | "
                     f"gagal={len(still_failed)} "
                     f"| [progres-total] {total + recovery_done}/"
