@@ -1683,12 +1683,6 @@ div[data-testid="stElementContainer"]:has(.uploaded-file-inline-meta) {
     overflow: visible !important;
 }
 
-
-/* FINAL MICRO-ADJUSTMENT — turunkan nama file + ukuran 3px */
-.uploaded-file-inline-meta {
-    transform: translateY(-33px) !important;
-}
-
 </style>
 """, unsafe_allow_html=True)
 
