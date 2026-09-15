@@ -1387,23 +1387,41 @@ def _translation_gate_success() -> None:
             _TRANSLATE_NEXT_REQUEST = min(_TRANSLATE_NEXT_REQUEST, time.monotonic() + _TRANSLATE_FAST_INTERVAL)
 
 class _Translator:
-    def __init__(self, source: str = 'auto', target: str = 'id', 
+    """Translator dengan pola request tran1/tran2.
+
+    Perbedaan penting dari versi adaptive:
+    - GoogleTranslator dibuat BARU pada setiap request, sama seperti tran1/tran2.
+    - Tidak ada global request gate / adaptive throttling.
+    - Maksimal 2 request: percobaan awal + 1 retry setelah 0,8 detik.
+    - Cache RAM + SQLite tetap dipertahankan agar request berulang lebih cepat.
+    - Kamus/italic tetap diproses sebelum/sesudah request.
+    """
+    def __init__(self, source: str = 'auto', target: str = 'id',
                  custom_dict: CustomDictionary | None = None,
                  italic_dict: ItalicDictionary | None = None):
-        try: from deep_translator import GoogleTranslator
-        except ImportError: raise ImportError("Jalankan: pip install deep-translator")
+        try:
+            from deep_translator import GoogleTranslator
+        except ImportError:
+            raise ImportError("Jalankan: pip install deep-translator")
         self._cls = GoogleTranslator
-        self.source = source; self.target = target
-        self.custom_dict = custom_dict; self.italic_dict = italic_dict
-        self._client = self._cls(source=self.source, target=self.target)
+        self.source = source
+        self.target = target
+        self.custom_dict = custom_dict
+        self.italic_dict = italic_dict
         self.failed_texts: list[str] = []
 
-    def translate_one(self, text: str, italic_map: dict = None) -> tuple[str, list[str]]:
-        t = text.strip()
-        if not t or _skip_text(t): return text, []
+    def _google_once(self, text: str):
+        # Sengaja instantiate per request: ini mengikuti tran1/tran2 persis
+        # dan menghindari session/client lama yang dapat membawa state buruk.
+        return self._cls(source=self.source, target=self.target).translate(text)
 
-        # CACHE FIRST: hasil sukses yang pernah diterjemahkan tidak dikirim
-        # ulang ke provider. Token proteksi acak dinormalisasi pada cache key.
+    def translate_one(self, text: str, italic_map: dict = None) -> tuple[str, list[str]]:
+        original = text
+        t = text.strip()
+        if not t or _skip_text(t):
+            return text, []
+
+        # Cache tetap menjadi lapisan pertama.
         cache_key, cache_src_tokens = _cache_identity(
             t, italic_map or {}, self.source, self.target, self.custom_dict
         )
@@ -1414,140 +1432,58 @@ class _Translator:
         token_map = {}
         if self.custom_dict and len(self.custom_dict) > 0:
             t, token_map = self.custom_dict._apply_pre(t)
+
         final_italic_map = italic_map or {}
 
-        # Jika seluruh teks sudah dicakup Kamus SNI, hasil kamus adalah hasil
-        # final. Ini berlaku untuk satu token ("Introduction") maupun beberapa
-        # token yang hanya dipisahkan tanda baca, angka bagian, atau em dash
-        # (judul Cover). Rangkaian token semacam itu tidak memiliki bahasa
-        # alami untuk diterjemahkan dan sering ditolak Google Translate.
+        # Jika seluruh isi sudah ditentukan oleh Kamus SNI, tidak perlu Google.
         uncovered = _RE_PROTECTION_TOKEN.sub('', t)
         uncovered_words = re.findall(r'[A-Za-zÀ-ÿ]{2,}', uncovered)
         if token_map and not uncovered_words:
             result = self.custom_dict._apply_post(t, token_map)
             italic_terms_found = []
             if final_italic_map:
-                result, italic_terms_found = self.italic_dict._apply_post(
-                    result, final_italic_map
-                )
+                _idict = self.italic_dict if self.italic_dict is not None else ItalicDictionary()
+                result, italic_terms_found = _idict._apply_post(result, final_italic_map)
             _cache_put(cache_key, result, italic_terms_found)
             return result, italic_terms_found
 
-        expected_tokens = {
-            token.casefold() for token in _RE_PROTECTION_TOKEN.findall(t)
-        }
+        # PERSIS FILOSOFI TRAN1/TRAN2:
+        # request sekali; bila exception tunggu 0,8 detik; request sekali lagi.
+        provider_ok = False
         result = None
-        last_error = None
-        for attempt in range(1, 4):
+        for attempt in (1, 2):
             try:
-                _translation_gate_wait()
-                candidate = self._client.translate(t)
-                if not candidate or _looks_like_error_response(t, candidate):
-                    raise ValueError('respons layanan terjemahan tidak valid')
-                returned_tokens = {
-                    token.casefold()
-                    for token in _RE_PROTECTION_TOKEN.findall(candidate)
-                }
-                if returned_tokens != expected_tokens:
-                    raise ValueError('token kamus/format berubah atau hilang')
+                candidate = self._google_once(t)
+                if candidate and not _looks_like_error_response(t, candidate):
+                    result = candidate
+                    provider_ok = True
+                    break
+            except Exception:
+                pass
 
-                source_plain = _RE_PROTECTION_TOKEN.sub('', t)
-                result_plain = _RE_PROTECTION_TOKEN.sub('', candidate)
-                if (
-                    re.search(r'[A-Za-z]{3}', source_plain)
-                    and re.sub(r'\s+', ' ', source_plain).strip().casefold()
-                    == re.sub(r'\s+', ' ', result_plain).strip().casefold()
-                ):
-                    raise ValueError('teks dikembalikan tanpa diterjemahkan')
-                result = candidate
-                _translation_gate_success()
-                break
-            except Exception as exc:
-                last_error = exc
-                # Filosofi tran1/tran2: jangan memperlambat seluruh dokumen
-                # karena satu kegagalan. Buat ulang client, tunggu singkat, lalu
-                # retry terbatas dengan backoff. Recovery khusus dilakukan kemudian dengan 1 worker.
-                try:
-                    self._client = self._cls(source=self.source, target=self.target)
-                except Exception:
-                    pass
-                if attempt < 3:
-                    # Backoff pendek lalu lebih panjang. Dengan satu worker ini
-                    # tidak menahan request milik worker lain.
-                    base_wait = 0.9 if attempt == 1 else 1.8
-                    time.sleep(base_wait + random.uniform(0.05, 0.25))
+            if attempt == 1:
+                time.sleep(0.8)
 
-        if result is None:
-            # Judul standar lazim terdiri dari beberapa klausa yang dipisahkan
-            # em dash. Jika layanan menolak judul panjang sebagai satu request,
-            # coba setiap klausa secara mandiri lalu gabungkan kembali dengan
-            # tanda pisah asli. Ini juga membuat bagian yang sudah dicakup
-            # kamus langsung diselesaikan lokal per klausa.
-            title_parts = re.split(r'(\s*[—–]\s*)', t)
-            if len(title_parts) > 1:
-                translated_parts = []
-                try:
-                    for part in title_parts:
-                        if not part:
-                            continue
-                        if re.fullmatch(r'\s*[—–]\s*', part):
-                            translated_parts.append(part)
-                        else:
-                            part_result, _ = self.translate_one(part, {})
-                            translated_parts.append(part_result)
-                    result = ''.join(translated_parts)
-                except TranslationFailedError as split_error:
-                    last_error = split_error
-
-        if False and result is None:
-            # Provider cadangan dinonaktifkan: satu provider menjaga konsistensi
-            # request/rate-limited. Deep-translator menyertakan MyMemory;
-            # kegagalannya tetap ditangani tanpa merusak dokumen.
-            try:
-                from deep_translator import MyMemoryTranslator
-                fallback_source = (
-                    'english' if self.source in ('auto', 'en') else self.source
-                )
-                fallback_target = (
-                    'indonesian' if self.target == 'id' else self.target
-                )
-                fallback = MyMemoryTranslator(
-                    source=fallback_source, target=fallback_target
-                ).translate(t)
-                if fallback and not _looks_like_error_response(t, fallback):
-                    fallback_tokens = {
-                        token.casefold()
-                        for token in _RE_PROTECTION_TOKEN.findall(fallback)
-                    }
-                    if fallback_tokens == expected_tokens:
-                        result = fallback
-            except Exception as fallback_error:
-                last_error = fallback_error
-
-        if result is None:
-            safe_title = _TITLE_SAFE_FALLBACKS.get(
-                re.sub(r'\s+', ' ', text).strip().casefold()
-            )
-            if safe_title:
-                result = safe_title
-
-        translation_succeeded = result is not None
-        if result is None:
-            preview = re.sub(r'\s+', ' ', text).strip()[:100]
-            # Jangan gagalkan seluruh pipeline karena satu request eksternal.
-            # Simpan teks sumber (token kamus tetap dipulihkan di bawah) dan
-            # laporkan sebagai peringatan pada ringkasan proses.
+        if not provider_ok:
+            preview = re.sub(r'\s+', ' ', original).strip()[:100]
             self.failed_texts.append(preview)
             result = t
-        if token_map: result = self.custom_dict._apply_post(result, token_map)
+
+        # Tidak memakai validasi token equality yang agresif. tran2 juga
+        # mengembalikan token secara post-process tanpa menggagalkan seluruh
+        # paragraf hanya karena validator internal.
+        if token_map:
+            result = self.custom_dict._apply_post(result, token_map)
+
         italic_terms_found = []
         if final_italic_map:
             _idict = self.italic_dict if self.italic_dict is not None else ItalicDictionary()
             result, italic_terms_found = _idict._apply_post(result, final_italic_map)
-        # Cache hanya menyimpan hasil sukses; fallback sumber/gagal tidak pernah
-        # dimasukkan agar cache tidak tercemar.
-        if translation_succeeded:
+
+        # Cache hanya hasil provider yang benar-benar sukses.
+        if provider_ok:
             _cache_put(cache_key, result, italic_terms_found)
+
         return result, italic_terms_found
 
 def _match_capitalization(original: str, translated: str) -> str:
@@ -2060,7 +1996,7 @@ class DocxFinalTranslatorEngine:
                     pct = 10 + int(done / max(total, 1) * 80)
                     _notify(
                         progress_callback, pct,
-                        f"[translate stabil 1 worker] {done}/{total} | "
+                        f"[translate tran1/tran2] {done}/{total} | "
                         f"berhasil={translated_count} | "
                         f"gagal={len(failed_paras)} | "
                         f"[progres-total] {done}/{total + len(failed_paras)}",
@@ -2079,7 +2015,6 @@ class DocxFinalTranslatorEngine:
                     sorted(failed_paras, key=lambda item: item[0]), start=1):
                 # Beri provider kesempatan pulih sebelum mengulang item yang gagal.
                 # Ini penting pada shared IP Streamlit Cloud setelah burst/429.
-                time.sleep(1.25 + random.uniform(0.05, 0.25))
                 before = len(recovery_tr.failed_texts)
                 found = _translate_para(para, recovery_tr)
                 failed = len(recovery_tr.failed_texts) > before
