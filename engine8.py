@@ -2643,22 +2643,22 @@ class DocxFinalTranslatorEngine:
                 except Exception as exc:
                     recovery_init_error = exc
 
-            # STREAMING RECOVERY:
-            # Jangan prewarm SELURUH failed_paras sekaligus. Pola lama membuat UI
-            # berhenti lama pada status terakhir "translate N worker" karena
-            # ratusan unit diproteksi/cache-lookup/dibatch sebelum callback berikutnya.
-            #
-            # Sekarang setiap paragraf gagal langsung:
-            #   request extraction -> cache/prewarm micro-batch 3/2/1 -> translate
-            #   -> validator/repair/retry -> update UI -> paragraf berikutnya.
-            # Dengan demikian worker Google sudah benar-benar berhenti sebelum
-            # Pemulihan dan user langsung melihat transisi ke Gemini.
+            # DIRECT STREAMING RECOVERY:
+            # Tidak ada lagi fase/status "menyiapkan pemulihan". Begitu seluruh
+            # worker Google selesai, callback langsung berpindah ke Gemini 0/N.
+            # Proteksi, cache lookup, risk classification dan micro-batch 3/2/1
+            # tetap dilakukan secara internal per paragraf agar akurasi/kecepatan
+            # terjaga, tetapi tidak menjadi fase blocking terpisah.
             if recovery_total:
-                _notify(
-                    progress_callback, 90,
-                    f"[menyiapkan pemulihan] 0/{recovery_total} | "
+                detail0 = (
+                    f"[pemulihan Gemini 2.5 Flash] 0/{recovery_total} | "
                     f"berhasil=0 | gagal_final=0 | tersisa={recovery_total}"
                 )
+                if recovery_tr is not None:
+                    detail0 += f" | key={recovery_tr.active_key_number}"
+                if recovery_init_error is not None:
+                    detail0 += f" | Gemini tidak aktif: {recovery_init_error}"
+                _notify(progress_callback, 90, detail0)
 
             sorted_failed = sorted(failed_paras, key=lambda item: item[0])
             for recovery_done, (index, para) in enumerate(sorted_failed, start=1):
@@ -2666,10 +2666,10 @@ class DocxFinalTranslatorEngine:
                     failed = True
                     found = []
                 else:
-                    # Prewarm HANYA unit milik paragraf yang sedang diproses.
-                    # prewarm() tetap menggunakan risk-adaptive micro-batch 3/2/1,
-                    # validated cache, local protection, transient backoff, dan
-                    # targeted retry 1x. Tidak ada lagi global blocking prewarm.
+                    # Persiapan internal HANYA untuk paragraf aktif. Ini bukan
+                    # fase UI terpisah: status sudah berada pada Pemulihan Gemini.
+                    # Tetap memakai risk-adaptive micro-batch 3/2/1, validated
+                    # cache, local protection, transient backoff, dan targeted retry 1x.
                     para_requests = _gemini_recovery_requests_for_para(para, recovery_tr)
                     if para_requests:
                         recovery_tr.prewarm(para_requests)
