@@ -19,7 +19,7 @@ import copy
 import time
 import uuid
 import traceback
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed, wait, FIRST_COMPLETED
 import csv
 import os
 import json
@@ -2603,27 +2603,91 @@ class DocxFinalTranslatorEngine:
             except (TypeError, ValueError):
                 worker_count = 2
             worker_count = max(1, min(worker_count, 4))
+            # BOUNDED QUEUE + ADAPTIVE WORKER (konservatif)
+            # ---------------------------------------------------------------
+            # worker_count adalah BATAS MAKSIMUM yang dipilih user. Executor
+            # tidak lagi menerima seluruh dokumen sekaligus; pending dibatasi
+            # 3 x worker agar dokumen ratusan halaman tidak membuat ribuan
+            # Future sekaligus. Selama provider sehat active_limit tetap sama
+            # dengan pilihan user, jadi tidak ada penalti throughput normal.
+            #
+            # Adaptasi sengaja konservatif: turun hanya bila rolling window
+            # menunjukkan kegagalan nyata, bukan karena satu request gagal.
+            # Naik kembali satu tingkat setelah rangkaian hasil sehat.
+            max_pending = max(worker_count, worker_count * 3)
+            active_limit = worker_count
+            recent_results = []          # True = gagal; maksimum 12 hasil
+            healthy_streak = 0
+            next_index = 0
+            pending = {}
+
+            def _record_health(failed):
+                nonlocal active_limit, healthy_streak
+                recent_results.append(bool(failed))
+                if len(recent_results) > 12:
+                    del recent_results[0]
+                if failed:
+                    healthy_streak = 0
+                else:
+                    healthy_streak += 1
+
+                # Turun hanya jika minimal 6 sampel dan >= 50% gagal pada
+                # rolling window. Satu kegagalan sporadis tidak mengubah worker.
+                if active_limit > 1 and len(recent_results) >= 6:
+                    fail_rate = sum(recent_results) / len(recent_results)
+                    if fail_rate >= 0.50:
+                        active_limit -= 1
+                        recent_results.clear()
+                        healthy_streak = 0
+                # Recovery concurrency: setelah 12 hasil berturut-turut sehat,
+                # naik satu tingkat sampai batas pilihan user.
+                elif active_limit < worker_count and healthy_streak >= 12:
+                    active_limit += 1
+                    recent_results.clear()
+                    healthy_streak = 0
+
+            def _fill_queue(pool):
+                nonlocal next_index
+                # Jangan submit lebih dari active_limit pekerjaan berjalan.
+                # max_pending tetap menjadi hard guard jika implementasi ini
+                # kelak diperluas dengan prefetch terpisah.
+                target = min(active_limit, max_pending)
+                while next_index < total and len(pending) < target:
+                    item = (next_index, translation_queue[next_index])
+                    fut = pool.submit(_translate_job, item)
+                    pending[fut] = next_index
+                    next_index += 1
+
             with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix='translate') as pool:
-                futures = [pool.submit(_translate_job, item)
-                           for item in enumerate(translation_queue)]
-                for future in as_completed(futures):
-                    index, para, found, failed = future.result()
-                    done += 1
-                    italic_count += len(found)
-                    if failed:
-                        failed_paras.append((index, para))
-                    else:
-                        translated_count += 1
-                    # Translate normal memakai rentang 10%--90%, dihitung
-                    # murni dari counter done/total (XXX/XXX).
-                    pct = 10 + int(done / max(total, 1) * 80)
-                    _notify(
-                        progress_callback, pct,
-                        f"[translate {worker_count} worker] {done}/{total} | "
-                        f"berhasil={translated_count} | "
-                        f"gagal={len(failed_paras)} | "
-                        f"[progres-total] {done}/{total + len(failed_paras)}",
-                    )
+                _fill_queue(pool)
+                while pending:
+                    completed, _ = wait(tuple(pending), return_when=FIRST_COMPLETED)
+                    for future in completed:
+                        pending.pop(future, None)
+                        index, para, found, failed = future.result()
+                        done += 1
+                        italic_count += len(found)
+                        if failed:
+                            failed_paras.append((index, para))
+                        else:
+                            translated_count += 1
+                        _record_health(failed)
+
+                        # Cache SQLite yang sudah ada adalah checkpoint ringan:
+                        # setiap hasil tervalidasi tersimpan segera (WAL), sehingga
+                        # restart tidak perlu menerjemahkan ulang hasil sukses.
+                        # Tidak menyimpan DOCX setiap paragraf karena itu justru
+                        # menambah I/O dan tidak thread-safe saat worker aktif.
+                        pct = 10 + int(done / max(total, 1) * 80)
+                        _notify(
+                            progress_callback, pct,
+                            f"[translate {worker_count} worker; aktif={active_limit}; "
+                            f"queue<={max_pending}] {done}/{total} | "
+                            f"berhasil={translated_count} | "
+                            f"gagal={len(failed_paras)} | "
+                            f"[progres-total] {done}/{total + len(failed_paras)}",
+                        )
+                    _fill_queue(pool)
 
             # PEMULIHAN: bagian yang gagal pada Google Translate tidak diulang
             # dengan provider yang sama. Gunakan Gemini 2.5 Flash secara
