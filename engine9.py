@@ -703,6 +703,30 @@ def apply_custom_styles(input_docx: str, output_docx: str) -> tuple[bool, str]:
     return StyleFinalizerEngine().apply(input_docx, output_docx)
 
 
+def _enforce_page_margin_safety(doc: Document) -> None:
+    """Jaga elemen Engine9 tetap berada di area cetak tanpa mengubah margin template.
+
+    Fokus pada indent paragraf negatif/berlebih yang dapat mendorong teks melewati
+    margin. Tabel/gambar sumber tidak di-resize agresif agar layout standar tidak rusak.
+    """
+    for paragraph in doc.paragraphs:
+        pPr = paragraph._p.find(qn('w:pPr'))
+        if pPr is None:
+            continue
+        ind = pPr.find(qn('w:ind'))
+        if ind is None:
+            continue
+        # Indent negatif dapat menempatkan teks di luar margin fisik.
+        for attr in ('w:left', 'w:start', 'w:right', 'w:end'):
+            val = ind.get(qn(attr))
+            if val is not None:
+                try:
+                    if int(val) < 0:
+                        ind.set(qn(attr), '0')
+                except (TypeError, ValueError):
+                    pass
+
+
 class TableOfContentsEngine:
     """Engine 9 final: buat style Judul/Pasal lalu sisipkan TOC Word."""
 
@@ -743,7 +767,7 @@ class TableOfContentsEngine:
         right_tab = OxmlElement('w:tab')
         right_tab.set(qn('w:val'), 'right')
         right_tab.set(qn('w:leader'), 'dot')
-        right_tab.set(qn('w:pos'), '9752')     # 17,2 cm
+        right_tab.set(qn('w:pos'), '8986')     # 15,85 cm; aman di area teks A4 margin 3/2 cm
         tabs.append(right_tab)
         pPr.append(tabs)
         pPr.append(OxmlElement('w:suppressAutoHyphens'))
@@ -958,7 +982,12 @@ class TableOfContentsEngine:
         if not docx_path or not os.path.isfile(docx_path):
             raise FileNotFoundError(f'File untuk update TOC tidak ditemukan: {docx_path}')
         if os.name != 'nt':
-            TableOfContentsEngine._update_toc_page_numbers_on_linux(docx_path)
+            # PENTING: jangan ubah TOC menjadi teks statis di Linux/Streamlit.
+            # TOC harus tetap native Word field agar pengguna tetap dapat memakai
+            # Update Field -> Update page numbers only setelah file diunduh.
+            # Linux tidak memiliki Microsoft Word COM, jadi pagination final Word
+            # tidak dapat dihitung secara identik. Field ditinggalkan dalam keadaan
+            # dirty dan akan dapat diperbarui oleh Microsoft Word.
             return
 
         abs_path = os.path.abspath(docx_path)
@@ -1372,13 +1401,16 @@ finally {{
         anchor = self._toc_anchor_after_three_blank_paragraphs(title)
         anchor.addnext(toc._p)
         self._force_update_fields(doc)
+        _enforce_page_margin_safety(doc)
         atomic_save_docx(doc, output_docx)
         # Jangan sediakan file untuk download sebelum Word benar-benar selesai
         # menghitung pagination dan menjalankan "Update page numbers only".
         self._update_toc_page_numbers_with_word(output_docx)
-        # Hasil COM di atas adalah hasil final. Cegah Word mengulang Update All
-        # saat pengguna membuka file dan merusak nomor tersimpan menjadi i/1.
-        self._disable_update_fields_after_finalization(output_docx)
+        # Hanya Windows + Microsoft Word yang benar-benar menghitung pagination
+        # final di Engine9. Pada Linux/Streamlit, pertahankan w:updateFields=true
+        # dan TOC native agar menu Update Field / Update page numbers only tetap aktif.
+        if os.name == 'nt':
+            self._disable_update_fields_after_finalization(output_docx)
         return output_docx
 
     def process(self, input_docx: Optional[str] = None,
