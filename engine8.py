@@ -27,6 +27,7 @@ import hashlib
 import sqlite3
 import tempfile
 import threading
+import random
 from collections import OrderedDict
 
 from docx import Document
@@ -1418,6 +1419,92 @@ class TranslationFailedError(RuntimeError):
     """Mencegah dokumen setengah diterjemahkan tetap disimpan."""
 
 
+def _google_error_code(exc: Exception):
+    """Best-effort klasifikasi error Google Translate/deep-translator."""
+    text = str(exc or "").casefold()
+    m = re.search(r'(?<!\d)(400|403|408|409|429|500|502|503|504)(?!\d)', text)
+    if m:
+        return int(m.group(1))
+    if any(x in text for x in ("too many request", "too many requests", "rate limit", "unusual traffic")):
+        return 429
+    if any(x in text for x in ("timeout", "timed out", "connection reset", "temporarily unavailable")):
+        return 503
+    return None
+
+
+class _GoogleTranslateCoordinator:
+    """Circuit breaker global untuk seluruh worker Google Translate.
+
+    Saat satu worker melihat 429/error sementara, SEMUA worker berhenti menekan
+    Google dan beralih ke Gemini. Setelah cooldown hanya satu worker diizinkan
+    melakukan probe. Jika probe sukses, circuit ditutup dan semua worker kembali
+    ke Google Translate. Ini mencegah thundering-herd/request bombing.
+    """
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._open_until = 0.0
+        self._probe_in_flight = False
+        self._strike = 0
+        self._base_cooldown = float(os.getenv("GOOGLE_TRANSLATE_COOLDOWN", "10"))
+        self._max_cooldown = float(os.getenv("GOOGLE_TRANSLATE_MAX_COOLDOWN", "60"))
+        self.last_code = None
+
+    def permit_google(self) -> tuple[bool, bool]:
+        now = time.monotonic()
+        with self._lock:
+            if now < self._open_until:
+                return False, False
+            if self._strike > 0:
+                if self._probe_in_flight:
+                    return False, False
+                self._probe_in_flight = True
+                return True, True
+            return True, False
+
+    def success(self, was_probe: bool = False):
+        with self._lock:
+            if was_probe or self._strike:
+                self._strike = 0
+                self._open_until = 0.0
+            self._probe_in_flight = False
+            self.last_code = None
+
+    def failure(self, code=None, was_probe: bool = False):
+        transient = code in (408, 409, 429, 500, 502, 503, 504) or code is None
+        with self._lock:
+            self._probe_in_flight = False
+            self.last_code = code
+            if transient:
+                self._strike = min(self._strike + 1, 4)
+                delay = min(self._max_cooldown, self._base_cooldown * (2 ** (self._strike - 1)))
+                # Jitter kecil agar semua worker tidak bangun pada milidetik sama.
+                self._open_until = max(self._open_until, time.monotonic() + delay + random.uniform(0.2, 0.9))
+
+    def state(self) -> str:
+        with self._lock:
+            remain = max(0.0, self._open_until - time.monotonic())
+            if remain > 0:
+                return f"Gemini fallback (Google cooldown {remain:.1f}s; kode={self.last_code or 'network'})"
+            if self._strike:
+                return "probe Google Translate"
+            return "Google Translate normal"
+
+
+_GOOGLE_TRANSLATE_COORDINATOR = _GoogleTranslateCoordinator()
+_GEMINI_WORKER_LOCK = threading.Lock()
+_GEMINI_WORKER_COUNTER = 0
+
+
+def _next_gemini_worker_key_index(key_count: int) -> int:
+    global _GEMINI_WORKER_COUNTER
+    if key_count <= 0:
+        return 0
+    with _GEMINI_WORKER_LOCK:
+        idx = _GEMINI_WORKER_COUNTER % key_count
+        _GEMINI_WORKER_COUNTER += 1
+        return idx
+
+
 class _Translator:
     def __init__(self, source: str = 'auto', target: str = 'id', 
                  custom_dict: CustomDictionary | None = None,
@@ -1431,6 +1518,10 @@ class _Translator:
         self._client = self._cls(source=self.source, target=self.target)
         self.failed_texts: list[str] = []
         self.dictionary_fingerprint = dictionary_fingerprint or _canonical_dictionary_fingerprint(custom_dict, italic_dict)
+        self._coordinator = _GOOGLE_TRANSLATE_COORDINATOR
+        self._gemini_fallback = None
+        self.last_provider = 'google'
+        self.last_error_code = None
 
     def translate_one(self, text: str, italic_map: dict = None) -> tuple[str, list[str]]:
         t = text.strip()
@@ -1476,33 +1567,68 @@ class _Translator:
         }
         result = None
         last_error = None
-        attempts = 1 if _negative_cache_active(cache_key) else 4
-        for attempt in range(1, attempts + 1):
-            try:
-                candidate = self._client.translate(t)
-                if not candidate or not _translation_quality_ok(t, candidate):
-                    raise ValueError('respons layanan terjemahan tidak lolos quality gate')
-                returned_tokens = {
-                    token.casefold()
-                    for token in _RE_PROTECTION_TOKEN.findall(candidate)
-                }
-                if returned_tokens != expected_tokens:
-                    raise ValueError('token kamus/format berubah atau hilang')
 
-                source_plain = _RE_PROTECTION_TOKEN.sub('', t)
-                result_plain = _RE_PROTECTION_TOKEN.sub('', candidate)
-                if (
-                    re.search(r'[A-Za-z]{3}', source_plain)
-                    and re.sub(r'\s+', ' ', source_plain).strip().casefold()
-                    == re.sub(r'\s+', ' ', result_plain).strip().casefold()
-                ):
-                    raise ValueError('teks dikembalikan tanpa diterjemahkan')
-                result = candidate
-                break
-            except Exception as exc:
-                last_error = exc
-                if attempt < attempts:
-                    time.sleep(min(3.0, 0.6 * (2 ** (attempt - 1))))
+        # Circuit breaker bersama: jika Google sedang cooldown, worker ini tidak
+        # mengirim request Google sama sekali dan langsung memakai Gemini.
+        google_allowed, was_probe = self._coordinator.permit_google()
+        if google_allowed:
+            attempts = 1 if was_probe or _negative_cache_active(cache_key) else 2
+            for attempt in range(1, attempts + 1):
+                try:
+                    candidate = self._client.translate(t)
+                    if not candidate or not _translation_quality_ok(t, candidate):
+                        raise ValueError('respons layanan terjemahan tidak lolos quality gate')
+                    returned_tokens = {
+                        token.casefold() for token in _RE_PROTECTION_TOKEN.findall(candidate)
+                    }
+                    if returned_tokens != expected_tokens:
+                        raise ValueError('token kamus/format berubah atau hilang')
+                    source_plain = _RE_PROTECTION_TOKEN.sub('', t)
+                    result_plain = _RE_PROTECTION_TOKEN.sub('', candidate)
+                    if (re.search(r'[A-Za-z]{3}', source_plain) and
+                        re.sub(r'\s+', ' ', source_plain).strip().casefold() ==
+                        re.sub(r'\s+', ' ', result_plain).strip().casefold()):
+                        raise ValueError('teks dikembalikan tanpa diterjemahkan')
+                    result = candidate
+                    self.last_provider = 'google'
+                    self.last_error_code = None
+                    self._coordinator.success(was_probe)
+                    break
+                except Exception as exc:
+                    last_error = exc
+                    code = _google_error_code(exc)
+                    self.last_error_code = code
+                    # 429/5xx/network membuka circuit untuk SEMUA worker.
+                    if code in (408, 409, 429, 500, 502, 503, 504) or was_probe:
+                        self._coordinator.failure(code, was_probe)
+                        break
+                    if attempt < attempts:
+                        time.sleep(0.45 + random.uniform(0.05, 0.25))
+        else:
+            self.last_provider = 'gemini'
+
+        # Fallback langsung per worker ke Gemini 2.5 Flash. Setiap instance
+        # worker mendapat key awal berbeda (round-robin GEMINI_API_KEY_1..15).
+        if result is None:
+            try:
+                if self._gemini_fallback is None:
+                    keys = _get_gemini_api_keys()
+                    if keys:
+                        start_idx = _next_gemini_worker_key_index(len(keys))
+                        ordered = keys[start_idx:] + keys[:start_idx]
+                        self._gemini_fallback = _GeminiRecoveryTranslator(
+                            self.source, self.target, self.custom_dict, self.italic_dict,
+                            self.dictionary_fingerprint, api_keys=ordered,
+                        )
+                if self._gemini_fallback is not None:
+                    gemini_result, gemini_terms = self._gemini_fallback.translate_one(text, italic_map or {})
+                    if gemini_result and gemini_result != text:
+                        if owns_flight:
+                            _ENGINE8_TRANSLATION_CACHE.finish(cache_key)
+                        self.last_provider = 'gemini'
+                        return gemini_result, gemini_terms
+            except Exception as gemini_error:
+                last_error = gemini_error
 
         if result is None:
             # Judul standar lazim terdiri dari beberapa klausa yang dipisahkan
@@ -1525,31 +1651,6 @@ class _Translator:
                     result = ''.join(translated_parts)
                 except TranslationFailedError as split_error:
                     last_error = split_error
-
-        if result is None:
-            # Provider cadangan untuk kondisi Google Translate sedang menolak
-            # request/rate-limited. Deep-translator menyertakan MyMemory;
-            # kegagalannya tetap ditangani tanpa merusak dokumen.
-            try:
-                from deep_translator import MyMemoryTranslator
-                fallback_source = (
-                    'english' if self.source in ('auto', 'en') else self.source
-                )
-                fallback_target = (
-                    'indonesian' if self.target == 'id' else self.target
-                )
-                fallback = MyMemoryTranslator(
-                    source=fallback_source, target=fallback_target
-                ).translate(t)
-                if fallback and _translation_quality_ok(t, fallback):
-                    fallback_tokens = {
-                        token.casefold()
-                        for token in _RE_PROTECTION_TOKEN.findall(fallback)
-                    }
-                    if fallback_tokens == expected_tokens:
-                        result = fallback
-            except Exception as fallback_error:
-                last_error = fallback_error
 
         if result is None:
             safe_title = _TITLE_SAFE_FALLBACKS.get(
@@ -1597,7 +1698,7 @@ class _Translator:
 
 
 def _get_gemini_api_keys() -> list[str]:
-    """Ambil maksimum 2 Gemini API key (primary + backup) tanpa hard-code.
+    """Ambil maksimum 15 Gemini API key tanpa hard-code.
 
     Urutan prioritas:
       1) GEMINI_API_KEY_1
@@ -1607,7 +1708,7 @@ def _get_gemini_api_keys() -> list[str]:
     Environment variable dibaca lebih dahulu, lalu Streamlit Secrets untuk
     nama yang belum tersedia di environment.
     """
-    names = ("GEMINI_API_KEY_1", "GEMINI_API_KEY_2")
+    names = tuple(f"GEMINI_API_KEY_{i}" for i in range(1, 16))
     values = []
 
     def _add(value):
@@ -1628,8 +1729,8 @@ def _get_gemini_api_keys() -> list[str]:
     except Exception:
         pass
 
-    # Desain Engine8 hanya primary + satu backup.
-    return values[:2]
+    # Maksimum 15 key berbeda; worker memilih key awal secara round-robin.
+    return values[:15]
 
 
 def _gemini_auth_error(exc: Exception) -> bool:
@@ -1700,17 +1801,17 @@ class _GeminiRecoveryTranslator:
     def __init__(self, source: str = 'auto', target: str = 'id',
                  custom_dict: CustomDictionary | None = None,
                  italic_dict: ItalicDictionary | None = None,
-                 dictionary_fingerprint: str = ''):
+                 dictionary_fingerprint: str = '', api_keys: list[str] | None = None):
         try:
             from google import genai
             from google.genai import types
         except ImportError as exc:
             raise ImportError("Jalankan: pip install -U google-genai") from exc
-        api_keys = _get_gemini_api_keys()
+        api_keys = list(api_keys or _get_gemini_api_keys())
         if not api_keys:
             raise RuntimeError(
-                "Gemini API key belum diset. Isi GEMINI_API_KEY_1 dan opsional "
-                "GEMINI_API_KEY_2 di Streamlit Secrets/environment variable."
+                "Gemini API key belum diset. Isi GEMINI_API_KEY_1 sampai "
+                "GEMINI_API_KEY_15 di Streamlit Secrets/environment variable."
             )
         self.source = source; self.target = target
         self.custom_dict = custom_dict; self.italic_dict = italic_dict
@@ -1769,11 +1870,11 @@ class _GeminiRecoveryTranslator:
 
     @property
     def active_key_number(self) -> int:
-        """Nomor key aktif (1/2) untuk diagnostic tanpa mengekspos secret."""
+        """Nomor key aktif dalam pool worker tanpa mengekspos secret."""
         return self._active_key_index + 1
 
     def _switch_to_backup_key(self) -> bool:
-        """Pindah sekali ke backup key bila tersedia; tidak pernah berputar balik."""
+        """Pindah ke key berikutnya dalam pool bila autentikasi key aktif gagal."""
         next_index = self._active_key_index + 1
         if next_index >= len(self._api_keys):
             return False
@@ -2571,6 +2672,7 @@ class DocxFinalTranslatorEngine:
                         f"[translate {worker_count} worker] {done}/{total} | "
                         f"berhasil={translated_count} | "
                         f"gagal={len(failed_paras)} | "
+                        f"provider={_GOOGLE_TRANSLATE_COORDINATOR.state()} | "
                         f"[progres-total] {done}/{total + len(failed_paras)}",
                     )
 
