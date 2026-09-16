@@ -90,7 +90,10 @@ GEMINI_BACKOFF_MAX = float(os.getenv("GEMINI_BACKOFF_MAX", "45.0"))
 # Main-provider pacing. 4 worker tetap paralel, tetapi awal request diberi jarak
 # kecil agar tidak membentuk burst serentak. Nilai ini adaptif saat failure naik.
 ENGINE8_PACER_MIN_INTERVAL = float(os.getenv("ENGINE8_PACER_MIN_INTERVAL", "0.22"))
-ENGINE8_PACER_MAX_INTERVAL = float(os.getenv("ENGINE8_PACER_MAX_INTERVAL", "1.50"))
+ENGINE8_PACER_MAX_INTERVAL = float(os.getenv("ENGINE8_PACER_MAX_INTERVAL", "2.50"))
+ENGINE8_MAIN_TRANSIENT_RETRIES = int(os.getenv("ENGINE8_MAIN_TRANSIENT_RETRIES", "8"))
+ENGINE8_MAIN_CIRCUIT_THRESHOLD = int(os.getenv("ENGINE8_MAIN_CIRCUIT_THRESHOLD", "3"))
+ENGINE8_MAIN_CIRCUIT_COOLDOWN = float(os.getenv("ENGINE8_MAIN_CIRCUIT_COOLDOWN", "25.0"))
 # Recovery circuit breaker: transient failure bukan translation failure.
 GEMINI_CIRCUIT_THRESHOLD = int(os.getenv("GEMINI_CIRCUIT_THRESHOLD", "3"))
 GEMINI_CIRCUIT_COOLDOWN = float(os.getenv("GEMINI_CIRCUIT_COOLDOWN", "20.0"))
@@ -1441,9 +1444,20 @@ class _AdaptiveRequestPacer:
     def __init__(self, minimum=ENGINE8_PACER_MIN_INTERVAL, maximum=ENGINE8_PACER_MAX_INTERVAL):
         self.minimum=max(0.0, float(minimum)); self.maximum=max(self.minimum, float(maximum))
         self.interval=self.minimum; self._next_at=0.0; self._healthy=0
+        self._transient_streak=0; self._circuit_open_until=0.0
+        self._half_open=False; self._probe_lock=threading.Lock()
         self._lock=threading.Lock()
 
     def wait_turn(self):
+        # Shared circuit breaker: saat provider sedang throttled, semua worker
+        # berhenti melepas request baru. Unit tetap pending, bukan gagal.
+        while True:
+            with self._lock:
+                now=time.monotonic()
+                circuit_wait=max(0.0, self._circuit_open_until-now)
+            if circuit_wait <= 0:
+                break
+            time.sleep(min(circuit_wait, 1.0))
         with self._lock:
             now=time.monotonic(); wait=max(0.0, self._next_at-now)
             self._next_at=max(now, self._next_at)+self.interval
@@ -1452,10 +1466,16 @@ class _AdaptiveRequestPacer:
     def report(self, failure_kind=''):
         with self._lock:
             if failure_kind in ('transport','rate_limit','provider'):
-                self._healthy=0
-                factor=1.55 if failure_kind == 'rate_limit' else 1.30
-                self.interval=min(self.maximum, max(self.minimum, self.interval*factor + 0.03))
+                self._healthy=0; self._transient_streak += 1
+                factor=1.70 if failure_kind == 'rate_limit' else 1.38
+                self.interval=min(self.maximum, max(self.minimum, self.interval*factor + 0.05))
+                if self._transient_streak >= ENGINE8_MAIN_CIRCUIT_THRESHOLD:
+                    # Open circuit. Semua worker menunggu cooldown; request yang
+                    # sedang retry tetap menjadi pending di worker masing-masing.
+                    self._circuit_open_until=max(self._circuit_open_until, time.monotonic()+ENGINE8_MAIN_CIRCUIT_COOLDOWN)
+                    self._transient_streak=0
             elif not failure_kind:
+                self._transient_streak=0
                 self._healthy += 1
                 if self._healthy >= 10:
                     self.interval=max(self.minimum, self.interval*0.82)
@@ -1538,7 +1558,7 @@ class _Translator:
         }
         result = None
         last_error = None
-        attempts = 1 if _negative_cache_active(cache_key) else 4
+        attempts = 1 if _negative_cache_active(cache_key) else ENGINE8_MAIN_TRANSIENT_RETRIES
         for attempt in range(1, attempts + 1):
             try:
                 _ENGINE8_MAIN_PACER.wait_turn()
@@ -1569,7 +1589,12 @@ class _Translator:
                 self.last_failure_kind = _main_failure_kind(exc)
                 _ENGINE8_MAIN_PACER.report(self.last_failure_kind)
                 if attempt < attempts:
-                    time.sleep(min(3.0, 0.6 * (2 ** (attempt - 1))))
+                    # Validation retry tetap cepat; transport/rate-limit/provider
+                    # memakai backoff lebih panjang dan circuit breaker bersama.
+                    if self.last_failure_kind in ('transport','rate_limit','provider'):
+                        time.sleep(min(30.0, 1.0 * (2 ** (attempt - 1))))
+                    else:
+                        time.sleep(min(3.0, 0.6 * (2 ** (attempt - 1))))
 
         if result is None:
             # Judul standar lazim terdiri dari beberapa klausa yang dipisahkan
@@ -2858,7 +2883,7 @@ class DocxFinalTranslatorEngine:
             if recovery_total:
                 detail0 = (
                     f"[pemulihan Gemini 2.5 Flash] 0/{recovery_total} | "
-                    f"berhasil=0 | gagal_recovery=0 | tersisa={recovery_total}"
+                    f"berhasil=0 | gagal_final=0 | tersisa={recovery_total}"
                 )
                 if recovery_tr is not None:
                     detail0 += f" | key={recovery_tr.active_key_number}"
@@ -2896,7 +2921,7 @@ class DocxFinalTranslatorEngine:
                     f"[pemulihan Gemini 2.5 Flash] "
                     f"{recovery_done}/{recovery_total} | "
                     f"berhasil={recovery_success} | "
-                    f"gagal_recovery={len(still_failed)} | "
+                    f"gagal_final={len(still_failed)} | "
                     f"tersisa={recovery_total - recovery_done}"
                 )
                 if recovery_tr is not None:
