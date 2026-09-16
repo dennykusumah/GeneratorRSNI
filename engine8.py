@@ -1495,6 +1495,23 @@ class _AdaptiveRequestPacer:
 _ENGINE8_MAIN_PACER = _AdaptiveRequestPacer()
 
 
+def _failure_code(exc: Exception) -> str:
+    """Kode diagnostik aman untuk dashboard; tidak memuat API key/payload."""
+    for obj in (exc, getattr(exc, "response", None)):
+        if obj is None: continue
+        for attr in ("status_code", "status"):
+            v=getattr(obj, attr, None)
+            try:
+                if v is not None and str(v).isdigit(): return str(int(v))
+            except Exception: pass
+    m=re.search(r"(?<!\d)(400|401|403|404|408|409|422|429|500|502|503|504)(?!\d)", str(exc))
+    if m: return m.group(1)
+    text=str(exc).casefold()
+    if any(x in text for x in ("timeout","timed out","deadline exceeded")): return "TIMEOUT"
+    if any(x in text for x in ("connection","remote disconnected","connection reset","connection aborted")): return "CONNECTION"
+    if any(x in text for x in ("quality gate","token kamus","tanpa diterjemahkan")): return "VALIDATION"
+    return "OTHER"
+
 def _main_failure_kind(exc: Exception) -> str:
     """Klasifikasi best-effort tanpa bergantung pada tipe exception provider."""
     text=str(exc).casefold()
@@ -1523,6 +1540,7 @@ class _Translator:
         self.failed_texts: list[str] = []
         self.dictionary_fingerprint = dictionary_fingerprint or _canonical_dictionary_fingerprint(custom_dict, italic_dict)
         self.last_failure_kind = ""
+        self.last_failure_code = ""
 
     def translate_one(self, text: str, italic_map: dict = None) -> tuple[str, list[str]]:
         t = text.strip()
@@ -1592,11 +1610,13 @@ class _Translator:
                     raise ValueError('teks dikembalikan tanpa diterjemahkan')
                 result = candidate
                 self.last_failure_kind = ""
+                self.last_failure_code = ""
                 _ENGINE8_MAIN_PACER.report("")
                 break
             except Exception as exc:
                 last_error = exc
                 self.last_failure_kind = _main_failure_kind(exc)
+                self.last_failure_code = _failure_code(exc)
                 _ENGINE8_MAIN_PACER.report(self.last_failure_kind)
                 if attempt < attempts:
                     # Validation retry tetap cepat; transport/rate-limit/provider
@@ -1822,6 +1842,7 @@ class _GeminiRecoveryTranslator:
         self._transient_streak = 0
         self._circuit_open_until = 0.0
         self.failure_counts = {'transport': 0, 'rate_limit': 0, 'provider': 0, 'validation': 0}
+        self.failure_codes = {}
 
     def _cache_key(self, text: str, italic_map=None) -> str:
         fp = "|".join((self.dictionary_fingerprint, GEMINI_RECOVERY_VERSION, self.model))
@@ -1903,6 +1924,8 @@ class _GeminiRecoveryTranslator:
 
     def _record_transient(self, exc: Exception):
         status=_gemini_status_code(exc)
+        code=str(status) if status is not None else _failure_code(exc)
+        self.failure_codes[code]=self.failure_codes.get(code,0)+1
         kind='rate_limit' if status == 429 else ('provider' if status in (500,502,503,504) else 'transport')
         self.failure_counts[kind]=self.failure_counts.get(kind,0)+1
         self._transient_streak += 1
@@ -2093,6 +2116,8 @@ class _GeminiRecoveryTranslator:
                     last_exc=exc
                     # Error permanen (mis. 400/404) tidak dibuang waktu dengan retry.
                     if not _gemini_transient_error(exc):
+                        code=str(_gemini_status_code(exc) or _failure_code(exc))
+                        self.failure_codes[code]=self.failure_codes.get(code,0)+1
                         self.failure_counts['provider']=self.failure_counts.get('provider',0)+1
                         self.diagnostics.append(
                             f"Gemini key {self.active_key_number}: request gagal permanen; batch dilewati."
@@ -2771,7 +2796,7 @@ class DocxFinalTranslatorEngine:
                 )
                 found = _translate_para(para, worker_tr)
                 failed=bool(worker_tr.failed_texts)
-                return index, para, found, failed, (worker_tr.last_failure_kind if failed else "")
+                return index, para, found, failed, (worker_tr.last_failure_kind if failed else ""), (worker_tr.last_failure_code if failed else "")
 
             # Tahap utama: jumlah worker dipilih user dari UI (1--4).
             try:
@@ -2798,6 +2823,7 @@ class DocxFinalTranslatorEngine:
             pending = {}
 
             failure_stats={'rate_limit':0,'transport':0,'provider':0,'validation':0,'unknown':0}
+            failure_codes={}
 
             transient_streak = 0
 
@@ -2854,7 +2880,7 @@ class DocxFinalTranslatorEngine:
                     completed, _ = wait(tuple(pending), return_when=FIRST_COMPLETED)
                     for future in completed:
                         pending.pop(future, None)
-                        index, para, found, failed, failure_kind = future.result()
+                        index, para, found, failed, failure_kind, failure_code = future.result()
                         done += 1
                         italic_count += len(found)
                         if failed:
@@ -2862,6 +2888,9 @@ class DocxFinalTranslatorEngine:
                         else:
                             translated_count += 1
                         _record_health(failed, failure_kind)
+                        if failed:
+                            code=failure_code or "OTHER"
+                            failure_codes[code]=failure_codes.get(code,0)+1
 
                         # Cache SQLite yang sudah ada adalah checkpoint ringan:
                         # setiap hasil tervalidasi tersimpan segera (WAL), sehingga
@@ -2877,6 +2906,7 @@ class DocxFinalTranslatorEngine:
                             f"gagal={len(failed_paras)} | pacer={_ENGINE8_MAIN_PACER.interval:.2f}s | "
                             f"429={failure_stats['rate_limit']} timeout={failure_stats['transport']} "
                             f"provider={failure_stats['provider']} validasi={failure_stats['validation']} | "
+                            f"kode=" + (",".join(f"{k}:{v}" for k,v in sorted(failure_codes.items())) or "-") + " | "
                             f"[progres-total] {done}/{total + len(failed_paras)}",
                         )
                     _fill_queue(pool)
@@ -2953,7 +2983,7 @@ class DocxFinalTranslatorEngine:
                     fc=recovery_tr.failure_counts
                     detail += (f" | key={recovery_tr.active_key_number} | 429={fc.get('rate_limit',0)} "
                                f"timeout={fc.get('transport',0)} provider={fc.get('provider',0)} "
-                               f"validasi={fc.get('validation',0)}")
+                               f"validasi={fc.get('validation',0)} | kode=" + (",".join(f"{k}:{v}" for k,v in sorted(recovery_tr.failure_codes.items())) or "-"))
                 if recovery_init_error is not None:
                     detail += f" | Gemini tidak aktif: {recovery_init_error}"
                 _notify(progress_callback, pct, detail)
