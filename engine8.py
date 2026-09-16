@@ -77,7 +77,7 @@ _EM_DASH = '—'
 ENGINE8_POLICY_VERSION = "2026.09-cache-v2-quality-gate"
 ENGINE8_PROVIDER_VERSION = "deep-translator-google+mymemory-v1"
 GEMINI_RECOVERY_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
-GEMINI_RECOVERY_VERSION = "gemini-recovery-v5-pacer-circuit-quality"
+GEMINI_RECOVERY_VERSION = "gemini-recovery-v6-adaptive-stable"
 # Balance akurasi/kecepatan: low=3, medium=2, high=1.
 GEMINI_RECOVERY_LOW_ITEMS = int(os.getenv("GEMINI_RECOVERY_LOW_ITEMS", "3"))
 GEMINI_RECOVERY_MEDIUM_ITEMS = int(os.getenv("GEMINI_RECOVERY_MEDIUM_ITEMS", "2"))
@@ -92,8 +92,8 @@ GEMINI_BACKOFF_MAX = float(os.getenv("GEMINI_BACKOFF_MAX", "45.0"))
 ENGINE8_PACER_MIN_INTERVAL = float(os.getenv("ENGINE8_PACER_MIN_INTERVAL", "0.22"))
 ENGINE8_PACER_MAX_INTERVAL = float(os.getenv("ENGINE8_PACER_MAX_INTERVAL", "2.50"))
 ENGINE8_MAIN_TRANSIENT_RETRIES = int(os.getenv("ENGINE8_MAIN_TRANSIENT_RETRIES", "8"))
-ENGINE8_MAIN_CIRCUIT_THRESHOLD = int(os.getenv("ENGINE8_MAIN_CIRCUIT_THRESHOLD", "3"))
-ENGINE8_MAIN_CIRCUIT_COOLDOWN = float(os.getenv("ENGINE8_MAIN_CIRCUIT_COOLDOWN", "25.0"))
+ENGINE8_MAIN_CIRCUIT_THRESHOLD = int(os.getenv("ENGINE8_MAIN_CIRCUIT_THRESHOLD", "2"))
+ENGINE8_MAIN_CIRCUIT_COOLDOWN = float(os.getenv("ENGINE8_MAIN_CIRCUIT_COOLDOWN", "30.0"))
 # Recovery circuit breaker: transient failure bukan translation failure.
 GEMINI_CIRCUIT_THRESHOLD = int(os.getenv("GEMINI_CIRCUIT_THRESHOLD", "3"))
 GEMINI_CIRCUIT_COOLDOWN = float(os.getenv("GEMINI_CIRCUIT_COOLDOWN", "20.0"))
@@ -1448,6 +1448,16 @@ class _AdaptiveRequestPacer:
         self._half_open=False; self._probe_lock=threading.Lock()
         self._lock=threading.Lock()
 
+    def reset_for_run(self):
+        """Mulai setiap dokumen dari kondisi sehat; state throttling run lama tidak bocor."""
+        with self._lock:
+            self.interval = self.minimum
+            self._next_at = 0.0
+            self._healthy = 0
+            self._transient_streak = 0
+            self._circuit_open_until = 0.0
+            self._half_open = False
+
     def wait_turn(self):
         # Shared circuit breaker: saat provider sedang throttled, semua worker
         # berhenti melepas request baru. Unit tetap pending, bukan gagal.
@@ -2744,6 +2754,11 @@ class DocxFinalTranslatorEngine:
                 f"| [progres-total] 0/{total}",
             )
 
+            # State pacer/circuit bersifat per dokumen. Streamlit mempertahankan
+            # proses Python antar-run, jadi state throttling dokumen sebelumnya
+            # tidak boleh membuat dokumen baru langsung berjalan dalam mode lambat.
+            _ENGINE8_MAIN_PACER.reset_for_run()
+
             done = translated_count = 0
             italic_count = 0
             failed_paras = []
@@ -2784,32 +2799,42 @@ class DocxFinalTranslatorEngine:
 
             failure_stats={'rate_limit':0,'transport':0,'provider':0,'validation':0,'unknown':0}
 
+            transient_streak = 0
+
             def _record_health(failed, failure_kind=''):
-                nonlocal active_limit, healthy_streak
+                nonlocal active_limit, healthy_streak, transient_streak
+                kind = failure_kind if failure_kind in failure_stats else 'unknown'
                 if failed:
-                    failure_stats[failure_kind if failure_kind in failure_stats else 'unknown'] += 1
+                    failure_stats[kind] += 1
                 recent_results.append(bool(failed))
                 if len(recent_results) > 12:
                     del recent_results[0]
-                if failed:
+
+                is_transient = failed and kind in ('rate_limit', 'transport', 'provider')
+                if is_transient:
+                    # Reaksi cepat terhadap burst provider: jangan menunggu 6 hasil
+                    # terminal. Dua transient berturut-turut langsung mengurangi
+                    # tekanan secara nyata. 4 -> 2 -> 1 lebih efektif daripada 4 -> 3.
+                    transient_streak += 1
+                    healthy_streak = 0
+                    if transient_streak >= 2 and active_limit > 1:
+                        active_limit = max(1, active_limit // 2)
+                        transient_streak = 0
+                        recent_results.clear()
+                elif failed:
+                    # Validation failure bukan sinyal rate-limit; jangan menurunkan
+                    # worker hanya karena satu teks teknis sulit divalidasi.
+                    transient_streak = 0
                     healthy_streak = 0
                 else:
+                    transient_streak = 0
                     healthy_streak += 1
-
-                # Turun hanya jika minimal 6 sampel dan >= 50% gagal pada
-                # rolling window. Satu kegagalan sporadis tidak mengubah worker.
-                if active_limit > 1 and len(recent_results) >= 6:
-                    fail_rate = sum(recent_results) / len(recent_results)
-                    if fail_rate >= 0.50:
-                        active_limit -= 1
+                    # Provider yang pulih dinaikkan perlahan satu worker sekali.
+                    # 8 sukses beruntun cukup untuk 1->2->3->4 tanpa oscillation.
+                    if active_limit < worker_count and healthy_streak >= 8:
+                        active_limit += 1
                         recent_results.clear()
                         healthy_streak = 0
-                # Recovery concurrency: setelah 12 hasil berturut-turut sehat,
-                # naik satu tingkat sampai batas pilihan user.
-                elif active_limit < worker_count and healthy_streak >= 12:
-                    active_limit += 1
-                    recent_results.clear()
-                    healthy_streak = 0
 
             def _fill_queue(pool):
                 nonlocal next_index
@@ -2883,7 +2908,7 @@ class DocxFinalTranslatorEngine:
             if recovery_total:
                 detail0 = (
                     f"[pemulihan Gemini 2.5 Flash] 0/{recovery_total} | "
-                    f"berhasil=0 | gagal_final=0 | tersisa={recovery_total}"
+                    f"berhasil=0 | gagal=0 | tersisa={recovery_total}"
                 )
                 if recovery_tr is not None:
                     detail0 += f" | key={recovery_tr.active_key_number}"
@@ -2921,7 +2946,7 @@ class DocxFinalTranslatorEngine:
                     f"[pemulihan Gemini 2.5 Flash] "
                     f"{recovery_done}/{recovery_total} | "
                     f"berhasil={recovery_success} | "
-                    f"gagal_final={len(still_failed)} | "
+                    f"gagal={len(still_failed)} | "
                     f"tersisa={recovery_total - recovery_done}"
                 )
                 if recovery_tr is not None:
