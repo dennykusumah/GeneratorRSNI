@@ -1491,6 +1491,131 @@ class _GoogleTranslateCoordinator:
 
 
 _GOOGLE_TRANSLATE_COORDINATOR = _GoogleTranslateCoordinator()
+
+class _SharedFallbackCoordinator:
+    """Circuit breaker ringan yang dipakai bersama seluruh worker per provider.
+
+    Tujuannya bukan mempercepat provider, tetapi mencegah semua worker melakukan
+    retry bersamaan saat provider sedang bermasalah. Setelah cooldown, hanya satu
+    worker menjadi probe; worker lain langsung turun ke provider berikutnya.
+    """
+    def __init__(self, name: str, base_env: str, max_env: str,
+                 base_default: float, max_default: float):
+        self.name = name
+        self._lock = threading.Lock()
+        self._open_until = 0.0
+        self._probe_in_flight = False
+        self._strike = 0
+        self._base = float(os.getenv(base_env, str(base_default)))
+        self._max = float(os.getenv(max_env, str(max_default)))
+        self.last_code = None
+
+    def permit(self) -> tuple[bool, bool]:
+        now = time.monotonic()
+        with self._lock:
+            if now < self._open_until:
+                return False, False
+            if self._strike:
+                if self._probe_in_flight:
+                    return False, False
+                self._probe_in_flight = True
+                return True, True
+            return True, False
+
+    def success(self, was_probe: bool = False):
+        with self._lock:
+            self._probe_in_flight = False
+            self._strike = 0
+            self._open_until = 0.0
+            self.last_code = None
+
+    def failure(self, code=None, was_probe: bool = False):
+        with self._lock:
+            self._probe_in_flight = False
+            self.last_code = code
+            self._strike = min(self._strike + 1, 5)
+            delay = min(self._max, self._base * (2 ** (self._strike - 1)))
+            self._open_until = max(
+                self._open_until,
+                time.monotonic() + delay + random.uniform(0.15, 0.75),
+            )
+
+    def state(self) -> str:
+        with self._lock:
+            remain = max(0.0, self._open_until - time.monotonic())
+            if remain:
+                return f"{self.name} cooldown {remain:.1f}s"
+            if self._strike:
+                return f"probe {self.name}"
+            return f"{self.name} normal"
+
+
+_GEMINI_COORDINATOR = _SharedFallbackCoordinator(
+    'Gemini', 'GEMINI_FALLBACK_COOLDOWN', 'GEMINI_FALLBACK_MAX_COOLDOWN', 8, 60
+)
+_ARGOS_COORDINATOR = _SharedFallbackCoordinator(
+    'Argos', 'ARGOS_FALLBACK_COOLDOWN', 'ARGOS_FALLBACK_MAX_COOLDOWN', 3, 20
+)
+_MYMEMORY_COORDINATOR = _SharedFallbackCoordinator(
+    'MyMemory', 'MYMEMORY_FALLBACK_COOLDOWN', 'MYMEMORY_FALLBACK_MAX_COOLDOWN', 12, 90
+)
+
+_ARGOS_INIT_LOCK = threading.Lock()
+_ARGOS_TRANSLATE_LOCK = threading.Lock()  # model lokal: hindari N inferensi berat serentak
+_ARGOS_READY = False
+_ARGOS_ERROR = None
+
+
+def _argos_translate(text: str, source: str = 'en', target: str = 'id') -> str:
+    """Terjemahan lokal Argos. Paket bahasa en->id diunduh sekali bila belum ada."""
+    global _ARGOS_READY, _ARGOS_ERROR
+    try:
+        import argostranslate.package as argos_package
+        import argostranslate.translate as argos_translate
+    except Exception as exc:
+        raise RuntimeError('Argos Translate belum terpasang') from exc
+
+    src = 'en' if source in ('auto', 'en') else source
+    dst = 'id' if target in ('id', 'indonesian') else target
+    if not _ARGOS_READY:
+        with _ARGOS_INIT_LOCK:
+            if not _ARGOS_READY:
+                try:
+                    installed = argos_translate.get_installed_languages()
+                    ok = any(
+                        a.code == src and any(t.code == dst for t in a.translations_to)
+                        for a in installed
+                    )
+                    if not ok:
+                        argos_package.update_package_index()
+                        packages = argos_package.get_available_packages()
+                        pkg = next((x for x in packages if x.from_code == src and x.to_code == dst), None)
+                        if pkg is None:
+                            raise RuntimeError(f'Paket Argos {src}->{dst} tidak tersedia')
+                        argos_package.install_from_path(pkg.download())
+                    _ARGOS_READY = True
+                    _ARGOS_ERROR = None
+                except Exception as exc:
+                    _ARGOS_ERROR = exc
+                    raise
+    with _ARGOS_TRANSLATE_LOCK:
+        return argos_translate.translate(text, src, dst)
+
+
+def _fallback_candidate_ok(source: str, candidate: str, expected_tokens: set[str]) -> bool:
+    if not candidate or not _translation_quality_ok(source, candidate):
+        return False
+    returned = {x.casefold() for x in _RE_PROTECTION_TOKEN.findall(candidate)}
+    if returned != expected_tokens:
+        return False
+    src_plain = _RE_PROTECTION_TOKEN.sub('', source)
+    dst_plain = _RE_PROTECTION_TOKEN.sub('', candidate)
+    if (re.search(r'[A-Za-z]{3}', src_plain) and
+        re.sub(r'\s+', ' ', src_plain).strip().casefold() ==
+        re.sub(r'\s+', ' ', dst_plain).strip().casefold()):
+        return False
+    return True
+
 _GEMINI_WORKER_LOCK = threading.Lock()
 _GEMINI_WORKER_COUNTER = 0
 
@@ -1607,28 +1732,76 @@ class _Translator:
         else:
             self.last_provider = 'gemini'
 
-        # Fallback langsung per worker ke Gemini 2.5 Flash. Setiap instance
-        # worker mendapat key awal berbeda (round-robin GEMINI_API_KEY_1..15).
+        # Rantai fallback per elemen:
+        # Google -> Gemini -> Argos (lokal) -> MyMemory -> gagal.
+        # Setiap provider memiliki circuit breaker global sehingga kegagalan pada
+        # satu worker membuat worker lain tidak membombardir provider yang sama.
         if result is None:
-            try:
-                if self._gemini_fallback is None:
-                    keys = _get_gemini_api_keys()
-                    if keys:
-                        start_idx = _next_gemini_worker_key_index(len(keys))
-                        ordered = keys[start_idx:] + keys[:start_idx]
-                        self._gemini_fallback = _GeminiRecoveryTranslator(
-                            self.source, self.target, self.custom_dict, self.italic_dict,
-                            self.dictionary_fingerprint, api_keys=ordered,
-                        )
-                if self._gemini_fallback is not None:
-                    gemini_result, gemini_terms = self._gemini_fallback.translate_one(text, italic_map or {})
-                    if gemini_result and gemini_result != text:
-                        if owns_flight:
-                            _ENGINE8_TRANSLATION_CACHE.finish(cache_key)
-                        self.last_provider = 'gemini'
-                        return gemini_result, gemini_terms
-            except Exception as gemini_error:
-                last_error = gemini_error
+            gemini_allowed, gemini_probe = _GEMINI_COORDINATOR.permit()
+            if gemini_allowed:
+                try:
+                    if self._gemini_fallback is None:
+                        keys = _get_gemini_api_keys()
+                        if keys:
+                            start_idx = _next_gemini_worker_key_index(len(keys))
+                            ordered = keys[start_idx:] + keys[:start_idx]
+                            self._gemini_fallback = _GeminiRecoveryTranslator(
+                                self.source, self.target, self.custom_dict, self.italic_dict,
+                                self.dictionary_fingerprint, api_keys=ordered,
+                            )
+                    if self._gemini_fallback is None:
+                        raise RuntimeError('Gemini API key belum tersedia')
+                    gemini_result, gemini_terms = self._gemini_fallback.translate_one(
+                        text, italic_map or {}
+                    )
+                    if not gemini_result or gemini_result == text:
+                        raise RuntimeError('Gemini tidak menghasilkan terjemahan valid')
+                    _GEMINI_COORDINATOR.success(gemini_probe)
+                    if owns_flight:
+                        _ENGINE8_TRANSLATION_CACHE.finish(cache_key)
+                    self.last_provider = 'gemini'
+                    return gemini_result, gemini_terms
+                except Exception as gemini_error:
+                    last_error = gemini_error
+                    self.last_error_code = _gemini_status_code(gemini_error)
+                    _GEMINI_COORDINATOR.failure(self.last_error_code, gemini_probe)
+
+        if result is None:
+            argos_allowed, argos_probe = _ARGOS_COORDINATOR.permit()
+            if argos_allowed:
+                try:
+                    candidate = _argos_translate(t, self.source, self.target)
+                    if not _fallback_candidate_ok(t, candidate, expected_tokens):
+                        raise RuntimeError('Argos tidak lolos quality gate')
+                    result = candidate
+                    self.last_provider = 'argos'
+                    self.last_error_code = None
+                    _ARGOS_COORDINATOR.success(argos_probe)
+                except Exception as argos_error:
+                    last_error = argos_error
+                    self.last_error_code = _google_error_code(argos_error)
+                    _ARGOS_COORDINATOR.failure(self.last_error_code, argos_probe)
+
+        if result is None:
+            mm_allowed, mm_probe = _MYMEMORY_COORDINATOR.permit()
+            if mm_allowed:
+                try:
+                    from deep_translator import MyMemoryTranslator
+                    # MyMemory tidak mendukung source='auto' secara konsisten.
+                    mm_source = 'en-GB' if self.source in ('auto', 'en') else self.source
+                    mm_target = 'id-ID' if self.target == 'id' else self.target
+                    mm_client = MyMemoryTranslator(source=mm_source, target=mm_target)
+                    candidate = mm_client.translate(t)
+                    if not _fallback_candidate_ok(t, candidate, expected_tokens):
+                        raise RuntimeError('MyMemory tidak lolos quality gate')
+                    result = candidate
+                    self.last_provider = 'mymemory'
+                    self.last_error_code = None
+                    _MYMEMORY_COORDINATOR.success(mm_probe)
+                except Exception as mm_error:
+                    last_error = mm_error
+                    self.last_error_code = _google_error_code(mm_error)
+                    _MYMEMORY_COORDINATOR.failure(self.last_error_code, mm_probe)
 
         if result is None:
             # Judul standar lazim terdiri dari beberapa klausa yang dipisahkan
