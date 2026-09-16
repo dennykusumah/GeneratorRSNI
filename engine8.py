@@ -77,10 +77,16 @@ _EM_DASH = '—'
 ENGINE8_POLICY_VERSION = "2026.09-cache-v2-quality-gate"
 ENGINE8_PROVIDER_VERSION = "deep-translator-google+mymemory-v1"
 GEMINI_RECOVERY_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
-GEMINI_RECOVERY_VERSION = "gemini-recovery-v3-dualkey-optimized"
-GEMINI_RECOVERY_MAX_ITEMS = int(os.getenv("GEMINI_RECOVERY_MAX_ITEMS", "8"))
-GEMINI_RECOVERY_TARGET_CHARS = int(os.getenv("GEMINI_RECOVERY_TARGET_CHARS", "6000"))
-GEMINI_RECOVERY_HARD_CHARS = int(os.getenv("GEMINI_RECOVERY_HARD_CHARS", "10000"))
+GEMINI_RECOVERY_VERSION = "gemini-recovery-v4-risk-adaptive-15key"
+# Balance akurasi/kecepatan: low=3, medium=2, high=1.
+GEMINI_RECOVERY_LOW_ITEMS = int(os.getenv("GEMINI_RECOVERY_LOW_ITEMS", "3"))
+GEMINI_RECOVERY_MEDIUM_ITEMS = int(os.getenv("GEMINI_RECOVERY_MEDIUM_ITEMS", "2"))
+GEMINI_RECOVERY_HIGH_ITEMS = 1
+GEMINI_RECOVERY_TARGET_CHARS = int(os.getenv("GEMINI_RECOVERY_TARGET_CHARS", "2500"))
+GEMINI_RECOVERY_HARD_CHARS = int(os.getenv("GEMINI_RECOVERY_HARD_CHARS", "4000"))
+GEMINI_TRANSIENT_MAX_RETRIES = int(os.getenv("GEMINI_TRANSIENT_MAX_RETRIES", "4"))
+GEMINI_BACKOFF_BASE = float(os.getenv("GEMINI_BACKOFF_BASE", "2.0"))
+GEMINI_BACKOFF_MAX = float(os.getenv("GEMINI_BACKOFF_MAX", "30.0"))
 _ENGINE8_L1_MAX_ENTRIES = 5000
 _ENGINE8_L2_MAX_ENTRIES = 100000
 _ENGINE8_NEGATIVE_TTL = 60
@@ -1597,17 +1603,13 @@ class _Translator:
 
 
 def _get_gemini_api_keys() -> list[str]:
-    """Ambil maksimum 2 Gemini API key (primary + backup) tanpa hard-code.
+    """Ambil hingga 15 Gemini key: key 1 utama, key 2..15 fallback.
 
-    Urutan prioritas:
-      1) GEMINI_API_KEY_1
-      2) GEMINI_API_KEY_2
-
-    Hanya dua nama key tersebut yang didukung. Nilai duplikat dibuang.
-    Environment variable dibaca lebih dahulu, lalu Streamlit Secrets untuk
-    nama yang belum tersedia di environment.
+    Key dibaca dari environment lalu Streamlit Secrets dengan nama
+    GEMINI_API_KEY_1 ... GEMINI_API_KEY_15. Duplikat dibuang.
+    Fallback dipakai untuk kegagalan key/auth, bukan untuk memutar kuota 429.
     """
-    names = ("GEMINI_API_KEY_1", "GEMINI_API_KEY_2")
+    names = tuple(f"GEMINI_API_KEY_{i}" for i in range(1, 16))
     values = []
 
     def _add(value):
@@ -1617,7 +1619,6 @@ def _get_gemini_api_keys() -> list[str]:
 
     for name in names:
         _add(os.getenv(name, ""))
-
     try:
         import streamlit as st
         for name in names:
@@ -1627,10 +1628,7 @@ def _get_gemini_api_keys() -> list[str]:
                 pass
     except Exception:
         pass
-
-    # Desain Engine8 hanya primary + satu backup.
-    return values[:2]
-
+    return values[:15]
 
 def _gemini_auth_error(exc: Exception) -> bool:
     """True hanya untuk error autentikasi/otorisasi yang layak failover key.
@@ -1690,11 +1688,10 @@ def _gemini_transient_error(exc: Exception) -> bool:
 class _GeminiRecoveryTranslator:
     """Satu tahap pemulihan Gemini 2.5 Flash yang hemat Free Tier.
 
-    Recovery memakai adaptive micro-batch (maks. 8 unit / target 6000 karakter),
-    concurrency=1, thinking=0, structured JSON, cache terpisah, serta seluruh
-    proteksi Kamus SNI/Kamus Istilah Asing yang sudah dimiliki Engine 8.
-    Tidak ada recovery AI kedua: item yang ditolak quality gate tetap gagal dan
-    kemudian dipertahankan dalam bahasa Inggris/merah oleh pipeline.
+    Recovery memakai risk-adaptive micro-batch 3/2/1, concurrency=1, thinking=0,
+    structured JSON, cache tervalidasi, dan proteksi Kamus SNI/Kamus Istilah Asing.
+    Hanya semantic/structural failure yang mendapat satu targeted retry individual.
+    Key 1 utama; key 2..15 adalah fallback untuk kegagalan autentikasi/key.
     """
 
     def __init__(self, source: str = 'auto', target: str = 'id',
@@ -1709,8 +1706,8 @@ class _GeminiRecoveryTranslator:
         api_keys = _get_gemini_api_keys()
         if not api_keys:
             raise RuntimeError(
-                "Gemini API key belum diset. Isi GEMINI_API_KEY_1 dan opsional "
-                "GEMINI_API_KEY_2 di Streamlit Secrets/environment variable."
+                "Gemini API key belum diset. Isi minimal GEMINI_API_KEY_1; "
+                "fallback opsional GEMINI_API_KEY_2 sampai GEMINI_API_KEY_15."
             )
         self.source = source; self.target = target
         self.custom_dict = custom_dict; self.italic_dict = italic_dict
@@ -1769,11 +1766,11 @@ class _GeminiRecoveryTranslator:
 
     @property
     def active_key_number(self) -> int:
-        """Nomor key aktif (1/2) untuk diagnostic tanpa mengekspos secret."""
+        """Nomor key aktif (1..15) untuk diagnostic tanpa mengekspos secret."""
         return self._active_key_index + 1
 
     def _switch_to_backup_key(self) -> bool:
-        """Pindah sekali ke backup key bila tersedia; tidak pernah berputar balik."""
+        """Pindah maju ke fallback berikutnya bila key aktif invalid; tidak berputar balik."""
         next_index = self._active_key_index + 1
         if next_index >= len(self._api_keys):
             return False
@@ -1784,21 +1781,20 @@ class _GeminiRecoveryTranslator:
         return True
 
     def _generate_content_with_failover(self, *, prompt: str, config):
-        """Generate dengan failover hanya pada 401/403/invalid credential.
+        """Generate dengan failover berantai hanya untuk kegagalan key/auth.
 
-        Rate limit (429), server error (5xx), dan timeout dilempar kembali ke
-        caller agar mekanisme exponential backoff yang sudah ada tetap berlaku.
+        429/5xx/timeout tidak memutar project/key; caller melakukan backoff pada
+        key aktif. Ini menjaga perilaku stabil dan tidak menyamarkan quota error.
         """
-        try:
-            return self._client.models.generate_content(
-                model=self.model, contents=prompt, config=config
-            )
-        except Exception as exc:
-            if _gemini_auth_error(exc) and self._switch_to_backup_key():
+        while True:
+            try:
                 return self._client.models.generate_content(
                     model=self.model, contents=prompt, config=config
                 )
-            raise
+            except Exception as exc:
+                if _gemini_auth_error(exc) and self._switch_to_backup_key():
+                    continue
+                raise
 
     def _generate_batch(self, rows: list[dict]) -> dict[str, str]:
         payload = json.dumps(rows, ensure_ascii=False, separators=(',', ':'))
@@ -1839,19 +1835,70 @@ class _GeminiRecoveryTranslator:
                 out[iid] = str(item.get('text', '') or '').strip()
         return out
 
+    def _targeted_retry_one(self, job: dict, reason: str = "quality/invariant validation failed"):
+        """Satu retry individual untuk semantic/structural failure saja."""
+        iid = "RETRY0001"
+        payload = json.dumps([{'id': iid, 'text': job['protected']}], ensure_ascii=False, separators=(',', ':'))
+        prompt = (
+            "Terjemahan sebelumnya ditolak validator karena " + reason + ". "
+            "Terjemahkan ulang SATU item ISO/IEC ini ke Bahasa Indonesia baku. "
+            "Jangan meringkas, jangan menghilangkan informasi, dan pertahankan SETIAP token ZXQ...QXZ, "
+            "angka, desimal, nomor pasal, simbol, satuan, formula, dan referensi persis. "
+            "Kembalikan JSON terstruktur saja.\nITEM:\n" + payload
+        )
+        schema = {
+            'type':'object','properties':{'translations':{'type':'array','items':{
+                'type':'object','properties':{'id':{'type':'string'},'text':{'type':'string'}},
+                'required':['id','text']} }},'required':['translations']
+        }
+        try:
+            response=self._generate_content_with_failover(prompt=prompt, config=self._config(schema))
+            data=json.loads((getattr(response,'text',None) or '').strip())
+            for item in data.get('translations',[]):
+                if str(item.get('id','')) == iid:
+                    cand=str(item.get('text','') or '').strip()
+                    return cand if self._candidate_ok(job['protected'], cand) else ''
+        except Exception as exc:
+            self.diagnostics.append(f"Gemini key {self.active_key_number}: targeted retry gagal ({_gemini_status_code(exc) or 'error'}).")
+        return ''
+
+    @staticmethod
+    def _risk_level(protected: str) -> str:
+        """Klasifikasi risiko lokal, deterministik, tanpa API."""
+        t = protected or ""
+        token_n = len(_RE_PROTECTION_TOKEN.findall(t))
+        number_n = len(re.findall(r'(?<![A-Za-z])\d+(?:[.,]\d+)?', t))
+        unit_n = len(re.findall(r'(?i)\b(?:mm|cm|km|kg|mg|kw|mw|hz|khz|mhz|ghz|v|kv|a|ma|pa|mpa|nm|°c|k)\b|[%±²³−×÷]', t))
+        ref_n = len(re.findall(r'(?i)\b(?:ISO|IEC|SNI|Clause|Annex|Table|Figure)\b|\b[A-Z]?\d+(?:\.\d+){1,4}\b', t))
+        formula_n = len(re.findall(r'[=<>≤≥∑√∆Ωµλ]|\^\d', t))
+        score = token_n*2 + min(number_n, 8) + unit_n*2 + ref_n*2 + formula_n*3
+        if len(t) > 2200 or score >= 16:
+            return "high"
+        if len(t) > 1100 or score >= 7:
+            return "medium"
+        return "low"
+
+    @staticmethod
+    def _risk_max_items(risk: str) -> int:
+        if risk == "high": return 1
+        if risk == "medium": return max(1, min(GEMINI_RECOVERY_MEDIUM_ITEMS, 2))
+        return max(1, min(GEMINI_RECOVERY_LOW_ITEMS, 3))
+
     def _chunks(self, jobs: list[dict]):
-        batch=[]; chars=0
-        max_items=max(1, min(GEMINI_RECOVERY_MAX_ITEMS, 8))
-        target=max(1000, GEMINI_RECOVERY_TARGET_CHARS)
+        batch=[]; chars=0; batch_limit=3
+        target=max(800, GEMINI_RECOVERY_TARGET_CHARS)
         hard=max(target, GEMINI_RECOVERY_HARD_CHARS)
         for job in jobs:
             n=len(job['protected'])
-            # Teks sangat panjang tetap satu unit/request; jangan pecah semantik.
-            if batch and (len(batch) >= max_items or chars+n > target or chars+n > hard):
-                yield batch; batch=[]; chars=0
-            batch.append(job); chars += n
-            if chars >= target or chars >= hard or len(batch) >= max_items:
-                yield batch; batch=[]; chars=0
+            risk=self._risk_level(job['protected'])
+            job['risk']=risk
+            item_limit=self._risk_max_items(risk)
+            prospective_limit=min(batch_limit, item_limit) if batch else item_limit
+            if batch and (len(batch) >= prospective_limit or chars+n > target or chars+n > hard):
+                yield batch; batch=[]; chars=0; batch_limit=3
+            batch.append(job); chars += n; batch_limit=min(batch_limit, item_limit)
+            if chars >= target or chars >= hard or len(batch) >= batch_limit:
+                yield batch; batch=[]; chars=0; batch_limit=3
         if batch: yield batch
 
     def prewarm(self, requests: list[tuple[str, dict]]) -> None:
@@ -1890,7 +1937,7 @@ class _GeminiRecoveryTranslator:
                 rows.append({'id':iid,'text':job['protected']}); idmap[iid]=job
             answers=None; last_exc=None
             # Hanya retry error request/transport. Output invalid TIDAK dikirim ulang.
-            for attempt in range(3):
+            for attempt in range(max(1, GEMINI_TRANSIENT_MAX_RETRIES)):
                 try:
                     answers=self._generate_batch(rows); break
                 except Exception as exc:
@@ -1901,11 +1948,11 @@ class _GeminiRecoveryTranslator:
                             f"Gemini key {self.active_key_number}: request gagal permanen; batch dilewati."
                         )
                         break
-                    if attempt < 2:
-                        # Backoff pendek: 1.0s lalu 2.0s + jitter deterministik kecil.
-                        delay=(1.0 * (2 ** attempt)) + (0.15 * ((seq + attempt) % 4))
+                    if attempt < max(1, GEMINI_TRANSIENT_MAX_RETRIES) - 1:
+                        # Exponential backoff + jitter kecil; tetap pada key/project aktif.
+                        delay=min(GEMINI_BACKOFF_MAX, GEMINI_BACKOFF_BASE * (2 ** attempt)) + (0.15 * ((seq + attempt) % 4))
                         self.diagnostics.append(
-                            f"Gemini key {self.active_key_number}: error sementara; retry {attempt+1}/2 setelah {delay:.2f}s."
+                            f"Gemini key {self.active_key_number}: error sementara; retry {attempt+1}/{max(1, GEMINI_TRANSIENT_MAX_RETRIES)-1} setelah {delay:.2f}s."
                         )
                         time.sleep(delay)
             if answers is None:
@@ -1915,7 +1962,11 @@ class _GeminiRecoveryTranslator:
             for iid, job in idmap.items():
                 cand=answers.get(iid,'')
                 if not self._candidate_ok(job['protected'], cand):
-                    self._batch_failed_keys.add(job['key']); continue
+                    # Accuracy-first: hanya output substantif yang ditolak validator
+                    # mendapat satu retry individual.
+                    cand=self._targeted_retry_one(job)
+                    if not cand:
+                        self._batch_failed_keys.add(job['key']); continue
                 result=cand
                 if job['token_map']:
                     result=self.custom_dict._apply_post(result, job['token_map'])
@@ -2626,7 +2677,8 @@ class DocxFinalTranslatorEngine:
                     f"[pemulihan Gemini 2.5 Flash] "
                     f"{recovery_done}/{recovery_total} | "
                     f"berhasil={recovery_success} | "
-                    f"gagal={recovery_total - recovery_done + len(still_failed)} "
+                    f"gagal={len(still_failed)} | "
+                    f"tersisa={recovery_total - recovery_done} "
                     f"| [progres-total] {total + recovery_done}/"
                     f"{total + recovery_total}"
                 )
