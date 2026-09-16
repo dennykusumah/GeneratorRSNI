@@ -1688,7 +1688,7 @@ def _gemini_transient_error(exc: Exception) -> bool:
 class _GeminiRecoveryTranslator:
     """Satu tahap pemulihan Gemini 2.5 Flash yang hemat Free Tier.
 
-    Recovery memakai risk-adaptive micro-batch 3/2/1, concurrency=1, thinking=0,
+    Recovery streaming memakai risk-adaptive micro-batch 3/2/1, concurrency=1, thinking=0,
     structured JSON, cache tervalidasi, dan proteksi Kamus SNI/Kamus Istilah Asing.
     Hanya semantic/structural failure yang mendapat satu targeted retry individual.
     Key 1 utama; key 2..15 adalah fallback untuk kegagalan autentikasi/key.
@@ -2643,24 +2643,37 @@ class DocxFinalTranslatorEngine:
                 except Exception as exc:
                     recovery_init_error = exc
 
-            # Satu pemulihan: kumpulkan seluruh unit teks secara read-only lalu
-            # prewarm cache melalui adaptive micro-batch Gemini. Setelah itu
-            # _translate_para memakai hasil cache sambil mempertahankan seluruh
-            # aturan formatting DOCX yang sudah ada.
-            if recovery_tr is not None:
-                recovery_requests = []
-                for _, _para in sorted(failed_paras, key=lambda item: item[0]):
-                    recovery_requests.extend(
-                        _gemini_recovery_requests_for_para(_para, recovery_tr)
-                    )
-                recovery_tr.prewarm(recovery_requests)
+            # STREAMING RECOVERY:
+            # Jangan prewarm SELURUH failed_paras sekaligus. Pola lama membuat UI
+            # berhenti lama pada status terakhir "translate N worker" karena
+            # ratusan unit diproteksi/cache-lookup/dibatch sebelum callback berikutnya.
+            #
+            # Sekarang setiap paragraf gagal langsung:
+            #   request extraction -> cache/prewarm micro-batch 3/2/1 -> translate
+            #   -> validator/repair/retry -> update UI -> paragraf berikutnya.
+            # Dengan demikian worker Google sudah benar-benar berhenti sebelum
+            # Pemulihan dan user langsung melihat transisi ke Gemini.
+            if recovery_total:
+                _notify(
+                    progress_callback, 90,
+                    f"[menyiapkan pemulihan] 0/{recovery_total} | "
+                    f"berhasil=0 | gagal_final=0 | tersisa={recovery_total}"
+                )
 
-            for recovery_done, (index, para) in enumerate(
-                    sorted(failed_paras, key=lambda item: item[0]), start=1):
+            sorted_failed = sorted(failed_paras, key=lambda item: item[0])
+            for recovery_done, (index, para) in enumerate(sorted_failed, start=1):
                 if recovery_tr is None:
                     failed = True
                     found = []
                 else:
+                    # Prewarm HANYA unit milik paragraf yang sedang diproses.
+                    # prewarm() tetap menggunakan risk-adaptive micro-batch 3/2/1,
+                    # validated cache, local protection, transient backoff, dan
+                    # targeted retry 1x. Tidak ada lagi global blocking prewarm.
+                    para_requests = _gemini_recovery_requests_for_para(para, recovery_tr)
+                    if para_requests:
+                        recovery_tr.prewarm(para_requests)
+
                     before = len(recovery_tr.failed_texts)
                     found = _translate_para(para, recovery_tr)
                     failed = len(recovery_tr.failed_texts) > before
@@ -2677,11 +2690,11 @@ class DocxFinalTranslatorEngine:
                     f"[pemulihan Gemini 2.5 Flash] "
                     f"{recovery_done}/{recovery_total} | "
                     f"berhasil={recovery_success} | "
-                    f"gagal={len(still_failed)} | "
-                    f"tersisa={recovery_total - recovery_done} "
-                    f"| [progres-total] {total + recovery_done}/"
-                    f"{total + recovery_total}"
+                    f"gagal_final={len(still_failed)} | "
+                    f"tersisa={recovery_total - recovery_done}"
                 )
+                if recovery_tr is not None:
+                    detail += f" | key={recovery_tr.active_key_number}"
                 if recovery_init_error is not None:
                     detail += f" | Gemini tidak aktif: {recovery_init_error}"
                 _notify(progress_callback, pct, detail)
