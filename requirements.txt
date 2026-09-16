@@ -23,3 +23,6 @@ pypdf>=5.0
 
 # Otomatisasi Microsoft Word oleh Engine 9 (hanya dipasang di Windows)
 pywin32>=308; sys_platform == "win32"
+
+# HTTP API fallback: DeepL, Microsoft Translator, Yandex
+requests>=2.32
