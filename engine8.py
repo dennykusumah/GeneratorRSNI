@@ -19,7 +19,7 @@ import copy
 import time
 import uuid
 import traceback
-from concurrent.futures import ThreadPoolExecutor, as_completed, wait, FIRST_COMPLETED
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import csv
 import os
 import json
@@ -77,26 +77,10 @@ _EM_DASH = '—'
 ENGINE8_POLICY_VERSION = "2026.09-cache-v2-quality-gate"
 ENGINE8_PROVIDER_VERSION = "deep-translator-google+mymemory-v1"
 GEMINI_RECOVERY_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
-GEMINI_RECOVERY_VERSION = "gemini-recovery-v6-adaptive-stable"
-# Balance akurasi/kecepatan: low=3, medium=2, high=1.
-GEMINI_RECOVERY_LOW_ITEMS = int(os.getenv("GEMINI_RECOVERY_LOW_ITEMS", "3"))
-GEMINI_RECOVERY_MEDIUM_ITEMS = int(os.getenv("GEMINI_RECOVERY_MEDIUM_ITEMS", "2"))
-GEMINI_RECOVERY_HIGH_ITEMS = 1
-GEMINI_RECOVERY_TARGET_CHARS = int(os.getenv("GEMINI_RECOVERY_TARGET_CHARS", "2500"))
-GEMINI_RECOVERY_HARD_CHARS = int(os.getenv("GEMINI_RECOVERY_HARD_CHARS", "4000"))
-GEMINI_TRANSIENT_MAX_RETRIES = int(os.getenv("GEMINI_TRANSIENT_MAX_RETRIES", "6"))
-GEMINI_BACKOFF_BASE = float(os.getenv("GEMINI_BACKOFF_BASE", "2.0"))
-GEMINI_BACKOFF_MAX = float(os.getenv("GEMINI_BACKOFF_MAX", "45.0"))
-# Main-provider pacing. 4 worker tetap paralel, tetapi awal request diberi jarak
-# kecil agar tidak membentuk burst serentak. Nilai ini adaptif saat failure naik.
-ENGINE8_PACER_MIN_INTERVAL = float(os.getenv("ENGINE8_PACER_MIN_INTERVAL", "0.22"))
-ENGINE8_PACER_MAX_INTERVAL = float(os.getenv("ENGINE8_PACER_MAX_INTERVAL", "2.50"))
-ENGINE8_MAIN_TRANSIENT_RETRIES = int(os.getenv("ENGINE8_MAIN_TRANSIENT_RETRIES", "8"))
-ENGINE8_MAIN_CIRCUIT_THRESHOLD = int(os.getenv("ENGINE8_MAIN_CIRCUIT_THRESHOLD", "2"))
-ENGINE8_MAIN_CIRCUIT_COOLDOWN = float(os.getenv("ENGINE8_MAIN_CIRCUIT_COOLDOWN", "30.0"))
-# Recovery circuit breaker: transient failure bukan translation failure.
-GEMINI_CIRCUIT_THRESHOLD = int(os.getenv("GEMINI_CIRCUIT_THRESHOLD", "3"))
-GEMINI_CIRCUIT_COOLDOWN = float(os.getenv("GEMINI_CIRCUIT_COOLDOWN", "20.0"))
+GEMINI_RECOVERY_VERSION = "gemini-recovery-v3-dualkey-optimized"
+GEMINI_RECOVERY_MAX_ITEMS = int(os.getenv("GEMINI_RECOVERY_MAX_ITEMS", "8"))
+GEMINI_RECOVERY_TARGET_CHARS = int(os.getenv("GEMINI_RECOVERY_TARGET_CHARS", "6000"))
+GEMINI_RECOVERY_HARD_CHARS = int(os.getenv("GEMINI_RECOVERY_HARD_CHARS", "10000"))
 _ENGINE8_L1_MAX_ENTRIES = 5000
 _ENGINE8_L2_MAX_ENTRIES = 100000
 _ENGINE8_NEGATIVE_TTL = 60
@@ -1434,125 +1418,6 @@ class TranslationFailedError(RuntimeError):
     """Mencegah dokumen setengah diterjemahkan tetap disimpan."""
 
 
-ENGINE8_HARD_REQUEST_TIMEOUT = float(os.getenv("ENGINE8_HARD_REQUEST_TIMEOUT", "20"))
-
-def _call_with_hard_timeout(fn, timeout_s: float):
-    """Run blocking provider call with a hard wall-clock timeout.
-
-    Uses a daemon helper thread so a stuck HTTP call cannot hold an Engine-8
-    worker indefinitely. The late result is discarded; no document state is
-    mutated by this helper.
-    """
-    box = {}
-    done = threading.Event()
-    def _runner():
-        try:
-            box["value"] = fn()
-        except BaseException as exc:
-            box["error"] = exc
-        finally:
-            done.set()
-    th = threading.Thread(target=_runner, name="engine8-http-call", daemon=True)
-    th.start()
-    if not done.wait(max(1.0, float(timeout_s))):
-        raise TimeoutError(f"provider request hard timeout after {float(timeout_s):.1f}s")
-    if "error" in box:
-        raise box["error"]
-    return box.get("value")
-
-
-class _AdaptiveRequestPacer:
-    """Thread-safe global pacer untuk provider utama.
-
-    Pacer hanya mengatur waktu MULAI request; worker tetap paralel saat provider
-    sehat. Interval naik perlahan pada transport/provider failure dan turun lagi
-    setelah streak sehat, sehingga 4 worker tidak menembakkan burst serentak.
-    """
-    def __init__(self, minimum=ENGINE8_PACER_MIN_INTERVAL, maximum=ENGINE8_PACER_MAX_INTERVAL):
-        self.minimum=max(0.0, float(minimum)); self.maximum=max(self.minimum, float(maximum))
-        self.interval=self.minimum; self._next_at=0.0; self._healthy=0
-        self._transient_streak=0; self._circuit_open_until=0.0
-        self._half_open=False; self._probe_lock=threading.Lock()
-        self._lock=threading.Lock()
-
-    def reset_for_run(self):
-        """Mulai setiap dokumen dari kondisi sehat; state throttling run lama tidak bocor."""
-        with self._lock:
-            self.interval = self.minimum
-            self._next_at = 0.0
-            self._healthy = 0
-            self._transient_streak = 0
-            self._circuit_open_until = 0.0
-            self._half_open = False
-
-    def wait_turn(self):
-        # Shared circuit breaker: saat provider sedang throttled, semua worker
-        # berhenti melepas request baru. Unit tetap pending, bukan gagal.
-        while True:
-            with self._lock:
-                now=time.monotonic()
-                circuit_wait=max(0.0, self._circuit_open_until-now)
-            if circuit_wait <= 0:
-                break
-            time.sleep(min(circuit_wait, 1.0))
-        with self._lock:
-            now=time.monotonic(); wait=max(0.0, self._next_at-now)
-            self._next_at=max(now, self._next_at)+self.interval
-        if wait: time.sleep(wait)
-
-    def report(self, failure_kind=''):
-        with self._lock:
-            if failure_kind in ('transport','rate_limit','provider'):
-                self._healthy=0; self._transient_streak += 1
-                factor=1.70 if failure_kind == 'rate_limit' else 1.38
-                self.interval=min(self.maximum, max(self.minimum, self.interval*factor + 0.05))
-                if self._transient_streak >= ENGINE8_MAIN_CIRCUIT_THRESHOLD:
-                    # Open circuit. Semua worker menunggu cooldown; request yang
-                    # sedang retry tetap menjadi pending di worker masing-masing.
-                    self._circuit_open_until=max(self._circuit_open_until, time.monotonic()+ENGINE8_MAIN_CIRCUIT_COOLDOWN)
-                    self._transient_streak=0
-            elif not failure_kind:
-                self._transient_streak=0
-                self._healthy += 1
-                if self._healthy >= 10:
-                    self.interval=max(self.minimum, self.interval*0.82)
-                    self._healthy=0
-
-
-_ENGINE8_MAIN_PACER = _AdaptiveRequestPacer()
-
-
-def _failure_code(exc: Exception) -> str:
-    """Kode diagnostik aman untuk dashboard; tidak memuat API key/payload."""
-    for obj in (exc, getattr(exc, "response", None)):
-        if obj is None: continue
-        for attr in ("status_code", "status"):
-            v=getattr(obj, attr, None)
-            try:
-                if v is not None and str(v).isdigit(): return str(int(v))
-            except Exception: pass
-    m=re.search(r"(?<!\d)(400|401|403|404|408|409|422|429|500|502|503|504)(?!\d)", str(exc))
-    if m: return m.group(1)
-    text=str(exc).casefold()
-    if any(x in text for x in ("timeout","timed out","deadline exceeded")): return "TIMEOUT"
-    if any(x in text for x in ("connection","remote disconnected","connection reset","connection aborted")): return "CONNECTION"
-    if any(x in text for x in ("quality gate","token kamus","tanpa diterjemahkan")): return "VALIDATION"
-    return "OTHER"
-
-def _main_failure_kind(exc: Exception) -> str:
-    """Klasifikasi best-effort tanpa bergantung pada tipe exception provider."""
-    text=str(exc).casefold()
-    if '429' in text or 'too many requests' in text or 'rate limit' in text or 'ratelimit' in text:
-        return 'rate_limit'
-    if any(x in text for x in ('timeout','timed out','connection','remote disconnected','temporarily unavailable')):
-        return 'transport'
-    if any(x in text for x in ('500','502','503','504','server error','bad gateway','service unavailable')):
-        return 'provider'
-    if any(x in text for x in ('quality gate','token kamus','tanpa diterjemahkan')):
-        return 'validation'
-    return 'provider'
-
-
 class _Translator:
     def __init__(self, source: str = 'auto', target: str = 'id', 
                  custom_dict: CustomDictionary | None = None,
@@ -1566,8 +1431,6 @@ class _Translator:
         self._client = self._cls(source=self.source, target=self.target)
         self.failed_texts: list[str] = []
         self.dictionary_fingerprint = dictionary_fingerprint or _canonical_dictionary_fingerprint(custom_dict, italic_dict)
-        self.last_failure_kind = ""
-        self.last_failure_code = ""
 
     def translate_one(self, text: str, italic_map: dict = None) -> tuple[str, list[str]]:
         t = text.strip()
@@ -1613,11 +1476,10 @@ class _Translator:
         }
         result = None
         last_error = None
-        attempts = 1 if _negative_cache_active(cache_key) else ENGINE8_MAIN_TRANSIENT_RETRIES
+        attempts = 1 if _negative_cache_active(cache_key) else 4
         for attempt in range(1, attempts + 1):
             try:
-                _ENGINE8_MAIN_PACER.wait_turn()
-                candidate = _call_with_hard_timeout(lambda: self._client.translate(t), ENGINE8_HARD_REQUEST_TIMEOUT)
+                candidate = self._client.translate(t)
                 if not candidate or not _translation_quality_ok(t, candidate):
                     raise ValueError('respons layanan terjemahan tidak lolos quality gate')
                 returned_tokens = {
@@ -1636,22 +1498,11 @@ class _Translator:
                 ):
                     raise ValueError('teks dikembalikan tanpa diterjemahkan')
                 result = candidate
-                self.last_failure_kind = ""
-                self.last_failure_code = ""
-                _ENGINE8_MAIN_PACER.report("")
                 break
             except Exception as exc:
                 last_error = exc
-                self.last_failure_kind = _main_failure_kind(exc)
-                self.last_failure_code = _failure_code(exc)
-                _ENGINE8_MAIN_PACER.report(self.last_failure_kind)
                 if attempt < attempts:
-                    # Validation retry tetap cepat; transport/rate-limit/provider
-                    # memakai backoff lebih panjang dan circuit breaker bersama.
-                    if self.last_failure_kind in ('transport','rate_limit','provider'):
-                        time.sleep(min(30.0, 1.0 * (2 ** (attempt - 1))))
-                    else:
-                        time.sleep(min(3.0, 0.6 * (2 ** (attempt - 1))))
+                    time.sleep(min(3.0, 0.6 * (2 ** (attempt - 1))))
 
         if result is None:
             # Judul standar lazim terdiri dari beberapa klausa yang dipisahkan
@@ -1746,13 +1597,17 @@ class _Translator:
 
 
 def _get_gemini_api_keys() -> list[str]:
-    """Ambil hingga 15 Gemini key: key 1 utama, key 2..15 fallback.
+    """Ambil maksimum 2 Gemini API key (primary + backup) tanpa hard-code.
 
-    Key dibaca dari environment lalu Streamlit Secrets dengan nama
-    GEMINI_API_KEY_1 ... GEMINI_API_KEY_15. Duplikat dibuang.
-    Fallback dipakai untuk kegagalan key/auth, bukan untuk memutar kuota 429.
+    Urutan prioritas:
+      1) GEMINI_API_KEY_1
+      2) GEMINI_API_KEY_2
+
+    Hanya dua nama key tersebut yang didukung. Nilai duplikat dibuang.
+    Environment variable dibaca lebih dahulu, lalu Streamlit Secrets untuk
+    nama yang belum tersedia di environment.
     """
-    names = tuple(f"GEMINI_API_KEY_{i}" for i in range(1, 16))
+    names = ("GEMINI_API_KEY_1", "GEMINI_API_KEY_2")
     values = []
 
     def _add(value):
@@ -1762,6 +1617,7 @@ def _get_gemini_api_keys() -> list[str]:
 
     for name in names:
         _add(os.getenv(name, ""))
+
     try:
         import streamlit as st
         for name in names:
@@ -1771,7 +1627,10 @@ def _get_gemini_api_keys() -> list[str]:
                 pass
     except Exception:
         pass
-    return values[:15]
+
+    # Desain Engine8 hanya primary + satu backup.
+    return values[:2]
+
 
 def _gemini_auth_error(exc: Exception) -> bool:
     """True hanya untuk error autentikasi/otorisasi yang layak failover key.
@@ -1831,10 +1690,11 @@ def _gemini_transient_error(exc: Exception) -> bool:
 class _GeminiRecoveryTranslator:
     """Satu tahap pemulihan Gemini 2.5 Flash yang hemat Free Tier.
 
-    Recovery streaming memakai risk-adaptive micro-batch 3/2/1, concurrency=1, thinking=0,
-    structured JSON, cache tervalidasi, dan proteksi Kamus SNI/Kamus Istilah Asing.
-    Hanya semantic/structural failure yang mendapat satu targeted retry individual.
-    Key 1 utama; key 2..15 adalah fallback untuk kegagalan autentikasi/key.
+    Recovery memakai adaptive micro-batch (maks. 8 unit / target 6000 karakter),
+    concurrency=1, thinking=0, structured JSON, cache terpisah, serta seluruh
+    proteksi Kamus SNI/Kamus Istilah Asing yang sudah dimiliki Engine 8.
+    Tidak ada recovery AI kedua: item yang ditolak quality gate tetap gagal dan
+    kemudian dipertahankan dalam bahasa Inggris/merah oleh pipeline.
     """
 
     def __init__(self, source: str = 'auto', target: str = 'id',
@@ -1849,8 +1709,8 @@ class _GeminiRecoveryTranslator:
         api_keys = _get_gemini_api_keys()
         if not api_keys:
             raise RuntimeError(
-                "Gemini API key belum diset. Isi minimal GEMINI_API_KEY_1; "
-                "fallback opsional GEMINI_API_KEY_2 sampai GEMINI_API_KEY_15."
+                "Gemini API key belum diset. Isi GEMINI_API_KEY_1 dan opsional "
+                "GEMINI_API_KEY_2 di Streamlit Secrets/environment variable."
             )
         self.source = source; self.target = target
         self.custom_dict = custom_dict; self.italic_dict = italic_dict
@@ -1866,10 +1726,6 @@ class _GeminiRecoveryTranslator:
         # translate_one tidak akan mengirimnya lagi: tetap satu pemulihan.
         self._batch_failed_keys: set[str] = set()
         self.diagnostics: list[str] = []
-        self._transient_streak = 0
-        self._circuit_open_until = 0.0
-        self.failure_counts = {'transport': 0, 'rate_limit': 0, 'provider': 0, 'validation': 0}
-        self.failure_codes = {}
 
     def _cache_key(self, text: str, italic_map=None) -> str:
         fp = "|".join((self.dictionary_fingerprint, GEMINI_RECOVERY_VERSION, self.model))
@@ -1913,11 +1769,11 @@ class _GeminiRecoveryTranslator:
 
     @property
     def active_key_number(self) -> int:
-        """Nomor key aktif (1..15) untuk diagnostic tanpa mengekspos secret."""
+        """Nomor key aktif (1/2) untuk diagnostic tanpa mengekspos secret."""
         return self._active_key_index + 1
 
     def _switch_to_backup_key(self) -> bool:
-        """Pindah maju ke fallback berikutnya bila key aktif invalid; tidak berputar balik."""
+        """Pindah sekali ke backup key bila tersedia; tidak pernah berputar balik."""
         next_index = self._active_key_index + 1
         if next_index >= len(self._api_keys):
             return False
@@ -1928,41 +1784,21 @@ class _GeminiRecoveryTranslator:
         return True
 
     def _generate_content_with_failover(self, *, prompt: str, config):
-        """Generate dengan failover berantai hanya untuk kegagalan key/auth.
+        """Generate dengan failover hanya pada 401/403/invalid credential.
 
-        429/5xx/timeout tidak memutar project/key; caller melakukan backoff pada
-        key aktif. Ini menjaga perilaku stabil dan tidak menyamarkan quota error.
+        Rate limit (429), server error (5xx), dan timeout dilempar kembali ke
+        caller agar mekanisme exponential backoff yang sudah ada tetap berlaku.
         """
-        while True:
-            try:
+        try:
+            return self._client.models.generate_content(
+                model=self.model, contents=prompt, config=config
+            )
+        except Exception as exc:
+            if _gemini_auth_error(exc) and self._switch_to_backup_key():
                 return self._client.models.generate_content(
                     model=self.model, contents=prompt, config=config
                 )
-            except Exception as exc:
-                if _gemini_auth_error(exc) and self._switch_to_backup_key():
-                    continue
-                raise
-
-    def _wait_circuit(self):
-        wait=max(0.0, self._circuit_open_until-time.monotonic())
-        if wait:
-            self.diagnostics.append(f"Gemini cooldown {wait:.1f}s sebelum request berikutnya.")
-            time.sleep(wait)
-
-    def _record_transient(self, exc: Exception):
-        status=_gemini_status_code(exc)
-        code=str(status) if status is not None else _failure_code(exc)
-        self.failure_codes[code]=self.failure_codes.get(code,0)+1
-        kind='rate_limit' if status == 429 else ('provider' if status in (500,502,503,504) else 'transport')
-        self.failure_counts[kind]=self.failure_counts.get(kind,0)+1
-        self._transient_streak += 1
-        if self._transient_streak >= max(2, GEMINI_CIRCUIT_THRESHOLD):
-            self._circuit_open_until=max(self._circuit_open_until, time.monotonic()+max(1.0,GEMINI_CIRCUIT_COOLDOWN))
-            self._transient_streak=0
-        return kind
-
-    def _record_success(self):
-        self._transient_streak=0
+            raise
 
     def _generate_batch(self, rows: list[dict]) -> dict[str, str]:
         payload = json.dumps(rows, ensure_ascii=False, separators=(',', ':'))
@@ -1991,11 +1827,9 @@ class _GeminiRecoveryTranslator:
             },
             'required': ['translations'],
         }
-        self._wait_circuit()
         response = self._generate_content_with_failover(
             prompt=prompt, config=self._config(schema)
         )
-        self._record_success()
         raw = (getattr(response, 'text', None) or '').strip()
         data = json.loads(raw)
         out = {}
@@ -2005,99 +1839,19 @@ class _GeminiRecoveryTranslator:
                 out[iid] = str(item.get('text', '') or '').strip()
         return out
 
-    def _targeted_retry_one(self, job: dict, reason: str = "quality/invariant validation failed"):
-        """Satu retry individual untuk semantic/structural failure saja."""
-        iid = "RETRY0001"
-        payload = json.dumps([{'id': iid, 'text': job['protected']}], ensure_ascii=False, separators=(',', ':'))
-        prompt = (
-            "Terjemahan sebelumnya ditolak validator karena " + reason + ". "
-            "Terjemahkan ulang SATU item ISO/IEC ini ke Bahasa Indonesia baku. "
-            "Jangan meringkas, jangan menghilangkan informasi, dan pertahankan SETIAP token ZXQ...QXZ, "
-            "angka, desimal, nomor pasal, simbol, satuan, formula, dan referensi persis. "
-            "Kembalikan JSON terstruktur saja.\nITEM:\n" + payload
-        )
-        schema = {
-            'type':'object','properties':{'translations':{'type':'array','items':{
-                'type':'object','properties':{'id':{'type':'string'},'text':{'type':'string'}},
-                'required':['id','text']} }},'required':['translations']
-        }
-        try:
-            self._wait_circuit()
-            response=self._generate_content_with_failover(prompt=prompt, config=self._config(schema))
-            self._record_success()
-            data=json.loads((getattr(response,'text',None) or '').strip())
-            for item in data.get('translations',[]):
-                if str(item.get('id','')) == iid:
-                    cand=str(item.get('text','') or '').strip()
-                    return cand if self._candidate_ok(job['protected'], cand) else ''
-        except Exception as exc:
-            if _gemini_transient_error(exc): self._record_transient(exc)
-            self.diagnostics.append(f"Gemini key {self.active_key_number}: targeted retry gagal ({_gemini_status_code(exc) or 'error'}).")
-        return ''
-
-    def _transport_rescue_one(self, job: dict) -> str:
-        """Kesempatan terakhir individual khusus setelah batch gagal transport.
-
-        Ini mencegah seluruh isi micro-batch langsung menjadi gagal hanya karena
-        satu request 429/timeout/5xx. Tetap memakai key/project aktif dan
-        cooldown, bukan rotasi key untuk kuota.
-        """
-        iid='NET0001'
-        rows=[{'id':iid,'text':job['protected']}]
-        for attempt in range(3):
-            try:
-                answers=self._generate_batch(rows)
-                cand=answers.get(iid,'')
-                if self._candidate_ok(job['protected'], cand):
-                    return cand
-                self.failure_counts['validation']=self.failure_counts.get('validation',0)+1
-                return self._targeted_retry_one(job, reason='hasil rescue transport tidak lolos quality gate')
-            except Exception as exc:
-                if not _gemini_transient_error(exc):
-                    return ''
-                self._record_transient(exc)
-                if attempt < 2:
-                    delay=min(GEMINI_BACKOFF_MAX, GEMINI_BACKOFF_BASE*(2**attempt))+0.25
-                    time.sleep(delay)
-        return ''
-
-    @staticmethod
-    def _risk_level(protected: str) -> str:
-        """Klasifikasi risiko lokal, deterministik, tanpa API."""
-        t = protected or ""
-        token_n = len(_RE_PROTECTION_TOKEN.findall(t))
-        number_n = len(re.findall(r'(?<![A-Za-z])\d+(?:[.,]\d+)?', t))
-        unit_n = len(re.findall(r'(?i)\b(?:mm|cm|km|kg|mg|kw|mw|hz|khz|mhz|ghz|v|kv|a|ma|pa|mpa|nm|°c|k)\b|[%±²³−×÷]', t))
-        ref_n = len(re.findall(r'(?i)\b(?:ISO|IEC|SNI|Clause|Annex|Table|Figure)\b|\b[A-Z]?\d+(?:\.\d+){1,4}\b', t))
-        formula_n = len(re.findall(r'[=<>≤≥∑√∆Ωµλ]|\^\d', t))
-        score = token_n*2 + min(number_n, 8) + unit_n*2 + ref_n*2 + formula_n*3
-        if len(t) > 2200 or score >= 16:
-            return "high"
-        if len(t) > 1100 or score >= 7:
-            return "medium"
-        return "low"
-
-    @staticmethod
-    def _risk_max_items(risk: str) -> int:
-        if risk == "high": return 1
-        if risk == "medium": return max(1, min(GEMINI_RECOVERY_MEDIUM_ITEMS, 2))
-        return max(1, min(GEMINI_RECOVERY_LOW_ITEMS, 3))
-
     def _chunks(self, jobs: list[dict]):
-        batch=[]; chars=0; batch_limit=3
-        target=max(800, GEMINI_RECOVERY_TARGET_CHARS)
+        batch=[]; chars=0
+        max_items=max(1, min(GEMINI_RECOVERY_MAX_ITEMS, 8))
+        target=max(1000, GEMINI_RECOVERY_TARGET_CHARS)
         hard=max(target, GEMINI_RECOVERY_HARD_CHARS)
         for job in jobs:
             n=len(job['protected'])
-            risk=self._risk_level(job['protected'])
-            job['risk']=risk
-            item_limit=self._risk_max_items(risk)
-            prospective_limit=min(batch_limit, item_limit) if batch else item_limit
-            if batch and (len(batch) >= prospective_limit or chars+n > target or chars+n > hard):
-                yield batch; batch=[]; chars=0; batch_limit=3
-            batch.append(job); chars += n; batch_limit=min(batch_limit, item_limit)
-            if chars >= target or chars >= hard or len(batch) >= batch_limit:
-                yield batch; batch=[]; chars=0; batch_limit=3
+            # Teks sangat panjang tetap satu unit/request; jangan pecah semantik.
+            if batch and (len(batch) >= max_items or chars+n > target or chars+n > hard):
+                yield batch; batch=[]; chars=0
+            batch.append(job); chars += n
+            if chars >= target or chars >= hard or len(batch) >= max_items:
+                yield batch; batch=[]; chars=0
         if batch: yield batch
 
     def prewarm(self, requests: list[tuple[str, dict]]) -> None:
@@ -2136,59 +1890,32 @@ class _GeminiRecoveryTranslator:
                 rows.append({'id':iid,'text':job['protected']}); idmap[iid]=job
             answers=None; last_exc=None
             # Hanya retry error request/transport. Output invalid TIDAK dikirim ulang.
-            for attempt in range(max(1, GEMINI_TRANSIENT_MAX_RETRIES)):
+            for attempt in range(3):
                 try:
                     answers=self._generate_batch(rows); break
                 except Exception as exc:
                     last_exc=exc
                     # Error permanen (mis. 400/404) tidak dibuang waktu dengan retry.
                     if not _gemini_transient_error(exc):
-                        code=str(_gemini_status_code(exc) or _failure_code(exc))
-                        self.failure_codes[code]=self.failure_codes.get(code,0)+1
-                        self.failure_counts['provider']=self.failure_counts.get('provider',0)+1
                         self.diagnostics.append(
                             f"Gemini key {self.active_key_number}: request gagal permanen; batch dilewati."
                         )
                         break
-                    kind=self._record_transient(exc)
-                    if attempt < max(1, GEMINI_TRANSIENT_MAX_RETRIES) - 1:
-                        # Exponential backoff + jitter. Circuit breaker dapat menambah
-                        # cooldown bila transient failure terjadi beruntun.
-                        delay=min(GEMINI_BACKOFF_MAX, GEMINI_BACKOFF_BASE * (2 ** attempt)) + (0.15 * ((seq + attempt) % 4))
+                    if attempt < 2:
+                        # Backoff pendek: 1.0s lalu 2.0s + jitter deterministik kecil.
+                        delay=(1.0 * (2 ** attempt)) + (0.15 * ((seq + attempt) % 4))
                         self.diagnostics.append(
-                            f"Gemini key {self.active_key_number}: error sementara; retry {attempt+1}/{max(1, GEMINI_TRANSIENT_MAX_RETRIES)-1} setelah {delay:.2f}s."
+                            f"Gemini key {self.active_key_number}: error sementara; retry {attempt+1}/2 setelah {delay:.2f}s."
                         )
                         time.sleep(delay)
             if answers is None:
-                # Transport/API failure bukan kegagalan linguistik. Setelah batch
-                # menghabiskan retry + circuit breaker, pecah ke individual rescue
-                # agar satu request gagal tidak menjatuhkan 2--3 unit sekaligus.
                 for job in chunk:
-                    cand=self._transport_rescue_one(job)
-                    if not cand:
-                        self._batch_failed_keys.add(job['key'])
-                        continue
-                    result=cand
-                    if job['token_map']:
-                        result=self.custom_dict._apply_post(result, job['token_map'])
-                    terms=[]
-                    if job['italic_map']:
-                        idict=self.italic_dict if self.italic_dict is not None else ItalicDictionary()
-                        result,terms=idict._apply_post(result, job['italic_map'])
-                    if result and not _looks_like_error_response(job['original'], result):
-                        _ENGINE8_TRANSLATION_CACHE.put(job['key'], result, terms)
-                    else:
-                        self._batch_failed_keys.add(job['key'])
+                    self._batch_failed_keys.add(job['key'])
                 continue
             for iid, job in idmap.items():
                 cand=answers.get(iid,'')
                 if not self._candidate_ok(job['protected'], cand):
-                    # Batch valid secara transport tetapi item gagal quality gate:
-                    # pecah menjadi request individual sebelum dinyatakan gagal.
-                    self.failure_counts['validation']=self.failure_counts.get('validation',0)+1
-                    cand=self._targeted_retry_one(job, reason="angka/token/struktur/quality gate tidak identik")
-                    if not cand:
-                        self._batch_failed_keys.add(job['key']); continue
+                    self._batch_failed_keys.add(job['key']); continue
                 result=cand
                 if job['token_map']:
                     result=self.custom_dict._apply_post(result, job['token_map'])
@@ -2806,11 +2533,6 @@ class DocxFinalTranslatorEngine:
                 f"| [progres-total] 0/{total}",
             )
 
-            # State pacer/circuit bersifat per dokumen. Streamlit mempertahankan
-            # proses Python antar-run, jadi state throttling dokumen sebelumnya
-            # tidak boleh membuat dokumen baru langsung berjalan dalam mode lambat.
-            _ENGINE8_MAIN_PACER.reset_for_run()
-
             done = translated_count = 0
             italic_count = 0
             failed_paras = []
@@ -2822,8 +2544,7 @@ class DocxFinalTranslatorEngine:
                     self.custom_dict, self.italic_dict, dictionary_fingerprint,
                 )
                 found = _translate_para(para, worker_tr)
-                failed=bool(worker_tr.failed_texts)
-                return index, para, found, failed, (worker_tr.last_failure_kind if failed else ""), (worker_tr.last_failure_code if failed else "")
+                return index, para, found, bool(worker_tr.failed_texts)
 
             # Tahap utama: jumlah worker dipilih user dari UI (1--4).
             try:
@@ -2831,126 +2552,27 @@ class DocxFinalTranslatorEngine:
             except (TypeError, ValueError):
                 worker_count = 2
             worker_count = max(1, min(worker_count, 4))
-            # BOUNDED QUEUE + ADAPTIVE WORKER (konservatif)
-            # ---------------------------------------------------------------
-            # worker_count adalah BATAS MAKSIMUM yang dipilih user. Executor
-            # tidak lagi menerima seluruh dokumen sekaligus; pending dibatasi
-            # 3 x worker agar dokumen ratusan halaman tidak membuat ribuan
-            # Future sekaligus. Selama provider sehat active_limit tetap sama
-            # dengan pilihan user, jadi tidak ada penalti throughput normal.
-            #
-            # Adaptasi sengaja konservatif: turun hanya bila rolling window
-            # menunjukkan kegagalan nyata, bukan karena satu request gagal.
-            # Naik kembali satu tingkat setelah rangkaian hasil sehat.
-            max_pending = max(worker_count, worker_count * 3)
-            active_limit = worker_count
-            recent_results = []          # True = gagal; maksimum 12 hasil
-            healthy_streak = 0
-            next_index = 0
-            pending = {}
-
-            failure_stats={'rate_limit':0,'transport':0,'provider':0,'validation':0,'unknown':0}
-            failure_codes={}
-
-            transient_streak = 0
-
-            def _record_health(failed, failure_kind=''):
-                nonlocal active_limit, healthy_streak, transient_streak
-                kind = failure_kind if failure_kind in failure_stats else 'unknown'
-                if failed:
-                    failure_stats[kind] += 1
-                recent_results.append(bool(failed))
-                if len(recent_results) > 12:
-                    del recent_results[0]
-
-                is_transient = failed and kind in ('rate_limit', 'transport', 'provider')
-                if is_transient:
-                    # Reaksi cepat terhadap burst provider: jangan menunggu 6 hasil
-                    # terminal. Dua transient berturut-turut langsung mengurangi
-                    # tekanan secara nyata. 4 -> 2 -> 1 lebih efektif daripada 4 -> 3.
-                    transient_streak += 1
-                    healthy_streak = 0
-                    if transient_streak >= 2 and active_limit > 1:
-                        active_limit = max(1, active_limit // 2)
-                        transient_streak = 0
-                        recent_results.clear()
-                elif failed:
-                    # Validation failure bukan sinyal rate-limit; jangan menurunkan
-                    # worker hanya karena satu teks teknis sulit divalidasi.
-                    transient_streak = 0
-                    healthy_streak = 0
-                else:
-                    transient_streak = 0
-                    healthy_streak += 1
-                    # Provider yang pulih dinaikkan perlahan satu worker sekali.
-                    # 8 sukses beruntun cukup untuk 1->2->3->4 tanpa oscillation.
-                    if active_limit < worker_count and healthy_streak >= 8:
-                        active_limit += 1
-                        recent_results.clear()
-                        healthy_streak = 0
-
-            def _fill_queue(pool):
-                nonlocal next_index
-                # Jangan submit lebih dari active_limit pekerjaan berjalan.
-                # max_pending tetap menjadi hard guard jika implementasi ini
-                # kelak diperluas dengan prefetch terpisah.
-                target = min(active_limit, max_pending)
-                while next_index < total and len(pending) < target:
-                    item = (next_index, translation_queue[next_index])
-                    fut = pool.submit(_translate_job, item)
-                    pending[fut] = next_index
-                    submitted_at[fut] = time.monotonic()
-                    next_index += 1
-
-            submitted_at = {}
             with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix='translate') as pool:
-                _fill_queue(pool)
-                while pending:
-                    completed, _ = wait(tuple(pending), timeout=1.0, return_when=FIRST_COMPLETED)
-                    if not completed:
-                        now = time.monotonic()
-                        oldest = max((now - submitted_at.get(f, now) for f in pending), default=0.0)
-                        _notify(progress_callback, 10 + int(done / max(total, 1) * 80),
-                            f"[translate {worker_count} worker; aktif={active_limit}; queue<={max_pending}] {done}/{total} | "
-                            f"berhasil={translated_count} | pending={total-done} | gagal={len(failed_paras)} | "
-                            f"inflight={len(pending)} | tertua={oldest:.1f}s | pacer={_ENGINE8_MAIN_PACER.interval:.2f}s | "
-                            f"429={failure_stats['rate_limit']} timeout={failure_stats['transport']} "
-                            f"provider={failure_stats['provider']} validasi={failure_stats['validation']} | "
-                            f"kode=" + (",".join(f"{k}:{v}" for k,v in sorted(failure_codes.items())) or "-"))
-                        continue
-                    for future in completed:
-                        pending.pop(future, None)
-                        submitted_at.pop(future, None)
-                        index, para, found, failed, failure_kind, failure_code = future.result()
-                        done += 1
-                        italic_count += len(found)
-                        if failed:
-                            failed_paras.append((index, para))
-                        else:
-                            translated_count += 1
-                        _record_health(failed, failure_kind)
-                        if failed:
-                            code=failure_code or "OTHER"
-                            failure_codes[code]=failure_codes.get(code,0)+1
-
-                        # Cache SQLite yang sudah ada adalah checkpoint ringan:
-                        # setiap hasil tervalidasi tersimpan segera (WAL), sehingga
-                        # restart tidak perlu menerjemahkan ulang hasil sukses.
-                        # Tidak menyimpan DOCX setiap paragraf karena itu justru
-                        # menambah I/O dan tidak thread-safe saat worker aktif.
-                        pct = 10 + int(done / max(total, 1) * 80)
-                        _notify(
-                            progress_callback, pct,
-                            f"[translate {worker_count} worker; aktif={active_limit}; "
-                            f"queue<={max_pending}] {done}/{total} | "
-                            f"berhasil={translated_count} | "
-                            f"pending={total-done} | gagal={len(failed_paras)} | inflight={len(pending)} | tertua={max((time.monotonic()-submitted_at.get(f,time.monotonic()) for f in pending), default=0.0):.1f}s | pacer={_ENGINE8_MAIN_PACER.interval:.2f}s | "
-                            f"429={failure_stats['rate_limit']} timeout={failure_stats['transport']} "
-                            f"provider={failure_stats['provider']} validasi={failure_stats['validation']} | "
-                            f"kode=" + (",".join(f"{k}:{v}" for k,v in sorted(failure_codes.items())) or "-") + " | "
-                            f"[progres-total] {done}/{total + len(failed_paras)}",
-                        )
-                    _fill_queue(pool)
+                futures = [pool.submit(_translate_job, item)
+                           for item in enumerate(translation_queue)]
+                for future in as_completed(futures):
+                    index, para, found, failed = future.result()
+                    done += 1
+                    italic_count += len(found)
+                    if failed:
+                        failed_paras.append((index, para))
+                    else:
+                        translated_count += 1
+                    # Translate normal memakai rentang 10%--90%, dihitung
+                    # murni dari counter done/total (XXX/XXX).
+                    pct = 10 + int(done / max(total, 1) * 80)
+                    _notify(
+                        progress_callback, pct,
+                        f"[translate {worker_count} worker] {done}/{total} | "
+                        f"berhasil={translated_count} | "
+                        f"gagal={len(failed_paras)} | "
+                        f"[progres-total] {done}/{total + len(failed_paras)}",
+                    )
 
             # PEMULIHAN: bagian yang gagal pada Google Translate tidak diulang
             # dengan provider yang sama. Gunakan Gemini 2.5 Flash secara
@@ -2970,37 +2592,24 @@ class DocxFinalTranslatorEngine:
                 except Exception as exc:
                     recovery_init_error = exc
 
-            # DIRECT STREAMING RECOVERY:
-            # Tidak ada lagi fase/status "menyiapkan pemulihan". Begitu seluruh
-            # worker Google selesai, callback langsung berpindah ke Gemini 0/N.
-            # Proteksi, cache lookup, risk classification dan micro-batch 3/2/1
-            # tetap dilakukan secara internal per paragraf agar akurasi/kecepatan
-            # terjaga, tetapi tidak menjadi fase blocking terpisah.
-            if recovery_total:
-                detail0 = (
-                    f"[pemulihan Gemini 2.5 Flash] 0/{recovery_total} | "
-                    f"berhasil=0 | gagal=0 | tersisa={recovery_total}"
-                )
-                if recovery_tr is not None:
-                    detail0 += f" | key={recovery_tr.active_key_number}"
-                if recovery_init_error is not None:
-                    detail0 += f" | Gemini tidak aktif: {recovery_init_error}"
-                _notify(progress_callback, 90, detail0)
+            # Satu pemulihan: kumpulkan seluruh unit teks secara read-only lalu
+            # prewarm cache melalui adaptive micro-batch Gemini. Setelah itu
+            # _translate_para memakai hasil cache sambil mempertahankan seluruh
+            # aturan formatting DOCX yang sudah ada.
+            if recovery_tr is not None:
+                recovery_requests = []
+                for _, _para in sorted(failed_paras, key=lambda item: item[0]):
+                    recovery_requests.extend(
+                        _gemini_recovery_requests_for_para(_para, recovery_tr)
+                    )
+                recovery_tr.prewarm(recovery_requests)
 
-            sorted_failed = sorted(failed_paras, key=lambda item: item[0])
-            for recovery_done, (index, para) in enumerate(sorted_failed, start=1):
+            for recovery_done, (index, para) in enumerate(
+                    sorted(failed_paras, key=lambda item: item[0]), start=1):
                 if recovery_tr is None:
                     failed = True
                     found = []
                 else:
-                    # Persiapan internal HANYA untuk paragraf aktif. Ini bukan
-                    # fase UI terpisah: status sudah berada pada Pemulihan Gemini.
-                    # Tetap memakai risk-adaptive micro-batch 3/2/1, validated
-                    # cache, local protection, transient backoff, dan targeted retry 1x.
-                    para_requests = _gemini_recovery_requests_for_para(para, recovery_tr)
-                    if para_requests:
-                        recovery_tr.prewarm(para_requests)
-
                     before = len(recovery_tr.failed_texts)
                     found = _translate_para(para, recovery_tr)
                     failed = len(recovery_tr.failed_texts) > before
@@ -3017,14 +2626,10 @@ class DocxFinalTranslatorEngine:
                     f"[pemulihan Gemini 2.5 Flash] "
                     f"{recovery_done}/{recovery_total} | "
                     f"berhasil={recovery_success} | "
-                    f"gagal={len(still_failed)} | "
-                    f"tersisa={recovery_total - recovery_done}"
+                    f"gagal={recovery_total - recovery_done + len(still_failed)} "
+                    f"| [progres-total] {total + recovery_done}/"
+                    f"{total + recovery_total}"
                 )
-                if recovery_tr is not None:
-                    fc=recovery_tr.failure_counts
-                    detail += (f" | key={recovery_tr.active_key_number} | 429={fc.get('rate_limit',0)} "
-                               f"timeout={fc.get('transport',0)} provider={fc.get('provider',0)} "
-                               f"validasi={fc.get('validation',0)} | kode=" + (",".join(f"{k}:{v}" for k,v in sorted(recovery_tr.failure_codes.items())) or "-"))
                 if recovery_init_error is not None:
                     detail += f" | Gemini tidak aktif: {recovery_init_error}"
                 _notify(progress_callback, pct, detail)
