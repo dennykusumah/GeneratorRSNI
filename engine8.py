@@ -1218,10 +1218,20 @@ def _fix_note_para(para, force_upper: bool | None = None) -> None:
         run_b._element.insert(0, copy.deepcopy(label_rpr))
     run_b.bold = True
 
-    for index, (piece, rpr) in enumerate(source_segments):
+    # Empat spasi setelah CATATAN harus menjadi run baseline tersendiri.
+    # Jangan gabungkan spasi ini ke run pertama kalimat karena run pertama
+    # dapat mewarisi w:vertAlign=superscript/subscript dari notasi teknis.
+    # Penggabungan tersebut sebelumnya dapat membuat spasi/huruf sesudah
+    # pangkat ikut terangkat (contoh: kWm−2 hingga, m2 dengan ...).
+    gap_run = para.add_run('    ')
+    gap_run.bold = False
+    gap_run.font.superscript = False
+    gap_run.font.subscript = False
+
+    for piece, rpr in source_segments:
         if not piece:
             continue
-        run_n = para.add_run(('    ' if index == 0 else '') + piece)
+        run_n = para.add_run(piece)
         if rpr is not None:
             if run_n._element.rPr is not None:
                 run_n._element.remove(run_n._element.rPr)
