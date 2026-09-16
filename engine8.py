@@ -1597,17 +1597,12 @@ class _Translator:
 
 
 def _get_gemini_api_keys() -> list[str]:
-    """Ambil maksimum 2 Gemini API key (primary + backup) tanpa hard-code.
+    """Ambil maksimum 15 Gemini API key: 1 utama + 14 fallback.
 
-    Urutan prioritas:
-      1) GEMINI_API_KEY_1
-      2) GEMINI_API_KEY_2
-
-    Hanya dua nama key tersebut yang didukung. Nilai duplikat dibuang.
-    Environment variable dibaca lebih dahulu, lalu Streamlit Secrets untuk
-    nama yang belum tersedia di environment.
+    Nama secret/environment: GEMINI_API_KEY_1 ... GEMINI_API_KEY_15.
+    Nilai kosong dan duplikat diabaikan. Key tidak pernah ditulis ke log.
     """
-    names = ("GEMINI_API_KEY_1", "GEMINI_API_KEY_2")
+    names = tuple(f"GEMINI_API_KEY_{i}" for i in range(1, 16))
     values = []
 
     def _add(value):
@@ -1617,7 +1612,6 @@ def _get_gemini_api_keys() -> list[str]:
 
     for name in names:
         _add(os.getenv(name, ""))
-
     try:
         import streamlit as st
         for name in names:
@@ -1627,10 +1621,7 @@ def _get_gemini_api_keys() -> list[str]:
                 pass
     except Exception:
         pass
-
-    # Desain Engine8 hanya primary + satu backup.
-    return values[:2]
-
+    return values[:15]
 
 def _gemini_auth_error(exc: Exception) -> bool:
     """True hanya untuk error autentikasi/otorisasi yang layak failover key.
@@ -1709,8 +1700,8 @@ class _GeminiRecoveryTranslator:
         api_keys = _get_gemini_api_keys()
         if not api_keys:
             raise RuntimeError(
-                "Gemini API key belum diset. Isi GEMINI_API_KEY_1 dan opsional "
-                "GEMINI_API_KEY_2 di Streamlit Secrets/environment variable."
+                "Gemini API key belum diset. Isi GEMINI_API_KEY_1 (utama) dan "
+                "GEMINI_API_KEY_2 ... GEMINI_API_KEY_15 (fallback) di Streamlit Secrets/environment variable."
             )
         self.source = source; self.target = target
         self.custom_dict = custom_dict; self.italic_dict = italic_dict
@@ -1721,6 +1712,7 @@ class _GeminiRecoveryTranslator:
         self._api_keys = api_keys
         self._active_key_index = 0
         self._client = genai.Client(api_key=self._api_keys[0])
+        self._key_cooldown_until = [0.0] * len(self._api_keys)
         self._types = types
         # Key yang SUDAH mendapat satu kesempatan AI tetapi gagal validasi.
         # translate_one tidak akan mengirimnya lagi: tetap satu pemulihan.
@@ -1769,36 +1761,64 @@ class _GeminiRecoveryTranslator:
 
     @property
     def active_key_number(self) -> int:
-        """Nomor key aktif (1/2) untuk diagnostic tanpa mengekspos secret."""
+        """Nomor key aktif (1..15) untuk diagnostic tanpa mengekspos secret."""
         return self._active_key_index + 1
 
-    def _switch_to_backup_key(self) -> bool:
-        """Pindah sekali ke backup key bila tersedia; tidak pernah berputar balik."""
-        next_index = self._active_key_index + 1
-        if next_index >= len(self._api_keys):
-            return False
+    def _activate_key(self, index: int, reason: str = "") -> None:
         old_no = self.active_key_number
-        self._active_key_index = next_index
-        self._client = self._genai.Client(api_key=self._api_keys[next_index])
-        self.diagnostics.append(f"Gemini key {old_no}: autentikasi gagal; failover ke key {self.active_key_number}.")
-        return True
+        self._active_key_index = index
+        self._client = self._genai.Client(api_key=self._api_keys[index])
+        if old_no != self.active_key_number:
+            suffix = f" ({reason})" if reason else ""
+            self.diagnostics.append(
+                f"Gemini key {old_no} -> key {self.active_key_number}{suffix}."
+            )
+
+    def _switch_to_next_available_key(self, *, cooldown_current: float = 0.0,
+                                      reason: str = "fallback") -> bool:
+        """Rotasi ke key berikut yang tidak cooldown, maksimum satu putaran."""
+        now = time.monotonic()
+        if cooldown_current > 0:
+            self._key_cooldown_until[self._active_key_index] = max(
+                self._key_cooldown_until[self._active_key_index], now + cooldown_current
+            )
+        n = len(self._api_keys)
+        for step in range(1, n + 1):
+            idx = (self._active_key_index + step) % n
+            if idx == self._active_key_index:
+                continue
+            if self._key_cooldown_until[idx] <= now:
+                self._activate_key(idx, reason)
+                return True
+        return False
 
     def _generate_content_with_failover(self, *, prompt: str, config):
-        """Generate dengan failover hanya pada 401/403/invalid credential.
+        """Gemini request dengan primary + 14 fallback.
 
-        Rate limit (429), server error (5xx), dan timeout dilempar kembali ke
-        caller agar mekanisme exponential backoff yang sudah ada tetap berlaku.
+        401/403 memindahkan key segera. 429 memberi cooldown pada key aktif dan
+        mencoba key project berikutnya. 5xx/timeout tetap dilempar ke retry
+        transport agar tidak melakukan rotasi berlebihan.
         """
-        try:
-            return self._client.models.generate_content(
-                model=self.model, contents=prompt, config=config
-            )
-        except Exception as exc:
-            if _gemini_auth_error(exc) and self._switch_to_backup_key():
+        tried = set()
+        while len(tried) < len(self._api_keys):
+            tried.add(self._active_key_index)
+            try:
                 return self._client.models.generate_content(
                     model=self.model, contents=prompt, config=config
                 )
-            raise
+            except Exception as exc:
+                status = _gemini_status_code(exc)
+                if _gemini_auth_error(exc):
+                    if self._switch_to_next_available_key(reason=f"HTTP {status or 'auth'}"):
+                        continue
+                elif status == 429:
+                    # Free-tier quota/rate limit: istirahatkan project key ini.
+                    if self._switch_to_next_available_key(
+                        cooldown_current=10.0, reason="HTTP 429 cooldown 60s"
+                    ):
+                        continue
+                raise
+        raise RuntimeError("Semua Gemini API key sedang tidak tersedia/cooldown.")
 
     def _generate_batch(self, rows: list[dict]) -> dict[str, str]:
         payload = json.dumps(rows, ensure_ascii=False, separators=(',', ':'))
@@ -2546,33 +2566,63 @@ class DocxFinalTranslatorEngine:
                 found = _translate_para(para, worker_tr)
                 return index, para, found, bool(worker_tr.failed_texts)
 
-            # Tahap utama: jumlah worker dipilih user dari UI (1--4).
+            # Tahap utama adaptif. Pilihan UI 1/2/3/4 adalah BATAS MAKSIMUM,
+            # bukan worker yang dipaksa selalu aktif. Saat batch mengalami gagal,
+            # concurrency turun 1. Setelah dua batch berturut-turut stabil, naik
+            # satu tingkat sampai kembali ke maksimum pilihan user.
             try:
                 worker_count = int(worker_count)
             except (TypeError, ValueError):
                 worker_count = 2
-            worker_count = max(1, min(worker_count, 4))
-            with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix='translate') as pool:
-                futures = [pool.submit(_translate_job, item)
-                           for item in enumerate(translation_queue)]
-                for future in as_completed(futures):
-                    index, para, found, failed = future.result()
-                    done += 1
-                    italic_count += len(found)
-                    if failed:
-                        failed_paras.append((index, para))
-                    else:
-                        translated_count += 1
-                    # Translate normal memakai rentang 10%--90%, dihitung
-                    # murni dari counter done/total (XXX/XXX).
-                    pct = 10 + int(done / max(total, 1) * 80)
-                    _notify(
-                        progress_callback, pct,
-                        f"[translate {worker_count} worker] {done}/{total} | "
-                        f"berhasil={translated_count} | "
-                        f"gagal={len(failed_paras)} | "
-                        f"[progres-total] {done}/{total + len(failed_paras)}",
-                    )
+            max_workers = max(1, min(worker_count, 4))
+            active_workers = max_workers
+            stable_batches = 0
+            cursor = 0
+            indexed_queue = list(enumerate(translation_queue))
+
+            while cursor < total:
+                # Batch kecil membuat perubahan concurrency benar-benar berlaku
+                # cepat; request lama tidak menumpuk saat 429 mulai muncul.
+                batch_size = min(max(active_workers * 2, 1), total - cursor)
+                batch = indexed_queue[cursor:cursor + batch_size]
+                cursor += batch_size
+                batch_failures = 0
+
+                with ThreadPoolExecutor(
+                    max_workers=active_workers,
+                    thread_name_prefix='translate'
+                ) as pool:
+                    futures = [pool.submit(_translate_job, item) for item in batch]
+                    for future in as_completed(futures):
+                        index, para, found, failed = future.result()
+                        done += 1
+                        italic_count += len(found)
+                        if failed:
+                            failed_paras.append((index, para))
+                            batch_failures += 1
+                        else:
+                            translated_count += 1
+                        pct = 10 + int(done / max(total, 1) * 80)
+                        _notify(
+                            progress_callback, pct,
+                            f"[translate adaptif {active_workers}/{max_workers} worker] "
+                            f"{done}/{total} | berhasil={translated_count} | "
+                            f"gagal={len(failed_paras)} | "
+                            f"[progres-total] {done}/{total + len(failed_paras)}",
+                        )
+
+                if batch_failures:
+                    stable_batches = 0
+                    if active_workers > 1:
+                        active_workers -= 1
+                    # Jeda kecil memberi ruang pada provider setelah indikasi
+                    # throttling/error; semakin banyak gagal, semakin panjang.
+                    time.sleep(min(4.0, 0.75 + 0.35 * batch_failures))
+                else:
+                    stable_batches += 1
+                    if stable_batches >= 2 and active_workers < max_workers:
+                        active_workers += 1
+                        stable_batches = 0
 
             # PEMULIHAN: bagian yang gagal pada Google Translate tidak diulang
             # dengan provider yang sama. Gunakan Gemini 2.5 Flash secara
