@@ -1434,6 +1434,33 @@ class TranslationFailedError(RuntimeError):
     """Mencegah dokumen setengah diterjemahkan tetap disimpan."""
 
 
+ENGINE8_HARD_REQUEST_TIMEOUT = float(os.getenv("ENGINE8_HARD_REQUEST_TIMEOUT", "20"))
+
+def _call_with_hard_timeout(fn, timeout_s: float):
+    """Run blocking provider call with a hard wall-clock timeout.
+
+    Uses a daemon helper thread so a stuck HTTP call cannot hold an Engine-8
+    worker indefinitely. The late result is discarded; no document state is
+    mutated by this helper.
+    """
+    box = {}
+    done = threading.Event()
+    def _runner():
+        try:
+            box["value"] = fn()
+        except BaseException as exc:
+            box["error"] = exc
+        finally:
+            done.set()
+    th = threading.Thread(target=_runner, name="engine8-http-call", daemon=True)
+    th.start()
+    if not done.wait(max(1.0, float(timeout_s))):
+        raise TimeoutError(f"provider request hard timeout after {float(timeout_s):.1f}s")
+    if "error" in box:
+        raise box["error"]
+    return box.get("value")
+
+
 class _AdaptiveRequestPacer:
     """Thread-safe global pacer untuk provider utama.
 
@@ -1590,7 +1617,7 @@ class _Translator:
         for attempt in range(1, attempts + 1):
             try:
                 _ENGINE8_MAIN_PACER.wait_turn()
-                candidate = self._client.translate(t)
+                candidate = _call_with_hard_timeout(lambda: self._client.translate(t), ENGINE8_HARD_REQUEST_TIMEOUT)
                 if not candidate or not _translation_quality_ok(t, candidate):
                     raise ValueError('respons layanan terjemahan tidak lolos quality gate')
                 returned_tokens = {
@@ -2872,14 +2899,28 @@ class DocxFinalTranslatorEngine:
                     item = (next_index, translation_queue[next_index])
                     fut = pool.submit(_translate_job, item)
                     pending[fut] = next_index
+                    submitted_at[fut] = time.monotonic()
                     next_index += 1
 
+            submitted_at = {}
             with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix='translate') as pool:
                 _fill_queue(pool)
                 while pending:
-                    completed, _ = wait(tuple(pending), return_when=FIRST_COMPLETED)
+                    completed, _ = wait(tuple(pending), timeout=1.0, return_when=FIRST_COMPLETED)
+                    if not completed:
+                        now = time.monotonic()
+                        oldest = max((now - submitted_at.get(f, now) for f in pending), default=0.0)
+                        _notify(progress_callback, 10 + int(done / max(total, 1) * 80),
+                            f"[translate {worker_count} worker; aktif={active_limit}; queue<={max_pending}] {done}/{total} | "
+                            f"berhasil={translated_count} | pending={total-done} | gagal={len(failed_paras)} | "
+                            f"inflight={len(pending)} | tertua={oldest:.1f}s | pacer={_ENGINE8_MAIN_PACER.interval:.2f}s | "
+                            f"429={failure_stats['rate_limit']} timeout={failure_stats['transport']} "
+                            f"provider={failure_stats['provider']} validasi={failure_stats['validation']} | "
+                            f"kode=" + (",".join(f"{k}:{v}" for k,v in sorted(failure_codes.items())) or "-"))
+                        continue
                     for future in completed:
                         pending.pop(future, None)
+                        submitted_at.pop(future, None)
                         index, para, found, failed, failure_kind, failure_code = future.result()
                         done += 1
                         italic_count += len(found)
@@ -2903,7 +2944,7 @@ class DocxFinalTranslatorEngine:
                             f"[translate {worker_count} worker; aktif={active_limit}; "
                             f"queue<={max_pending}] {done}/{total} | "
                             f"berhasil={translated_count} | "
-                            f"gagal={len(failed_paras)} | pacer={_ENGINE8_MAIN_PACER.interval:.2f}s | "
+                            f"pending={total-done} | gagal={len(failed_paras)} | inflight={len(pending)} | tertua={max((time.monotonic()-submitted_at.get(f,time.monotonic()) for f in pending), default=0.0):.1f}s | pacer={_ENGINE8_MAIN_PACER.interval:.2f}s | "
                             f"429={failure_stats['rate_limit']} timeout={failure_stats['transport']} "
                             f"provider={failure_stats['provider']} validasi={failure_stats['validation']} | "
                             f"kode=" + (",".join(f"{k}:{v}" for k,v in sorted(failure_codes.items())) or "-") + " | "
