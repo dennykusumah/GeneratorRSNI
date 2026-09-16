@@ -1586,25 +1586,73 @@ class _Translator:
 
 
 
-def _get_gemini_api_key() -> str:
-    """Ambil Gemini API key tanpa pernah menuliskannya di source code."""
-    key = (os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY") or "").strip()
-    if key:
-        return key
-    # Streamlit Cloud lazim menyimpan secret di st.secrets. Import dibuat
-    # opsional agar engine8 tetap dapat dipakai sebagai modul Python biasa.
+def _get_gemini_api_keys() -> list[str]:
+    """Ambil maksimum 2 Gemini API key (primary + backup) tanpa hard-code.
+
+    Urutan prioritas:
+      1) GEMINI_API_KEY_1
+      2) GEMINI_API_KEY_2
+
+    Hanya dua nama key tersebut yang didukung. Nilai duplikat dibuang.
+    Environment variable dibaca lebih dahulu, lalu Streamlit Secrets untuk
+    nama yang belum tersedia di environment.
+    """
+    names = ("GEMINI_API_KEY_1", "GEMINI_API_KEY_2")
+    values = []
+
+    def _add(value):
+        value = str(value or "").strip()
+        if value and value not in values:
+            values.append(value)
+
+    for name in names:
+        _add(os.getenv(name, ""))
+
     try:
         import streamlit as st
-        for name in ("GEMINI_API_KEY", "GOOGLE_API_KEY"):
+        for name in names:
             try:
-                value = str(st.secrets.get(name, "") or "").strip()
+                _add(st.secrets.get(name, ""))
             except Exception:
-                value = ""
-            if value:
-                return value
+                pass
     except Exception:
         pass
-    return ""
+
+    # Desain Engine8 hanya primary + satu backup.
+    return values[:2]
+
+
+def _get_gemini_api_key() -> str:
+    """Backward-compatible helper: kembalikan key primary atau string kosong."""
+    keys = _get_gemini_api_keys()
+    return keys[0] if keys else ""
+
+
+def _gemini_auth_error(exc: Exception) -> bool:
+    """True hanya untuk error autentikasi/otorisasi yang layak failover key.
+
+    429/5xx/timeout sengaja BUKAN auth error: kondisi tersebut ditangani retry
+    transport pada key aktif, sehingga backup tidak dipakai untuk mengakali
+    rate limit project.
+    """
+    status = getattr(exc, "status_code", None)
+    if status is None:
+        response = getattr(exc, "response", None)
+        status = getattr(response, "status_code", None)
+    try:
+        if int(status) in (401, 403):
+            return True
+    except Exception:
+        pass
+
+    text = str(exc).casefold()
+    auth_markers = (
+        "api key not valid", "api_key_invalid", "invalid api key",
+        "invalid authentication", "authentication failed", "unauthenticated",
+        "permission denied", "permission_denied", "forbidden",
+        "credentials are invalid", "credential is invalid",
+    )
+    return any(marker in text for marker in auth_markers)
 
 
 class _GeminiRecoveryTranslator:
@@ -1626,18 +1674,21 @@ class _GeminiRecoveryTranslator:
             from google.genai import types
         except ImportError as exc:
             raise ImportError("Jalankan: pip install -U google-genai") from exc
-        api_key = _get_gemini_api_key()
-        if not api_key:
+        api_keys = _get_gemini_api_keys()
+        if not api_keys:
             raise RuntimeError(
-                "GEMINI_API_KEY belum diset. Isi di Streamlit Secrets atau "
-                "environment variable GEMINI_API_KEY."
+                "Gemini API key belum diset. Isi GEMINI_API_KEY_1 dan opsional "
+                "GEMINI_API_KEY_2 di Streamlit Secrets/environment variable."
             )
         self.source = source; self.target = target
         self.custom_dict = custom_dict; self.italic_dict = italic_dict
         self.failed_texts: list[str] = []
         self.dictionary_fingerprint = dictionary_fingerprint or _canonical_dictionary_fingerprint(custom_dict, italic_dict)
         self.model = GEMINI_RECOVERY_MODEL
-        self._client = genai.Client(api_key=api_key)
+        self._genai = genai
+        self._api_keys = api_keys
+        self._active_key_index = 0
+        self._client = genai.Client(api_key=self._api_keys[0])
         self._types = types
         # Key yang SUDAH mendapat satu kesempatan AI tetapi gagal validasi.
         # translate_one tidak akan mengirimnya lagi: tetap satu pemulihan.
@@ -1683,6 +1734,37 @@ class _GeminiRecoveryTranslator:
             kw['response_schema'] = schema
         return self._types.GenerateContentConfig(**kw)
 
+    @property
+    def active_key_number(self) -> int:
+        """Nomor key aktif (1/2) untuk diagnostic tanpa mengekspos secret."""
+        return self._active_key_index + 1
+
+    def _switch_to_backup_key(self) -> bool:
+        """Pindah sekali ke backup key bila tersedia; tidak pernah berputar balik."""
+        next_index = self._active_key_index + 1
+        if next_index >= len(self._api_keys):
+            return False
+        self._active_key_index = next_index
+        self._client = self._genai.Client(api_key=self._api_keys[next_index])
+        return True
+
+    def _generate_content_with_failover(self, *, prompt: str, config):
+        """Generate dengan failover hanya pada 401/403/invalid credential.
+
+        Rate limit (429), server error (5xx), dan timeout dilempar kembali ke
+        caller agar mekanisme exponential backoff yang sudah ada tetap berlaku.
+        """
+        try:
+            return self._client.models.generate_content(
+                model=self.model, contents=prompt, config=config
+            )
+        except Exception as exc:
+            if _gemini_auth_error(exc) and self._switch_to_backup_key():
+                return self._client.models.generate_content(
+                    model=self.model, contents=prompt, config=config
+                )
+            raise
+
     def _generate_batch(self, rows: list[dict]) -> dict[str, str]:
         payload = json.dumps(rows, ensure_ascii=False, separators=(',', ':'))
         prompt = (
@@ -1710,8 +1792,8 @@ class _GeminiRecoveryTranslator:
             },
             'required': ['translations'],
         }
-        response = self._client.models.generate_content(
-            model=self.model, contents=prompt, config=self._config(schema)
+        response = self._generate_content_with_failover(
+            prompt=prompt, config=self._config(schema)
         )
         raw = (getattr(response, 'text', None) or '').strip()
         data = json.loads(raw)
