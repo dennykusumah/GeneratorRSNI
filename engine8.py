@@ -77,7 +77,7 @@ _EM_DASH = '—'
 ENGINE8_POLICY_VERSION = "2026.09-cache-v2-quality-gate"
 ENGINE8_PROVIDER_VERSION = "deep-translator-google+mymemory-v1"
 GEMINI_RECOVERY_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
-GEMINI_RECOVERY_VERSION = "gemini-recovery-v2-microbatch"
+GEMINI_RECOVERY_VERSION = "gemini-recovery-v3-dualkey-optimized"
 GEMINI_RECOVERY_MAX_ITEMS = int(os.getenv("GEMINI_RECOVERY_MAX_ITEMS", "8"))
 GEMINI_RECOVERY_TARGET_CHARS = int(os.getenv("GEMINI_RECOVERY_TARGET_CHARS", "6000"))
 GEMINI_RECOVERY_HARD_CHARS = int(os.getenv("GEMINI_RECOVERY_HARD_CHARS", "10000"))
@@ -1622,12 +1622,6 @@ def _get_gemini_api_keys() -> list[str]:
     return values[:2]
 
 
-def _get_gemini_api_key() -> str:
-    """Backward-compatible helper: kembalikan key primary atau string kosong."""
-    keys = _get_gemini_api_keys()
-    return keys[0] if keys else ""
-
-
 def _gemini_auth_error(exc: Exception) -> bool:
     """True hanya untuk error autentikasi/otorisasi yang layak failover key.
 
@@ -1635,15 +1629,9 @@ def _gemini_auth_error(exc: Exception) -> bool:
     transport pada key aktif, sehingga backup tidak dipakai untuk mengakali
     rate limit project.
     """
-    status = getattr(exc, "status_code", None)
-    if status is None:
-        response = getattr(exc, "response", None)
-        status = getattr(response, "status_code", None)
-    try:
-        if int(status) in (401, 403):
-            return True
-    except Exception:
-        pass
+    status = _gemini_status_code(exc)
+    if status in (401, 403):
+        return True
 
     text = str(exc).casefold()
     auth_markers = (
@@ -1653,6 +1641,40 @@ def _gemini_auth_error(exc: Exception) -> bool:
         "credentials are invalid", "credential is invalid",
     )
     return any(marker in text for marker in auth_markers)
+
+
+def _gemini_status_code(exc: Exception):
+    """Best-effort HTTP/RPC status extraction without exposing credentials."""
+    for obj in (exc, getattr(exc, "response", None)):
+        if obj is None:
+            continue
+        for attr in ("status_code", "code"):
+            value = getattr(obj, attr, None)
+            if callable(value):
+                try: value = value()
+                except Exception: value = None
+            try:
+                if value is not None:
+                    return int(value)
+            except Exception:
+                pass
+    m = re.search(r'(?<!\d)(401|403|408|409|429|500|502|503|504)(?!\d)', str(exc))
+    return int(m.group(1)) if m else None
+
+
+def _gemini_transient_error(exc: Exception) -> bool:
+    """Retry only failures likely to succeed later; permanent 4xx fail fast."""
+    status = _gemini_status_code(exc)
+    if status in (408, 409, 429, 500, 502, 503, 504):
+        return True
+    text = str(exc).casefold()
+    markers = (
+        "timeout", "timed out", "deadline exceeded", "temporarily unavailable",
+        "service unavailable", "connection reset", "connection aborted",
+        "connection error", "remote disconnected", "server disconnected",
+        "internal server error", "bad gateway", "gateway timeout",
+    )
+    return any(x in text for x in markers)
 
 
 class _GeminiRecoveryTranslator:
@@ -1693,6 +1715,7 @@ class _GeminiRecoveryTranslator:
         # Key yang SUDAH mendapat satu kesempatan AI tetapi gagal validasi.
         # translate_one tidak akan mengirimnya lagi: tetap satu pemulihan.
         self._batch_failed_keys: set[str] = set()
+        self.diagnostics: list[str] = []
 
     def _cache_key(self, text: str, italic_map=None) -> str:
         fp = "|".join((self.dictionary_fingerprint, GEMINI_RECOVERY_VERSION, self.model))
@@ -1744,8 +1767,10 @@ class _GeminiRecoveryTranslator:
         next_index = self._active_key_index + 1
         if next_index >= len(self._api_keys):
             return False
+        old_no = self.active_key_number
         self._active_key_index = next_index
         self._client = self._genai.Client(api_key=self._api_keys[next_index])
+        self.diagnostics.append(f"Gemini key {old_no}: autentikasi gagal; failover ke key {self.active_key_number}.")
         return True
 
     def _generate_content_with_failover(self, *, prompt: str, config):
@@ -1776,15 +1801,15 @@ class _GeminiRecoveryTranslator:
             "Kembalikan tepat satu hasil untuk setiap id dalam JSON terstruktur.\nITEM:\n" + payload
         )
         schema = {
-            'type': 'OBJECT',
+            'type': 'object',
             'properties': {
                 'translations': {
-                    'type': 'ARRAY',
+                    'type': 'array',
                     'items': {
-                        'type': 'OBJECT',
+                        'type': 'object',
                         'properties': {
-                            'id': {'type': 'STRING'},
-                            'text': {'type': 'STRING'},
+                            'id': {'type': 'string'},
+                            'text': {'type': 'string'},
                         },
                         'required': ['id', 'text'],
                     },
@@ -1860,9 +1885,19 @@ class _GeminiRecoveryTranslator:
                     answers=self._generate_batch(rows); break
                 except Exception as exc:
                     last_exc=exc
+                    # Error permanen (mis. 400/404) tidak dibuang waktu dengan retry.
+                    if not _gemini_transient_error(exc):
+                        self.diagnostics.append(
+                            f"Gemini key {self.active_key_number}: request gagal permanen; batch dilewati."
+                        )
+                        break
                     if attempt < 2:
-                        # exponential backoff + jitter deterministik ringan tanpa dependency.
-                        time.sleep((1.0 * (2 ** attempt)) + (0.15 * ((seq + attempt) % 4)))
+                        # Backoff pendek: 1.0s lalu 2.0s + jitter deterministik kecil.
+                        delay=(1.0 * (2 ** attempt)) + (0.15 * ((seq + attempt) % 4))
+                        self.diagnostics.append(
+                            f"Gemini key {self.active_key_number}: error sementara; retry {attempt+1}/2 setelah {delay:.2f}s."
+                        )
+                        time.sleep(delay)
             if answers is None:
                 for job in chunk:
                     self._batch_failed_keys.add(job['key'])
