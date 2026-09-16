@@ -61,7 +61,6 @@ Deteksi batas bahasa Indonesia vs Inggris:
   berbahasa Indonesia.
 """
 
-from pipeline_utils import validate_docx, atomic_save_docx
 import os
 import re
 import copy
@@ -686,7 +685,8 @@ class StyleFinalizerEngine:
             #    supaya tidak mengubah bagian lain dari engine ini.
             _enforce_italic_terms(doc, ['Red Green Blue'])
 
-            atomic_save_docx(doc, output_docx)
+            doc.save(output_docx)
+
             msg = (
                 f'OK: {len(judul_targets)} heading/Lampiran -> "Judul", '
                 f'{len(pasal_targets)} pasal/subpasal -> "Pasal".'
@@ -701,30 +701,6 @@ class StyleFinalizerEngine:
 def apply_custom_styles(input_docx: str, output_docx: str) -> tuple[bool, str]:
     """Shortcut fungsi-level untuk StyleFinalizerEngine().apply(...)."""
     return StyleFinalizerEngine().apply(input_docx, output_docx)
-
-
-def _enforce_page_margin_safety(doc: Document) -> None:
-    """Jaga elemen Engine9 tetap berada di area cetak tanpa mengubah margin template.
-
-    Fokus pada indent paragraf negatif/berlebih yang dapat mendorong teks melewati
-    margin. Tabel/gambar sumber tidak di-resize agresif agar layout standar tidak rusak.
-    """
-    for paragraph in doc.paragraphs:
-        pPr = paragraph._p.find(qn('w:pPr'))
-        if pPr is None:
-            continue
-        ind = pPr.find(qn('w:ind'))
-        if ind is None:
-            continue
-        # Indent negatif dapat menempatkan teks di luar margin fisik.
-        for attr in ('w:left', 'w:start', 'w:right', 'w:end'):
-            val = ind.get(qn(attr))
-            if val is not None:
-                try:
-                    if int(val) < 0:
-                        ind.set(qn(attr), '0')
-                except (TypeError, ValueError):
-                    pass
 
 
 class TableOfContentsEngine:
@@ -767,7 +743,7 @@ class TableOfContentsEngine:
         right_tab = OxmlElement('w:tab')
         right_tab.set(qn('w:val'), 'right')
         right_tab.set(qn('w:leader'), 'dot')
-        right_tab.set(qn('w:pos'), '8986')     # 15,85 cm; aman di area teks A4 margin 3/2 cm
+        right_tab.set(qn('w:pos'), '9752')     # 17,2 cm
         tabs.append(right_tab)
         pPr.append(tabs)
         pPr.append(OxmlElement('w:suppressAutoHyphens'))
@@ -893,7 +869,8 @@ class TableOfContentsEngine:
         node = settings.find(qn('w:updateFields'))
         if node is not None:
             node.set(qn('w:val'), 'false')
-        atomic_save_docx(doc, docx_path)
+        doc.save(docx_path)
+
     @staticmethod
     def _collect_entries(doc: Document, toc_title: Paragraph):
         entries = []
@@ -982,12 +959,7 @@ class TableOfContentsEngine:
         if not docx_path or not os.path.isfile(docx_path):
             raise FileNotFoundError(f'File untuk update TOC tidak ditemukan: {docx_path}')
         if os.name != 'nt':
-            # PENTING: jangan ubah TOC menjadi teks statis di Linux/Streamlit.
-            # TOC harus tetap native Word field agar pengguna tetap dapat memakai
-            # Update Field -> Update page numbers only setelah file diunduh.
-            # Linux tidak memiliki Microsoft Word COM, jadi pagination final Word
-            # tidak dapat dihitung secara identik. Field ditinggalkan dalam keadaan
-            # dirty dan akan dapat diperbarui oleh Microsoft Word.
+            TableOfContentsEngine._update_toc_page_numbers_on_linux(docx_path)
             return
 
         abs_path = os.path.abspath(docx_path)
@@ -1316,7 +1288,8 @@ finally {{
             paragraph._p.set(qn('w:rsidRPr'), 'E9000001')
             paragraph.add_run(title)
             paragraph.add_run('\t' + page_label)
-        atomic_save_docx(doc, docx_path)
+        doc.save(docx_path)
+
     @staticmethod
     def _update_toc_page_numbers_on_linux(docx_path: str) -> None:
         """Hitung TOC secara deterministik di Streamlit Cloud/Linux.
@@ -1387,7 +1360,6 @@ finally {{
     def insert_toc(self, input_docx: str, output_docx: str) -> str:
         if not input_docx or not os.path.isfile(input_docx):
             raise FileNotFoundError(f'File input tidak ditemukan: {input_docx}')
-        validate_docx(input_docx)
         ok, message = StyleFinalizerEngine().apply(input_docx, output_docx)
         if not ok:
             raise RuntimeError(message)
@@ -1401,16 +1373,14 @@ finally {{
         anchor = self._toc_anchor_after_three_blank_paragraphs(title)
         anchor.addnext(toc._p)
         self._force_update_fields(doc)
-        _enforce_page_margin_safety(doc)
-        atomic_save_docx(doc, output_docx)
+        doc.save(output_docx)
+
         # Jangan sediakan file untuk download sebelum Word benar-benar selesai
         # menghitung pagination dan menjalankan "Update page numbers only".
         self._update_toc_page_numbers_with_word(output_docx)
-        # Hanya Windows + Microsoft Word yang benar-benar menghitung pagination
-        # final di Engine9. Pada Linux/Streamlit, pertahankan w:updateFields=true
-        # dan TOC native agar menu Update Field / Update page numbers only tetap aktif.
-        if os.name == 'nt':
-            self._disable_update_fields_after_finalization(output_docx)
+        # Hasil COM di atas adalah hasil final. Cegah Word mengulang Update All
+        # saat pengguna membuka file dan merusak nomor tersimpan menjadi i/1.
+        self._disable_update_fields_after_finalization(output_docx)
         return output_docx
 
     def process(self, input_docx: Optional[str] = None,
