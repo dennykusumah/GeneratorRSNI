@@ -8,6 +8,9 @@ lxml>=5.3
 # Layanan terjemahan Engine 8
 deep-translator>=1.11.4
 
+# Gemini 2.5 Flash untuk pemulihan terjemahan Engine 8
+google-genai>=1.0.0
+
 # Dukungan pembacaan kamus Excel lokal pada Engine 8
 pandas>=2.2
 openpyxl>=3.1.5
