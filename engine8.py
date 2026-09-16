@@ -76,6 +76,11 @@ _EM_DASH = '—'
 
 ENGINE8_POLICY_VERSION = "2026.09-cache-v2-quality-gate"
 ENGINE8_PROVIDER_VERSION = "deep-translator-google+mymemory-v1"
+GEMINI_RECOVERY_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+GEMINI_RECOVERY_VERSION = "gemini-recovery-v2-microbatch"
+GEMINI_RECOVERY_MAX_ITEMS = int(os.getenv("GEMINI_RECOVERY_MAX_ITEMS", "8"))
+GEMINI_RECOVERY_TARGET_CHARS = int(os.getenv("GEMINI_RECOVERY_TARGET_CHARS", "6000"))
+GEMINI_RECOVERY_HARD_CHARS = int(os.getenv("GEMINI_RECOVERY_HARD_CHARS", "10000"))
 _ENGINE8_L1_MAX_ENTRIES = 5000
 _ENGINE8_L2_MAX_ENTRIES = 100000
 _ENGINE8_NEGATIVE_TTL = 60
@@ -1579,6 +1584,273 @@ class _Translator:
             _ENGINE8_TRANSLATION_CACHE.finish(cache_key)
         return result, italic_terms_found
 
+
+
+def _get_gemini_api_key() -> str:
+    """Ambil Gemini API key tanpa pernah menuliskannya di source code."""
+    key = (os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY") or "").strip()
+    if key:
+        return key
+    # Streamlit Cloud lazim menyimpan secret di st.secrets. Import dibuat
+    # opsional agar engine8 tetap dapat dipakai sebagai modul Python biasa.
+    try:
+        import streamlit as st
+        for name in ("GEMINI_API_KEY", "GOOGLE_API_KEY"):
+            try:
+                value = str(st.secrets.get(name, "") or "").strip()
+            except Exception:
+                value = ""
+            if value:
+                return value
+    except Exception:
+        pass
+    return ""
+
+
+class _GeminiRecoveryTranslator:
+    """Satu tahap pemulihan Gemini 2.5 Flash yang hemat Free Tier.
+
+    Recovery memakai adaptive micro-batch (maks. 8 unit / target 6000 karakter),
+    concurrency=1, thinking=0, structured JSON, cache terpisah, serta seluruh
+    proteksi Kamus SNI/Kamus Istilah Asing yang sudah dimiliki Engine 8.
+    Tidak ada recovery AI kedua: item yang ditolak quality gate tetap gagal dan
+    kemudian dipertahankan dalam bahasa Inggris/merah oleh pipeline.
+    """
+
+    def __init__(self, source: str = 'auto', target: str = 'id',
+                 custom_dict: CustomDictionary | None = None,
+                 italic_dict: ItalicDictionary | None = None,
+                 dictionary_fingerprint: str = ''):
+        try:
+            from google import genai
+            from google.genai import types
+        except ImportError as exc:
+            raise ImportError("Jalankan: pip install -U google-genai") from exc
+        api_key = _get_gemini_api_key()
+        if not api_key:
+            raise RuntimeError(
+                "GEMINI_API_KEY belum diset. Isi di Streamlit Secrets atau "
+                "environment variable GEMINI_API_KEY."
+            )
+        self.source = source; self.target = target
+        self.custom_dict = custom_dict; self.italic_dict = italic_dict
+        self.failed_texts: list[str] = []
+        self.dictionary_fingerprint = dictionary_fingerprint or _canonical_dictionary_fingerprint(custom_dict, italic_dict)
+        self.model = GEMINI_RECOVERY_MODEL
+        self._client = genai.Client(api_key=api_key)
+        self._types = types
+        # Key yang SUDAH mendapat satu kesempatan AI tetapi gagal validasi.
+        # translate_one tidak akan mengirimnya lagi: tetap satu pemulihan.
+        self._batch_failed_keys: set[str] = set()
+
+    def _cache_key(self, text: str, italic_map=None) -> str:
+        fp = "|".join((self.dictionary_fingerprint, GEMINI_RECOVERY_VERSION, self.model))
+        return _ENGINE8_TRANSLATION_CACHE.make_key(text, self.source, self.target, fp, italic_map)
+
+    def _prepare(self, text: str, italic_map=None):
+        original = text
+        t = text.strip()
+        token_map = {}
+        if self.custom_dict and len(self.custom_dict) > 0:
+            t, token_map = self.custom_dict._apply_pre(t)
+        return original, t, token_map, (italic_map or {})
+
+    @staticmethod
+    def _candidate_ok(source: str, candidate: str) -> bool:
+        if not candidate or not _translation_quality_ok(source, candidate):
+            return False
+        expected = {x.casefold() for x in _RE_PROTECTION_TOKEN.findall(source)}
+        returned = {x.casefold() for x in _RE_PROTECTION_TOKEN.findall(candidate)}
+        if expected != returned:
+            return False
+        src_plain = _RE_PROTECTION_TOKEN.sub('', source)
+        dst_plain = _RE_PROTECTION_TOKEN.sub('', candidate)
+        if (re.search(r'[A-Za-z]{3}', src_plain) and
+            re.sub(r'\s+', ' ', src_plain).strip().casefold() ==
+            re.sub(r'\s+', ' ', dst_plain).strip().casefold()):
+            return False
+        return True
+
+    def _config(self, schema=None):
+        kw = dict(temperature=0, max_output_tokens=8192)
+        # google-genai modern: thinking 0 = latency/token lebih rendah.
+        try:
+            kw['thinking_config'] = self._types.ThinkingConfig(thinking_budget=0)
+        except Exception:
+            pass
+        if schema is not None:
+            kw['response_mime_type'] = 'application/json'
+            kw['response_schema'] = schema
+        return self._types.GenerateContentConfig(**kw)
+
+    def _generate_batch(self, rows: list[dict]) -> dict[str, str]:
+        payload = json.dumps(rows, ensure_ascii=False, separators=(',', ':'))
+        prompt = (
+            "Anda adalah penerjemah standar teknis ISO/IEC ke Bahasa Indonesia baku untuk rancangan SNI. "
+            "Terjemahkan SETIAP item secara independen. Jangan menjelaskan, meringkas, menambah, atau mengurangi isi. "
+            "Pertahankan semua angka, desimal, nomor pasal, simbol, satuan, rumus, tanda baca teknis, dan setiap token "
+            "ZXQ...QXZ PERSIS. Token adalah placeholder dan dilarang diubah/dihapus/dipisah. "
+            "Gunakan bahasa teknis formal; 'shall' normatif umumnya 'harus'. "
+            "Kembalikan tepat satu hasil untuk setiap id dalam JSON terstruktur.\nITEM:\n" + payload
+        )
+        schema = {
+            'type': 'OBJECT',
+            'properties': {
+                'translations': {
+                    'type': 'ARRAY',
+                    'items': {
+                        'type': 'OBJECT',
+                        'properties': {
+                            'id': {'type': 'STRING'},
+                            'text': {'type': 'STRING'},
+                        },
+                        'required': ['id', 'text'],
+                    },
+                },
+            },
+            'required': ['translations'],
+        }
+        response = self._client.models.generate_content(
+            model=self.model, contents=prompt, config=self._config(schema)
+        )
+        raw = (getattr(response, 'text', None) or '').strip()
+        data = json.loads(raw)
+        out = {}
+        for item in data.get('translations', []):
+            iid = str(item.get('id', ''))
+            if iid:
+                out[iid] = str(item.get('text', '') or '').strip()
+        return out
+
+    def _chunks(self, jobs: list[dict]):
+        batch=[]; chars=0
+        max_items=max(1, min(GEMINI_RECOVERY_MAX_ITEMS, 8))
+        target=max(1000, GEMINI_RECOVERY_TARGET_CHARS)
+        hard=max(target, GEMINI_RECOVERY_HARD_CHARS)
+        for job in jobs:
+            n=len(job['protected'])
+            # Teks sangat panjang tetap satu unit/request; jangan pecah semantik.
+            if batch and (len(batch) >= max_items or chars+n > target or chars+n > hard):
+                yield batch; batch=[]; chars=0
+            batch.append(job); chars += n
+            if chars >= target or chars >= hard or len(batch) >= max_items:
+                yield batch; batch=[]; chars=0
+        if batch: yield batch
+
+    def prewarm(self, requests: list[tuple[str, dict]]) -> None:
+        """Terjemahkan semua unit recovery dalam micro-batch dan isi cache.
+
+        Satu unit hanya memperoleh satu hasil AI. Retry 429/5xx/timeout adalah
+        retry transport dari request batch yang sama, bukan pemulihan kedua.
+        """
+        jobs=[]; seen=set()
+        for text, italic_map in requests:
+            t0=text.strip()
+            if not t0 or _skip_text(t0):
+                continue
+            key=self._cache_key(t0, italic_map)
+            if key in seen or _ENGINE8_TRANSLATION_CACHE.get(key) is not None:
+                continue
+            seen.add(key)
+            original, protected, token_map, final_italic = self._prepare(t0, italic_map)
+            uncovered = _RE_PROTECTION_TOKEN.sub('', protected)
+            if token_map and not re.findall(r'[A-Za-zÀ-ÿ]{2,}', uncovered):
+                result=self.custom_dict._apply_post(protected, token_map)
+                terms=[]
+                if final_italic:
+                    idict=self.italic_dict if self.italic_dict is not None else ItalicDictionary()
+                    result,terms=idict._apply_post(result, final_italic)
+                _ENGINE8_TRANSLATION_CACHE.put(key,result,terms)
+                continue
+            jobs.append(dict(key=key, original=original, protected=protected,
+                             token_map=token_map, italic_map=final_italic))
+
+        seq=0
+        for chunk in self._chunks(jobs):
+            rows=[]; idmap={}
+            for job in chunk:
+                seq += 1; iid=f'R{seq:06d}'
+                rows.append({'id':iid,'text':job['protected']}); idmap[iid]=job
+            answers=None; last_exc=None
+            # Hanya retry error request/transport. Output invalid TIDAK dikirim ulang.
+            for attempt in range(3):
+                try:
+                    answers=self._generate_batch(rows); break
+                except Exception as exc:
+                    last_exc=exc
+                    if attempt < 2:
+                        # exponential backoff + jitter deterministik ringan tanpa dependency.
+                        time.sleep((1.0 * (2 ** attempt)) + (0.15 * ((seq + attempt) % 4)))
+            if answers is None:
+                for job in chunk:
+                    self._batch_failed_keys.add(job['key'])
+                continue
+            for iid, job in idmap.items():
+                cand=answers.get(iid,'')
+                if not self._candidate_ok(job['protected'], cand):
+                    self._batch_failed_keys.add(job['key']); continue
+                result=cand
+                if job['token_map']:
+                    result=self.custom_dict._apply_post(result, job['token_map'])
+                terms=[]
+                if job['italic_map']:
+                    idict=self.italic_dict if self.italic_dict is not None else ItalicDictionary()
+                    result,terms=idict._apply_post(result, job['italic_map'])
+                if not result or _looks_like_error_response(job['original'], result):
+                    self._batch_failed_keys.add(job['key']); continue
+                _ENGINE8_TRANSLATION_CACHE.put(job['key'], result, terms)
+
+    def translate_one(self, text: str, italic_map: dict = None) -> tuple[str, list[str]]:
+        original=text; t=text.strip()
+        if not t or _skip_text(t): return text, []
+        key=self._cache_key(t, italic_map)
+        cached=_ENGINE8_TRANSLATION_CACHE.get(key)
+        if cached is not None: return cached
+        # Setelah prewarm, key ini berarti sudah memperoleh SATU kesempatan Gemini.
+        if key in self._batch_failed_keys:
+            self.failed_texts.append(re.sub(r'\s+',' ',original).strip()[:100])
+            return original, []
+        # Jalur aman untuk pemanggilan di luar pipeline prewarm (mis. judul):
+        # tetap satu unit/request, tanpa rescue kedua.
+        self.prewarm([(t, italic_map or {})])
+        cached=_ENGINE8_TRANSLATION_CACHE.get(key)
+        if cached is not None: return cached
+        self.failed_texts.append(re.sub(r'\s+',' ',original).strip()[:100])
+        return original, []
+
+
+def _gemini_recovery_requests_for_para(para, tr) -> list[tuple[str, dict]]:
+    """Mirror read-only dari input yang akan diminta _translate_para ke translator.
+    Tidak mengubah DOCX; dipakai untuk micro-batch prewarm Gemini.
+    """
+    if _skip_paragraph(para) or _has_hyperlinks(para): return []
+    text_runs=[(i,r) for i,r in enumerate(para.runs) if r.text and r.text.strip()]
+    if not text_runs: return []
+    combined=''.join(r.text for _,r in text_runs).strip()
+    if not combined or _skip_text(combined): return []
+    para_style_italic=_get_para_style_italic(para)
+    segs=_segment_runs_by_format(text_runs, para_style_italic)
+    if any(_is_protected_segment(t,i,v) for t,i,v in segs):
+        req=[]; plain=[]
+        def flush():
+            if not plain: return
+            block=''.join(plain); plain.clear()
+            if not block.strip(): return
+            if tr.italic_dict and len(tr.italic_dict)>0:
+                pre,imap=tr.italic_dict._apply_pre(block)
+            else: pre,imap=block,{}
+            req.append((pre,imap))
+        for seg_text,is_ital,vtype in segs:
+            if _is_protected_segment(seg_text,is_ital,vtype): flush()
+            else: plain.append(seg_text)
+        flush(); return req
+    # Tanpa protected segment, _extract_source_format_map tidak menghasilkan
+    # token sehingga cukup mirror Kamus Istilah Asing sebelum translate_one.
+    if tr.italic_dict and len(tr.italic_dict)>0:
+        combined,imap=tr.italic_dict._apply_pre(combined)
+    else: imap={}
+    return [(combined,imap)]
+
 def _match_capitalization(original: str, translated: str) -> str:
     orig = original.strip(); tran = translated.strip()
     if not orig or not tran: return translated
@@ -2175,37 +2447,65 @@ class DocxFinalTranslatorEngine:
                         f"[progres-total] {done}/{total + len(failed_paras)}",
                     )
 
-            # Hanya bagian yang belum berhasil diterjemahkan yang diulang,
-            # secara berurutan dengan tepat 1 worker.
+            # PEMULIHAN: bagian yang gagal pada Google Translate tidak diulang
+            # dengan provider yang sama. Gunakan Gemini 2.5 Flash secara
+            # berurutan agar hemat RPM free tier dan tetap memakai SELURUH
+            # aturan format/kamus yang sama melalui _translate_para().
             recovery_total = len(failed_paras)
             still_failed = []
             recovery_success = 0
-            recovery_tr = _Translator(
-                self.source_lang, self.target_lang,
-                self.custom_dict, self.italic_dict, dictionary_fingerprint,
-            )
+            recovery_tr = None
+            recovery_init_error = None
+            if recovery_total:
+                try:
+                    recovery_tr = _GeminiRecoveryTranslator(
+                        self.source_lang, self.target_lang,
+                        self.custom_dict, self.italic_dict, dictionary_fingerprint,
+                    )
+                except Exception as exc:
+                    recovery_init_error = exc
+
+            # Satu pemulihan: kumpulkan seluruh unit teks secara read-only lalu
+            # prewarm cache melalui adaptive micro-batch Gemini. Setelah itu
+            # _translate_para memakai hasil cache sambil mempertahankan seluruh
+            # aturan formatting DOCX yang sudah ada.
+            if recovery_tr is not None:
+                recovery_requests = []
+                for _, _para in sorted(failed_paras, key=lambda item: item[0]):
+                    recovery_requests.extend(
+                        _gemini_recovery_requests_for_para(_para, recovery_tr)
+                    )
+                recovery_tr.prewarm(recovery_requests)
+
             for recovery_done, (index, para) in enumerate(
                     sorted(failed_paras, key=lambda item: item[0]), start=1):
-                before = len(recovery_tr.failed_texts)
-                found = _translate_para(para, recovery_tr)
-                failed = len(recovery_tr.failed_texts) > before
+                if recovery_tr is None:
+                    failed = True
+                    found = []
+                else:
+                    before = len(recovery_tr.failed_texts)
+                    found = _translate_para(para, recovery_tr)
+                    failed = len(recovery_tr.failed_texts) > before
+
                 if failed:
                     still_failed.append(para)
                 else:
                     recovery_success += 1
                     translated_count += 1
                     italic_count += len(found)
-                # Pemulihan memakai rentang 90%--98%, dihitung murni dari
-                # counter recovery_done/recovery_total (YY/YY).
+
                 pct = 90 + int(recovery_done / max(recovery_total, 1) * 8)
-                _notify(
-                    progress_callback, pct,
-                    f"[pemulihan 1 worker] {recovery_done}/{recovery_total} | "
+                detail = (
+                    f"[pemulihan Gemini 2.5 Flash] "
+                    f"{recovery_done}/{recovery_total} | "
                     f"berhasil={recovery_success} | "
                     f"gagal={recovery_total - recovery_done + len(still_failed)} "
                     f"| [progres-total] {total + recovery_done}/"
-                    f"{total + recovery_total}",
+                    f"{total + recovery_total}"
                 )
+                if recovery_init_error is not None:
+                    detail += f" | Gemini tidak aktif: {recovery_init_error}"
+                _notify(progress_callback, pct, detail)
 
             # Dipakai ringkasan dan UI peringatan. Dokumen parsial tetap
             # disimpan agar dapat di-download atau dipaksa lanjut ke Engine 9.
@@ -2235,7 +2535,7 @@ class DocxFinalTranslatorEngine:
             if still_failed:
                 return False, (
                     f"{len(still_failed)} bagian masih belum berhasil "
-                    "diterjemahkan setelah pemulihan 1 worker. Dokumen parsial "
+                    "diterjemahkan setelah pemulihan Gemini 2.5 Flash. Dokumen parsial "
                     "Engine 8 sudah disimpan; teks sumber yang gagal diberi "
                     "font merah dan dapat di-download atau "
                     "dipaksa lanjut ke Engine 9."
