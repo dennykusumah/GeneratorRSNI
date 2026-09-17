@@ -1445,8 +1445,8 @@ class _GoogleTranslateCoordinator:
         self._open_until = 0.0
         self._probe_in_flight = False
         self._strike = 0
-        self._base_cooldown = float(os.getenv("GOOGLE_TRANSLATE_COOLDOWN", "10"))
-        self._max_cooldown = float(os.getenv("GOOGLE_TRANSLATE_MAX_COOLDOWN", "60"))
+        self._base_cooldown = float(os.getenv("GOOGLE_TRANSLATE_COOLDOWN", "5"))
+        self._max_cooldown = float(os.getenv("GOOGLE_TRANSLATE_MAX_COOLDOWN", "30"))
         self.last_code = None
 
     def permit_google(self) -> tuple[bool, bool]:
@@ -1508,6 +1508,7 @@ class _SharedFallbackCoordinator:
         self._strike = 0
         self._base = float(os.getenv(base_env, str(base_default)))
         self._max = float(os.getenv(max_env, str(max_default)))
+        self._schedule = None
         self.last_code = None
 
     def permit(self) -> tuple[bool, bool]:
@@ -1534,7 +1535,10 @@ class _SharedFallbackCoordinator:
             self._probe_in_flight = False
             self.last_code = code
             self._strike = min(self._strike + 1, 5)
-            delay = min(self._max, self._base * (2 ** (self._strike - 1)))
+            if self._schedule:
+                delay = self._schedule[min(self._strike - 1, len(self._schedule) - 1)]
+            else:
+                delay = min(self._max, self._base * (2 ** (self._strike - 1)))
             self._open_until = max(
                 self._open_until,
                 time.monotonic() + delay + random.uniform(0.15, 0.75),
@@ -1550,15 +1554,19 @@ class _SharedFallbackCoordinator:
             return f"{self.name} normal"
 
 
+# Gemini tidak memakai cooldown global pada 429: _GeminiRecoveryTranslator
+# langsung memindahkan request ke API key berikutnya sampai pool habis.
 _GEMINI_COORDINATOR = _SharedFallbackCoordinator(
-    'Gemini', 'GEMINI_FALLBACK_COOLDOWN', 'GEMINI_FALLBACK_MAX_COOLDOWN', 8, 60
+    'Gemini', 'GEMINI_FALLBACK_COOLDOWN', 'GEMINI_FALLBACK_MAX_COOLDOWN', 0, 0
 )
 _ARGOS_COORDINATOR = _SharedFallbackCoordinator(
-    'Argos', 'ARGOS_FALLBACK_COOLDOWN', 'ARGOS_FALLBACK_MAX_COOLDOWN', 3, 20
+    'Argos', 'ARGOS_FALLBACK_COOLDOWN', 'ARGOS_FALLBACK_MAX_COOLDOWN', 5, 30
 )
+_ARGOS_COORDINATOR._schedule = [5.0, 10.0, 20.0, 30.0]
 _MYMEMORY_COORDINATOR = _SharedFallbackCoordinator(
-    'MyMemory', 'MYMEMORY_FALLBACK_COOLDOWN', 'MYMEMORY_FALLBACK_MAX_COOLDOWN', 12, 90
+    'MyMemory', 'MYMEMORY_FALLBACK_COOLDOWN', 'MYMEMORY_FALLBACK_MAX_COOLDOWN', 3, 15
 )
+_MYMEMORY_COORDINATOR._schedule = [3.0, 5.0, 10.0, 15.0]
 
 _ARGOS_INIT_LOCK = threading.Lock()
 _ARGOS_TRANSLATE_LOCK = threading.Lock()  # model lokal: hindari N inferensi berat serentak
@@ -1569,11 +1577,11 @@ _ARGOS_INIT_COOLDOWN_UNTIL = 0.0
 
 
 def _argos_init_cooldown_seconds(failures: int) -> float:
-    """Backoff inisialisasi Argos agar Streamlit tidak mengunduh model berulang-ulang."""
-    base = max(5.0, float(os.getenv('ARGOS_INIT_COOLDOWN', '30')))
-    maximum = max(base, float(os.getenv('ARGOS_INIT_MAX_COOLDOWN', '300')))
-    # 30, 60, 120, 240, 300 ... (default), plus jitter kecil.
-    return min(maximum, base * (2 ** max(0, failures - 1))) + random.uniform(0.25, 1.25)
+    """Cooldown init Argos: 5 -> 10 -> 20 -> maksimum 30 detik."""
+    schedule = (5.0, 10.0, 20.0, 30.0)
+    configured_max = max(5.0, float(os.getenv('ARGOS_INIT_MAX_COOLDOWN', '30')))
+    delay = schedule[min(max(1, failures) - 1, len(schedule) - 1)]
+    return min(configured_max, delay) + random.uniform(0.15, 0.65)
 
 
 def _argos_translate(text: str, source: str = 'en', target: str = 'id') -> str:
@@ -1821,17 +1829,24 @@ class _Translator:
 
         def _argos_stage(stage_no: int) -> bool:
             nonlocal result, last_error
+            allowed, probe = _ARGOS_COORDINATOR.permit()
+            if not allowed:
+                last_error = RuntimeError(_ARGOS_COORDINATOR.state())
+                return False
             try:
                 candidate = _argos_translate(t, self.source, self.target)
                 if not _fallback_candidate_ok(t, candidate, expected_tokens):
                     raise RuntimeError('Argos tidak lolos quality gate')
+                _ARGOS_COORDINATOR.success(probe)
                 result = candidate
                 self.last_provider = f'argos-{stage_no}'
                 self.last_error_code = None
                 return True
             except Exception as exc:
                 last_error = exc
-                self.last_error_code = _google_error_code(exc)
+                code = _google_error_code(exc)
+                self.last_error_code = code
+                _ARGOS_COORDINATOR.failure(code, probe)
                 return False
 
         # GELOMBANG 1: Google -> Gemini seluruh key.
@@ -1870,19 +1885,26 @@ class _Translator:
             _argos_stage(3)
 
         if result is None:
-            try:
-                from deep_translator import MyMemoryTranslator
-                mm_source = 'en-GB' if self.source in ('auto', 'en') else self.source
-                mm_target = 'id-ID' if self.target == 'id' else self.target
-                candidate = MyMemoryTranslator(source=mm_source, target=mm_target).translate(t)
-                if not _fallback_candidate_ok(t, candidate, expected_tokens):
-                    raise RuntimeError('MyMemory tidak lolos quality gate')
-                result = candidate
-                self.last_provider = 'mymemory-3'
-                self.last_error_code = None
-            except Exception as exc:
-                last_error = exc
-                self.last_error_code = _google_error_code(exc)
+            allowed, probe = _MYMEMORY_COORDINATOR.permit()
+            if allowed:
+                try:
+                    from deep_translator import MyMemoryTranslator
+                    mm_source = 'en-GB' if self.source in ('auto', 'en') else self.source
+                    mm_target = 'id-ID' if self.target == 'id' else self.target
+                    candidate = MyMemoryTranslator(source=mm_source, target=mm_target).translate(t)
+                    if not _fallback_candidate_ok(t, candidate, expected_tokens):
+                        raise RuntimeError('MyMemory tidak lolos quality gate')
+                    _MYMEMORY_COORDINATOR.success(probe)
+                    result = candidate
+                    self.last_provider = 'mymemory-3'
+                    self.last_error_code = None
+                except Exception as exc:
+                    last_error = exc
+                    code = _google_error_code(exc)
+                    self.last_error_code = code
+                    _MYMEMORY_COORDINATOR.failure(code, probe)
+            else:
+                last_error = RuntimeError(_MYMEMORY_COORDINATOR.state())
 
         if result is None:
             # Judul standar lazim terdiri dari beberapa klausa yang dipisahkan
@@ -2348,7 +2370,7 @@ def _get_deepl_api_key() -> str:
 
 
 def _deepl_translate(text: str, source: str = 'auto', target: str = 'id') -> str:
-    """DeepL API Free/Pro. Endpoint dipilih otomatis dari suffix key :fx."""
+    """DeepL API Free/Pro; pada 429/5xx utamakan Retry-After bila tersedia."""
     import requests
     key = _get_deepl_api_key()
     if not key:
@@ -2358,19 +2380,35 @@ def _deepl_translate(text: str, source: str = 'auto', target: str = 'id') -> str
     data = {'text': text, 'target_lang': 'ID'}
     if source not in ('auto', '', None):
         data['source_lang'] = 'EN' if source == 'en' else str(source).upper()
-    response = requests.post(
-        endpoint,
-        headers={'Authorization': f'DeepL-Auth-Key {key}'},
-        data=data,
-        timeout=25,
-    )
-    if response.status_code >= 400:
+
+    for attempt in range(2):
+        response = requests.post(
+            endpoint,
+            headers={'Authorization': f'DeepL-Auth-Key {key}'},
+            data=data, timeout=25,
+        )
+        if response.status_code < 400:
+            payload = response.json()
+            rows = payload.get('translations') or []
+            if not rows or not rows[0].get('text'):
+                raise RuntimeError('DeepL tidak mengembalikan hasil terjemahan')
+            return str(rows[0]['text'])
+
+        if attempt == 0 and response.status_code in (429, 500, 502, 503, 504):
+            retry_after = response.headers.get('Retry-After')
+            if retry_after:
+                try:
+                    delay = min(30.0, max(0.5, float(retry_after)))
+                except (TypeError, ValueError):
+                    delay = 2.0
+            else:
+                delay = 2.0
+            time.sleep(delay)
+            continue
         raise RuntimeError(f'DeepL HTTP {response.status_code}')
-    payload = response.json()
-    rows = payload.get('translations') or []
-    if not rows or not rows[0].get('text'):
-        raise RuntimeError('DeepL tidak mengembalikan hasil terjemahan')
-    return str(rows[0]['text'])
+
+    raise RuntimeError('DeepL gagal setelah retry')
+
 
 
 class _RecoveryFallbackTranslator:
@@ -2462,28 +2500,40 @@ class _RecoveryFallbackTranslator:
                 errors.append(f'Gemini:{_gemini_status_code(exc) or type(exc).__name__}')
                 self.last_error_code = _gemini_status_code(exc)
 
-        # 3) Argos Translate.
+        # 3) Argos Translate -- shared cooldown 5 -> 10 -> 20 -> max 30 detik.
         if result is None:
-            try:
-                candidate = _argos_translate(protected, self.source, self.target)
-                if not _fallback_candidate_ok(protected, candidate, expected_tokens):
-                    raise RuntimeError('Argos tidak lolos quality gate')
-                result = candidate; self.last_provider = 'argos'; self.last_error_code = None
-            except Exception as exc:
-                errors.append(f'Argos:{type(exc).__name__}')
+            allowed, probe = _ARGOS_COORDINATOR.permit()
+            if allowed:
+                try:
+                    candidate = _argos_translate(protected, self.source, self.target)
+                    if not _fallback_candidate_ok(protected, candidate, expected_tokens):
+                        raise RuntimeError('Argos tidak lolos quality gate')
+                    _ARGOS_COORDINATOR.success(probe)
+                    result = candidate; self.last_provider = 'argos'; self.last_error_code = None
+                except Exception as exc:
+                    _ARGOS_COORDINATOR.failure(_google_error_code(exc), probe)
+                    errors.append(f'Argos:{type(exc).__name__}')
+            else:
+                errors.append(f'Argos:{_ARGOS_COORDINATOR.state()}')
 
-        # 4) MyMemory.
+        # 4) MyMemory -- shared cooldown 3 -> 5 -> 10 -> max 15 detik.
         if result is None:
-            try:
-                from deep_translator import MyMemoryTranslator
-                mm_source = 'en-GB' if self.source in ('auto', 'en') else self.source
-                mm_target = 'id-ID' if self.target == 'id' else self.target
-                candidate = MyMemoryTranslator(source=mm_source, target=mm_target).translate(protected)
-                if not _fallback_candidate_ok(protected, candidate, expected_tokens):
-                    raise RuntimeError('MyMemory tidak lolos quality gate')
-                result = candidate; self.last_provider = 'mymemory'; self.last_error_code = None
-            except Exception as exc:
-                errors.append(f'MyMemory:{_google_error_code(exc) or type(exc).__name__}')
+            allowed, probe = _MYMEMORY_COORDINATOR.permit()
+            if allowed:
+                try:
+                    from deep_translator import MyMemoryTranslator
+                    mm_source = 'en-GB' if self.source in ('auto', 'en') else self.source
+                    mm_target = 'id-ID' if self.target == 'id' else self.target
+                    candidate = MyMemoryTranslator(source=mm_source, target=mm_target).translate(protected)
+                    if not _fallback_candidate_ok(protected, candidate, expected_tokens):
+                        raise RuntimeError('MyMemory tidak lolos quality gate')
+                    _MYMEMORY_COORDINATOR.success(probe)
+                    result = candidate; self.last_provider = 'mymemory'; self.last_error_code = None
+                except Exception as exc:
+                    _MYMEMORY_COORDINATOR.failure(_google_error_code(exc), probe)
+                    errors.append(f'MyMemory:{_google_error_code(exc) or type(exc).__name__}')
+            else:
+                errors.append(f'MyMemory:{_MYMEMORY_COORDINATOR.state()}')
 
         # 5) DeepL -- provider terakhir sebelum dinyatakan gagal.
         if result is None:
