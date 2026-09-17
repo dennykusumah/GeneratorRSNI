@@ -1909,9 +1909,9 @@ def _get_gemini_api_keys() -> list[str]:
 def _gemini_auth_error(exc: Exception) -> bool:
     """True hanya untuk error autentikasi/otorisasi yang layak failover key.
 
-    429/5xx/timeout sengaja BUKAN auth error: kondisi tersebut ditangani retry
-    transport pada key aktif, sehingga backup tidak dipakai untuk mengakali
-    rate limit project.
+    401/403 menandakan credential bermasalah. Error 429 ditangani terpisah
+    oleh pool Gemini: request langsung mencoba key berikutnya sampai seluruh
+    key yang tersedia sudah memperoleh satu kesempatan.
     """
     status = _gemini_status_code(exc)
     if status in (401, 403):
@@ -2058,21 +2058,40 @@ class _GeminiRecoveryTranslator:
         return True
 
     def _generate_content_with_failover(self, *, prompt: str, config):
-        """Generate dengan failover hanya pada 401/403/invalid credential.
+        """Generate dengan failover key berurutan.
 
-        Rate limit (429), server error (5xx), dan timeout dilempar kembali ke
-        caller agar mekanisme exponential backoff yang sudah ada tetap berlaku.
+        401/403/invalid credential dan 429 langsung memindahkan request ke key
+        berikutnya. Setiap key hanya dicoba satu kali untuk request yang sama.
+        Setelah seluruh pool habis, exception terakhir dilempar ke caller agar
+        pipeline dapat berpindah ke provider berikutnya (Argos).
         """
-        try:
-            return self._client.models.generate_content(
-                model=self.model, contents=prompt, config=config
-            )
-        except Exception as exc:
-            if _gemini_auth_error(exc) and self._switch_to_backup_key():
+        last_exc = None
+        tried = 0
+        while tried < len(self._api_keys):
+            key_no = self.active_key_number
+            try:
                 return self._client.models.generate_content(
                     model=self.model, contents=prompt, config=config
                 )
-            raise
+            except Exception as exc:
+                last_exc = exc
+                status = _gemini_status_code(exc)
+                rotate = _gemini_auth_error(exc) or status == 429
+                if not rotate:
+                    raise
+                tried += 1
+                reason = f"HTTP {status}" if status else "credential invalid"
+                if not self._switch_to_backup_key():
+                    self.diagnostics.append(
+                        f"Gemini key {key_no}: {reason}; seluruh {len(self._api_keys)} key telah dicoba."
+                    )
+                    raise
+                self.diagnostics.append(
+                    f"Gemini key {key_no}: {reason}; failover ke key {self.active_key_number}."
+                )
+        if last_exc is not None:
+            raise last_exc
+        raise RuntimeError('Gemini gagal tanpa exception yang dapat diidentifikasi')
 
     def _generate_batch(self, rows: list[dict]) -> dict[str, str]:
         payload = json.dumps(rows, ensure_ascii=False, separators=(',', ':'))
@@ -2170,6 +2189,13 @@ class _GeminiRecoveryTranslator:
                 except Exception as exc:
                     last_exc=exc
                     # Error permanen (mis. 400/404) tidak dibuang waktu dengan retry.
+                    if _gemini_status_code(exc) == 429:
+                        # Seluruh pool sudah dicoba oleh _generate_content_with_failover.
+                        # Jangan mengulang pool/request yang sama; lanjut provider berikutnya.
+                        self.diagnostics.append(
+                            f"Gemini: seluruh key terkena 429 untuk batch ini; failover provider."
+                        )
+                        break
                     if not _gemini_transient_error(exc):
                         self.diagnostics.append(
                             f"Gemini key {self.active_key_number}: request gagal permanen; batch dilewati."
@@ -2219,6 +2245,188 @@ class _GeminiRecoveryTranslator:
         self.failed_texts.append(re.sub(r'\s+',' ',original).strip()[:100])
         return original, []
 
+
+
+def _get_deepl_api_key() -> str:
+    """Ambil DeepL API key dari environment atau Streamlit Secrets."""
+    value = str(os.getenv("DEEPL_API_KEY", "") or os.getenv("DEEPL_AUTH_KEY", "")).strip()
+    if value:
+        return value
+    try:
+        import streamlit as st
+        for name in ("DEEPL_API_KEY", "DEEPL_AUTH_KEY"):
+            try:
+                value = str(st.secrets.get(name, "") or "").strip()
+                if value:
+                    return value
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return ""
+
+
+def _deepl_translate(text: str, source: str = 'auto', target: str = 'id') -> str:
+    """DeepL API Free/Pro. Endpoint dipilih otomatis dari suffix key :fx."""
+    import requests
+    key = _get_deepl_api_key()
+    if not key:
+        raise RuntimeError('DEEPL_API_KEY belum tersedia')
+    endpoint = ('https://api-free.deepl.com/v2/translate'
+                if key.endswith(':fx') else 'https://api.deepl.com/v2/translate')
+    data = {'text': text, 'target_lang': 'ID'}
+    if source not in ('auto', '', None):
+        data['source_lang'] = 'EN' if source == 'en' else str(source).upper()
+    response = requests.post(
+        endpoint,
+        headers={'Authorization': f'DeepL-Auth-Key {key}'},
+        data=data,
+        timeout=25,
+    )
+    if response.status_code >= 400:
+        raise RuntimeError(f'DeepL HTTP {response.status_code}')
+    payload = response.json()
+    rows = payload.get('translations') or []
+    if not rows or not rows[0].get('text'):
+        raise RuntimeError('DeepL tidak mengembalikan hasil terjemahan')
+    return str(rows[0]['text'])
+
+
+class _RecoveryFallbackTranslator:
+    """Pemulihan serial (1 worker): Google -> Gemini key 1..15 -> Argos ->
+    MyMemory -> DeepL -> gagal.
+
+    Setiap unit teks melewati provider secara berurutan. Gemini selalu mulai
+    dari API key 1; 401/403/429 akan mencoba key berikutnya sampai pool habis.
+    Microsoft Translator dan Yandex tidak digunakan.
+    """
+    def __init__(self, source='auto', target='id', custom_dict=None,
+                 italic_dict=None, dictionary_fingerprint=''):
+        try:
+            from deep_translator import GoogleTranslator
+        except ImportError as exc:
+            raise ImportError('Jalankan: pip install deep-translator') from exc
+        self.source = source; self.target = target
+        self.custom_dict = custom_dict; self.italic_dict = italic_dict
+        self.dictionary_fingerprint = dictionary_fingerprint or _canonical_dictionary_fingerprint(custom_dict, italic_dict)
+        self.failed_texts = []
+        self.last_provider = None
+        self.last_error_code = None
+        self.diagnostics = []
+        self._google = GoogleTranslator(source=source, target=target)
+        keys = _get_gemini_api_keys()
+        self._gemini = (_GeminiRecoveryTranslator(
+            source, target, custom_dict, italic_dict,
+            self.dictionary_fingerprint, api_keys=keys
+        ) if keys else None)
+
+    def translate_one(self, text: str, italic_map: dict = None):
+        original = text
+        t = text.strip()
+        if not t or _skip_text(t):
+            return text, []
+        italic_map = italic_map or {}
+        cache_key = _ENGINE8_TRANSLATION_CACHE.make_key(
+            t, self.source, self.target,
+            self.dictionary_fingerprint + '|recovery-multilevel-v1', italic_map
+        )
+        cached = _ENGINE8_TRANSLATION_CACHE.get(cache_key)
+        if cached is not None:
+            return cached
+
+        token_map = {}
+        protected = t
+        if self.custom_dict and len(self.custom_dict) > 0:
+            protected, token_map = self.custom_dict._apply_pre(protected)
+        uncovered = _RE_PROTECTION_TOKEN.sub('', protected)
+        if token_map and not re.findall(r'[A-Za-zÀ-ÿ]{2,}', uncovered):
+            result = self.custom_dict._apply_post(protected, token_map)
+            terms = []
+            if italic_map:
+                idict = self.italic_dict if self.italic_dict is not None else ItalicDictionary()
+                result, terms = idict._apply_post(result, italic_map)
+            _ENGINE8_TRANSLATION_CACHE.put(cache_key, result, terms)
+            return result, terms
+
+        expected_tokens = {x.casefold() for x in _RE_PROTECTION_TOKEN.findall(protected)}
+        result = None
+        errors = []
+
+        # 1) Google Translate -- tepat satu request pada tahap pemulihan.
+        try:
+            candidate = self._google.translate(protected)
+            if not _fallback_candidate_ok(protected, candidate, expected_tokens):
+                raise RuntimeError('Google tidak lolos quality gate')
+            result = candidate; self.last_provider = 'google'; self.last_error_code = None
+        except Exception as exc:
+            errors.append(f'Google:{_google_error_code(exc) or type(exc).__name__}')
+            self.last_error_code = _google_error_code(exc)
+
+        # 2) Gemini -- mulai key 1 dan failover 429/auth sampai key 15/pool habis.
+        if result is None and self._gemini is not None:
+            try:
+                # Setiap unit pemulihan selalu mulai lagi dari API key 1.
+                self._gemini._active_key_index = 0
+                self._gemini._client = self._gemini._genai.Client(
+                    api_key=self._gemini._api_keys[0]
+                )
+                # Pakai protected text sehingga token Kamus SNI tetap identik.
+                rows = [{'id': 'R000001', 'text': protected}]
+                answers = self._gemini._generate_batch(rows)
+                candidate = answers.get('R000001', '')
+                if not _fallback_candidate_ok(protected, candidate, expected_tokens):
+                    raise RuntimeError('Gemini tidak lolos quality gate')
+                result = candidate; self.last_provider = 'gemini'; self.last_error_code = None
+            except Exception as exc:
+                errors.append(f'Gemini:{_gemini_status_code(exc) or type(exc).__name__}')
+                self.last_error_code = _gemini_status_code(exc)
+
+        # 3) Argos Translate.
+        if result is None:
+            try:
+                candidate = _argos_translate(protected, self.source, self.target)
+                if not _fallback_candidate_ok(protected, candidate, expected_tokens):
+                    raise RuntimeError('Argos tidak lolos quality gate')
+                result = candidate; self.last_provider = 'argos'; self.last_error_code = None
+            except Exception as exc:
+                errors.append(f'Argos:{type(exc).__name__}')
+
+        # 4) MyMemory.
+        if result is None:
+            try:
+                from deep_translator import MyMemoryTranslator
+                mm_source = 'en-GB' if self.source in ('auto', 'en') else self.source
+                mm_target = 'id-ID' if self.target == 'id' else self.target
+                candidate = MyMemoryTranslator(source=mm_source, target=mm_target).translate(protected)
+                if not _fallback_candidate_ok(protected, candidate, expected_tokens):
+                    raise RuntimeError('MyMemory tidak lolos quality gate')
+                result = candidate; self.last_provider = 'mymemory'; self.last_error_code = None
+            except Exception as exc:
+                errors.append(f'MyMemory:{_google_error_code(exc) or type(exc).__name__}')
+
+        # 5) DeepL -- provider terakhir sebelum dinyatakan gagal.
+        if result is None:
+            try:
+                candidate = _deepl_translate(protected, self.source, self.target)
+                if not _fallback_candidate_ok(protected, candidate, expected_tokens):
+                    raise RuntimeError('DeepL tidak lolos quality gate')
+                result = candidate; self.last_provider = 'deepl'; self.last_error_code = None
+            except Exception as exc:
+                errors.append(f'DeepL:{_google_error_code(exc) or type(exc).__name__}')
+
+        if result is None:
+            self.failed_texts.append(re.sub(r'\s+', ' ', original).strip()[:100])
+            self.diagnostics.append(' -> '.join(errors))
+            return original, []
+
+        if token_map:
+            result = self.custom_dict._apply_post(result, token_map)
+        terms = []
+        if italic_map:
+            idict = self.italic_dict if self.italic_dict is not None else ItalicDictionary()
+            result, terms = idict._apply_post(result, italic_map)
+        _ENGINE8_TRANSLATION_CACHE.put(cache_key, result, terms)
+        return result, terms
 
 def _gemini_recovery_requests_for_para(para, tr) -> list[tuple[str, dict]]:
     """Mirror read-only dari input yang akan diminta _translate_para ke translator.
@@ -2849,46 +3057,22 @@ class DocxFinalTranslatorEngine:
                         f"[progres-total] {done}/{total + len(failed_paras)}",
                     )
 
-            # PEMULIHAN: bagian yang gagal pada Google Translate tidak diulang
-            # dengan provider yang sama. Gunakan Gemini 2.5 Flash secara
-            # berurutan agar hemat RPM free tier dan tetap memakai SELURUH
-            # aturan format/kamus yang sama melalui _translate_para().
+            # PEMULIHAN SERIAL (1 worker): Google -> Gemini API 1..15 ->
+            # Argos -> MyMemory -> DeepL -> gagal. Tidak memakai Microsoft/Yandex.
             recovery_total = len(failed_paras)
             still_failed = []
             recovery_success = 0
-            recovery_tr = None
-            recovery_init_error = None
-            if recovery_total:
-                try:
-                    recovery_tr = _GeminiRecoveryTranslator(
-                        self.source_lang, self.target_lang,
-                        self.custom_dict, self.italic_dict, dictionary_fingerprint,
-                    )
-                except Exception as exc:
-                    recovery_init_error = exc
+            recovery_tr = _RecoveryFallbackTranslator(
+                self.source_lang, self.target_lang, self.custom_dict,
+                self.italic_dict, dictionary_fingerprint
+            ) if recovery_total else None
 
-            # Satu pemulihan: kumpulkan seluruh unit teks secara read-only lalu
-            # prewarm cache melalui adaptive micro-batch Gemini. Setelah itu
-            # _translate_para memakai hasil cache sambil mempertahankan seluruh
-            # aturan formatting DOCX yang sudah ada.
-            if recovery_tr is not None:
-                recovery_requests = []
-                for _, _para in sorted(failed_paras, key=lambda item: item[0]):
-                    recovery_requests.extend(
-                        _gemini_recovery_requests_for_para(_para, recovery_tr)
-                    )
-                recovery_tr.prewarm(recovery_requests)
-
+            # Sengaja serial: tidak ada ThreadPoolExecutor pada tahap pemulihan.
             for recovery_done, (index, para) in enumerate(
                     sorted(failed_paras, key=lambda item: item[0]), start=1):
-                if recovery_tr is None:
-                    failed = True
-                    found = []
-                else:
-                    before = len(recovery_tr.failed_texts)
-                    found = _translate_para(para, recovery_tr)
-                    failed = len(recovery_tr.failed_texts) > before
-
+                before = len(recovery_tr.failed_texts)
+                found = _translate_para(para, recovery_tr)
+                failed = len(recovery_tr.failed_texts) > before
                 if failed:
                     still_failed.append(para)
                 else:
@@ -2897,17 +3081,14 @@ class DocxFinalTranslatorEngine:
                     italic_count += len(found)
 
                 pct = 90 + int(recovery_done / max(recovery_total, 1) * 8)
-                detail = (
-                    f"[pemulihan Gemini 2.5 Flash] "
-                    f"{recovery_done}/{recovery_total} | "
-                    f"berhasil={recovery_success} | "
-                    f"gagal={recovery_total - recovery_done + len(still_failed)} "
-                    f"| [progres-total] {total + recovery_done}/"
-                    f"{total + recovery_total}"
+                _notify(
+                    progress_callback, pct,
+                    f"[pemulihan 1 worker: Google→Gemini(1-15)→Argos→MyMemory→DeepL] "
+                    f"{recovery_done}/{recovery_total} | berhasil={recovery_success} | "
+                    f"gagal={recovery_total - recovery_done + len(still_failed)} | "
+                    f"provider={recovery_tr.last_provider or '-'} | "
+                    f"[progres-total] {total + recovery_done}/{total + recovery_total}"
                 )
-                if recovery_init_error is not None:
-                    detail += f" | Gemini tidak aktif: {recovery_init_error}"
-                _notify(progress_callback, pct, detail)
 
             # Dipakai ringkasan dan UI peringatan. Dokumen parsial tetap
             # disimpan agar dapat di-download atau dipaksa lanjut ke Engine 9.
@@ -2937,7 +3118,7 @@ class DocxFinalTranslatorEngine:
             if still_failed:
                 return False, (
                     f"{len(still_failed)} bagian masih belum berhasil "
-                    "diterjemahkan setelah pemulihan Gemini 2.5 Flash. Dokumen parsial "
+                    "diterjemahkan setelah pemulihan multilevel Google/Gemini/Argos/MyMemory/DeepL. Dokumen parsial "
                     "Engine 8 sudah disimpan; teks sumber yang gagal diberi "
                     "font merah dan dapat di-download atau "
                     "dipaksa lanjut ke Engine 9."
