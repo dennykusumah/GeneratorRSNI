@@ -1564,11 +1564,21 @@ _ARGOS_INIT_LOCK = threading.Lock()
 _ARGOS_TRANSLATE_LOCK = threading.Lock()  # model lokal: hindari N inferensi berat serentak
 _ARGOS_READY = False
 _ARGOS_ERROR = None
+_ARGOS_INIT_FAILURES = 0
+_ARGOS_INIT_COOLDOWN_UNTIL = 0.0
+
+
+def _argos_init_cooldown_seconds(failures: int) -> float:
+    """Backoff inisialisasi Argos agar Streamlit tidak mengunduh model berulang-ulang."""
+    base = max(5.0, float(os.getenv('ARGOS_INIT_COOLDOWN', '30')))
+    maximum = max(base, float(os.getenv('ARGOS_INIT_MAX_COOLDOWN', '300')))
+    # 30, 60, 120, 240, 300 ... (default), plus jitter kecil.
+    return min(maximum, base * (2 ** max(0, failures - 1))) + random.uniform(0.25, 1.25)
 
 
 def _argos_translate(text: str, source: str = 'en', target: str = 'id') -> str:
-    """Terjemahan lokal Argos. Paket bahasa en->id diunduh sekali bila belum ada."""
-    global _ARGOS_READY, _ARGOS_ERROR
+    """Terjemahan lokal Argos; init/download model thread-safe dengan failure cooldown."""
+    global _ARGOS_READY, _ARGOS_ERROR, _ARGOS_INIT_FAILURES, _ARGOS_INIT_COOLDOWN_UNTIL
     try:
         import argostranslate.package as argos_package
         import argostranslate.translate as argos_translate
@@ -1577,9 +1587,22 @@ def _argos_translate(text: str, source: str = 'en', target: str = 'id') -> str:
 
     src = 'en' if source in ('auto', 'en') else source
     dst = 'id' if target in ('id', 'indonesian') else target
+
     if not _ARGOS_READY:
+        # Fast-fail selama cooldown. Semua worker melihat state yang sama dan tidak
+        # mencoba update index/download model secara berulang.
+        remaining = _ARGOS_INIT_COOLDOWN_UNTIL - time.monotonic()
+        if remaining > 0:
+            detail = f': {_ARGOS_ERROR}' if _ARGOS_ERROR else ''
+            raise RuntimeError(f'Inisialisasi Argos cooldown {remaining:.1f}s{detail}')
+
         with _ARGOS_INIT_LOCK:
             if not _ARGOS_READY:
+                # Worker mungkin menunggu lock saat worker lain gagal; cek cooldown lagi.
+                remaining = _ARGOS_INIT_COOLDOWN_UNTIL - time.monotonic()
+                if remaining > 0:
+                    detail = f': {_ARGOS_ERROR}' if _ARGOS_ERROR else ''
+                    raise RuntimeError(f'Inisialisasi Argos cooldown {remaining:.1f}s{detail}')
                 try:
                     installed = argos_translate.get_installed_languages()
                     ok = any(
@@ -1592,12 +1615,34 @@ def _argos_translate(text: str, source: str = 'en', target: str = 'id') -> str:
                         pkg = next((x for x in packages if x.from_code == src and x.to_code == dst), None)
                         if pkg is None:
                             raise RuntimeError(f'Paket Argos {src}->{dst} tidak tersedia')
-                        argos_package.install_from_path(pkg.download())
+                        download_path = pkg.download()
+                        argos_package.install_from_path(download_path)
+
+                    # Verifikasi ulang setelah instalasi; jangan menandai READY hanya
+                    # karena proses install tidak melempar exception.
+                    installed = argos_translate.get_installed_languages()
+                    ok = any(
+                        a.code == src and any(t.code == dst for t in a.translations_to)
+                        for a in installed
+                    )
+                    if not ok:
+                        raise RuntimeError(f'Model Argos {src}->{dst} belum aktif setelah instalasi')
+
                     _ARGOS_READY = True
                     _ARGOS_ERROR = None
+                    _ARGOS_INIT_FAILURES = 0
+                    _ARGOS_INIT_COOLDOWN_UNTIL = 0.0
                 except Exception as exc:
+                    _ARGOS_READY = False
                     _ARGOS_ERROR = exc
-                    raise
+                    _ARGOS_INIT_FAILURES += 1
+                    delay = _argos_init_cooldown_seconds(_ARGOS_INIT_FAILURES)
+                    _ARGOS_INIT_COOLDOWN_UNTIL = time.monotonic() + delay
+                    raise RuntimeError(
+                        f'Inisialisasi Argos gagal; cooldown {delay:.1f}s '
+                        f'(percobaan gagal #{_ARGOS_INIT_FAILURES}): {exc}'
+                    ) from exc
+
     with _ARGOS_TRANSLATE_LOCK:
         return argos_translate.translate(text, src, dst)
 
