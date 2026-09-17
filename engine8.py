@@ -1812,7 +1812,14 @@ class _Translator:
                 gemini_result, gemini_terms = gemini.translate_one(text, italic_map or {})
                 if not gemini_result or gemini_result == text:
                     raise RuntimeError('Gemini tidak menghasilkan terjemahan valid')
-                self.last_provider = f'Gemini Flash API {gemini.active_key_number}'
+                # Tampilkan nomor API berdasarkan urutan GEMINI_API_KEY_1..15
+                # yang asli, bukan posisi key di pool worker yang sudah dirotasi.
+                active_key = worker_gemini_keys[gemini._active_key_index]
+                try:
+                    gemini_api_no = gemini_keys.index(active_key) + 1
+                except ValueError:
+                    gemini_api_no = gemini.active_key_number
+                self.last_provider = f'Gemini API {gemini_api_no}'
                 self.last_error_code = None
                 return True, (gemini_result, gemini_terms)
             except Exception as exc:
@@ -2458,7 +2465,7 @@ class _RecoveryFallbackTranslator:
                 candidate = answers.get('R000001', '')
                 if not _fallback_candidate_ok(protected, candidate, expected_tokens):
                     raise RuntimeError('Gemini tidak lolos quality gate')
-                result = candidate; self.last_provider = f'Gemini Flash API {self._gemini.active_key_number}'; self.last_error_code = None
+                result = candidate; self.last_provider = f'Gemini API {self._gemini.active_key_number}'; self.last_error_code = None
             except Exception as exc:
                 errors.append(f'Gemini:{_gemini_status_code(exc) or type(exc).__name__}')
                 self.last_error_code = _gemini_status_code(exc)
@@ -3134,8 +3141,8 @@ class DocxFinalTranslatorEngine:
                 provider = (provider or 'Google Translate').strip()
                 if provider.lower().startswith('google'):
                     return f'Google Translate {worker_count} worker'
-                if provider.lower().startswith('gemini flash api'):
-                    return provider
+                if provider.lower().startswith('gemini api') or provider.lower().startswith('gemini flash api'):
+                    return provider.replace('Gemini Flash API', 'Gemini API')
                 if provider.lower().startswith('argos'):
                     return 'Argos Translate'
                 if provider.lower().startswith('mymemory'):
