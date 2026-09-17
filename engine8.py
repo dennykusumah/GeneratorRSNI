@@ -3117,6 +3117,7 @@ class DocxFinalTranslatorEngine:
             worker_count = max(1, min(worker_count, 4))
 
             failure_times = deque()
+            main_failed_attempts = 0
 
             def _wait_failure_slot():
                 # Maksimum lima kegagalan yang dikomit ke dashboard per rolling
@@ -3196,6 +3197,7 @@ class DocxFinalTranslatorEngine:
                         if failed:
                             _wait_failure_slot()
                             failure_times.append(time.monotonic())
+                            main_failed_attempts += 1
                             if para is not None:
                                 round_failed.append((index, para))
                         else:
@@ -3203,14 +3205,16 @@ class DocxFinalTranslatorEngine:
                             round_success += 1
                             italic_count += len(found)
 
-                        unresolved_now = len(round_failed) + max(
-                            0, len(remaining_main) - round_success - len(round_failed)
-                        )
+                        # `gagal` pada translate utama adalah jumlah attempt gagal
+                        # aktual. Counter dimulai dari 0, hanya naik saat suatu
+                        # attempt benar-benar gagal, dan tidak pernah turun ketika
+                        # retry berikutnya berhasil. Progress X/Y tetap menghitung
+                        # target unik yang sudah berhasil diterjemahkan.
                         _notify(
                             progress_callback,
                             10 + int(translated_count / max(total, 1) * 80),
                             f"[{current_provider} | {translated_count}/{total} | "
-                            f"berhasil={translated_count} | gagal={unresolved_now}]",
+                            f"berhasil={translated_count} | gagal={main_failed_attempts}]",
                         )
 
                         try:
@@ -3248,20 +3252,20 @@ class DocxFinalTranslatorEngine:
             # Setiap putaran mencoba seluruh rantai:
             # Google -> Gemini 1..15 -> Argos -> MyMemory -> DeepL.
             # Yang sukses dikeluarkan permanen; hanya yang masih gagal di-loop.
-            # Selama ada kemajuan, loop terus. Untuk outage permanen, tiga putaran
-            # recovery penuh tanpa kemajuan menjadi fail-safe agar aplikasi tidak
-            # menggantung tanpa batas dan dokumen parsial tetap bisa ke Engine 9.
+            # Recovery dibatasi maksimal 10 putaran penuh. Setelah putaran ke-10,
+            # sisa yang tetap gagal ditandai merah dan pipeline diteruskan ke
+            # tahap berikutnya (Engine 9); tidak ada recovery tanpa batas.
             recovery_total = len(failed_paras)
             recovery_pending = sorted(failed_paras, key=lambda item: item[0])
             recovery_success = 0
             recovery_round = 0
-            recovery_stagnant_rounds = 0
+            MAX_RECOVERY_ROUNDS = 10
             recovery_tr = _RecoveryFallbackTranslator(
                 self.source_lang, self.target_lang, self.custom_dict,
                 self.italic_dict, dictionary_fingerprint
             ) if recovery_total else None
 
-            while recovery_pending:
+            while recovery_pending and recovery_round < MAX_RECOVERY_ROUNDS:
                 recovery_round += 1
                 next_pending = []
                 round_success = 0
@@ -3294,7 +3298,8 @@ class DocxFinalTranslatorEngine:
                     pct = 90 + int(recovery_success / max(recovery_total, 1) * 8)
                     _notify(
                         progress_callback, pct,
-                        f"[{recovery_provider} | {recovery_success}/{recovery_total} | "
+                        f"[Recovery: {recovery_provider} | "
+                        f"{recovery_success}/{recovery_total} | "
                         f"berhasil={recovery_success} | gagal={unresolved}]"
                     )
 
@@ -3302,12 +3307,11 @@ class DocxFinalTranslatorEngine:
                 if not recovery_pending:
                     break
 
-                if round_success == 0:
-                    recovery_stagnant_rounds += 1
-                else:
-                    recovery_stagnant_rounds = 0
-
-                if recovery_stagnant_rounds >= 3:
+                # Maksimal 10 loop recovery. Bahkan bila satu putaran tidak
+                # menghasilkan kemajuan, recovery tetap mendapat kesempatan pada
+                # putaran berikutnya karena provider/cooldown dapat sudah pulih.
+                # Sesudah loop ke-10, sisa gagal langsung menuju tahap berikutnya.
+                if recovery_round >= MAX_RECOVERY_ROUNDS:
                     break
 
                 # Cooldown bertahap antarputaran recovery. Maksimum 30 detik;
