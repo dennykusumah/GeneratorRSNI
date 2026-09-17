@@ -3240,78 +3240,65 @@ class DocxFinalTranslatorEngine:
             failed_paras = sorted(failed_paras, key=lambda item: item[0])
 
             # -----------------------------------------------------------------
-            # PEMULIHAN BERULANG, SERIAL 1 WORKER
+            # PEMULIHAN SERIAL 1 WORKER -- SELESAI SAAT SEMUA GAGAL SUDAH DIKERJAKAN
             # -----------------------------------------------------------------
-            # Recovery hanya menerima unit yang gagal dari translate utama.
-            # Setiap putaran mencoba seluruh rantai:
+            # Recovery HANYA menerima target yang gagal dari translate utama.
+            # Setiap target recovery dikerjakan SATU KALI melalui seluruh rantai
+            # recovery yang tersedia:
             # Google -> Gemini 1..15 -> Argos -> MyMemory -> DeepL.
-            # Yang sukses dikeluarkan permanen; hanya yang masih gagal di-loop.
-            # Recovery dibatasi maksimal 10 putaran penuh. Setelah putaran ke-10,
-            # sisa yang tetap gagal ditandai merah dan pipeline diteruskan ke
-            # tahap berikutnya (Engine 9); tidak ada recovery tanpa batas.
+            #
+            # Tidak ada lagi batas 10 loop dan tidak ada pengulangan recovery
+            # terhadap target yang sama. Recovery berakhir tepat ketika seluruh
+            # target gagal dari translate utama sudah mendapat satu hasil akhir
+            # recovery (berhasil atau gagal final), sehingga progress selalu
+            # mencapai recovery_total/recovery_total.
             recovery_total = len(failed_paras)
             recovery_pending = sorted(failed_paras, key=lambda item: item[0])
             recovery_success = 0
-            recovery_round = 0
-            MAX_RECOVERY_ROUNDS = 10
+            recovery_failed = 0
+            recovery_processed = 0
             recovery_tr = _RecoveryFallbackTranslator(
                 self.source_lang, self.target_lang, self.custom_dict,
                 self.italic_dict, dictionary_fingerprint
             ) if recovery_total else None
 
-            while recovery_pending and recovery_round < MAX_RECOVERY_ROUNDS:
-                recovery_round += 1
-                next_pending = []
-                round_success = 0
-
-                for index, para in recovery_pending:
-                    before = len(recovery_tr.failed_texts)
-                    try:
-                        found = _translate_para(para, recovery_tr)
-                        failed = len(recovery_tr.failed_texts) > before
-                    except Exception as exc:
-                        found = []
-                        failed = True
-                        recovery_tr.last_provider = recovery_tr.last_provider or 'Google Translate'
-                        recovery_tr.diagnostics.append(
-                            f'Unhandled:{type(exc).__name__}:{exc}'
-                        )
-
-                    if failed:
-                        next_pending.append((index, para))
-                    else:
-                        round_success += 1
-                        recovery_success += 1
-                        translated_count += 1
-                        italic_count += len(found)
-
-                    recovery_provider = recovery_tr.last_provider or 'Google Translate'
-                    unresolved = len(next_pending) + max(
-                        0, len(recovery_pending) - round_success - len(next_pending)
-                    )
-                    pct = 90 + int(recovery_success / max(recovery_total, 1) * 8)
-                    _notify(
-                        progress_callback, pct,
-                        f"[Recovery: {recovery_provider} | "
-                        f"{recovery_success}/{recovery_total} | "
-                        f"berhasil={recovery_success} | gagal={unresolved}]"
+            still_failed_items = []
+            for index, para in recovery_pending:
+                before = len(recovery_tr.failed_texts)
+                try:
+                    found = _translate_para(para, recovery_tr)
+                    failed = len(recovery_tr.failed_texts) > before
+                except Exception as exc:
+                    found = []
+                    failed = True
+                    recovery_tr.last_provider = recovery_tr.last_provider or 'Google Translate'
+                    recovery_tr.diagnostics.append(
+                        f'Unhandled:{type(exc).__name__}:{exc}'
                     )
 
-                recovery_pending = sorted(next_pending, key=lambda item: item[0])
-                if not recovery_pending:
-                    break
+                # Satu target dianggap "dikerjakan" setelah seluruh rantai
+                # recovery untuk target tersebut selesai, apa pun hasil akhirnya.
+                recovery_processed += 1
+                if failed:
+                    recovery_failed += 1
+                    still_failed_items.append((index, para))
+                else:
+                    recovery_success += 1
+                    translated_count += 1
+                    italic_count += len(found)
 
-                # Maksimal 10 loop recovery. Bahkan bila satu putaran tidak
-                # menghasilkan kemajuan, recovery tetap mendapat kesempatan pada
-                # putaran berikutnya karena provider/cooldown dapat sudah pulih.
-                # Sesudah loop ke-10, sisa gagal langsung menuju tahap berikutnya.
-                if recovery_round >= MAX_RECOVERY_ROUNDS:
-                    break
+                recovery_provider = recovery_tr.last_provider or 'Google Translate'
+                pct = 90 + int(recovery_processed / max(recovery_total, 1) * 8)
+                _notify(
+                    progress_callback, pct,
+                    f"[Recovery: {recovery_provider} | "
+                    f"{recovery_processed}/{recovery_total} | "
+                    f"berhasil={recovery_success} | gagal={recovery_failed}]"
+                )
 
-                # Cooldown bertahap antarputaran recovery. Maksimum 30 detik;
-                # memberi kesempatan circuit breaker/provider pulih tanpa spam.
-                recovery_cooldown = min(30.0, 5.0 * (2 ** min(recovery_round - 1, 3)))
-                time.sleep(recovery_cooldown + random.uniform(0.10, 0.50))
+            # Setelah seluruh kegagalan translate utama sudah dikerjakan,
+            # Recovery selesai. Yang tetap gagal menjadi gagal final/merah.
+            recovery_pending = sorted(still_failed_items, key=lambda item: item[0])
 
             still_failed = [para for _, para in recovery_pending]
             # Dipakai ringkasan dan UI peringatan. Dokumen parsial tetap
