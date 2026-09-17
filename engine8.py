@@ -1617,6 +1617,7 @@ def _fallback_candidate_ok(source: str, candidate: str, expected_tokens: set[str
     return True
 
 _GEMINI_WORKER_LOCK = threading.Lock()
+_GOOGLE_RETRY_STAGE_LOCK = threading.Lock()  # serialkan retry Google tahap 2/3 antar-worker
 _GEMINI_WORKER_COUNTER = 0
 
 
@@ -1693,12 +1694,37 @@ class _Translator:
         result = None
         last_error = None
 
-        # Circuit breaker bersama: jika Google sedang cooldown, worker ini tidak
-        # mengirim request Google sama sekali dan langsung memakai Gemini.
-        google_allowed, was_probe = self._coordinator.permit_google()
-        if google_allowed:
-            attempts = 1 if was_probe or _negative_cache_active(cache_key) else 2
-            for attempt in range(1, attempts + 1):
+        # Translator utama memakai tiga gelombang terkontrol:
+        # 1) Google -> seluruh pool Gemini
+        # 2) Google -> seluruh pool Gemini -> Argos
+        # 3) Google -> seluruh pool Gemini -> Argos -> MyMemory
+        # Jika semuanya gagal, unit masuk tahap pemulihan.
+        #
+        # Gemini dibuat ulang pada setiap gelombang agar selalu mulai dari API key
+        # awal milik worker lalu failover berurutan sampai seluruh pool dicoba.
+        gemini_keys = _get_gemini_api_keys()
+        if gemini_keys:
+            start_idx = _next_gemini_worker_key_index(len(gemini_keys))
+            worker_gemini_keys = gemini_keys[start_idx:] + gemini_keys[:start_idx]
+        else:
+            worker_gemini_keys = []
+
+        def _google_stage(stage_no: int) -> bool:
+            nonlocal result, last_error
+            # Tahap pertama tetap menghormati circuit breaker global. Tahap 2/3
+            # adalah retry eksplisit yang diminta pipeline, tetapi diserialkan
+            # antar-worker agar Google tidak dibombardir secara paralel.
+            if stage_no == 1:
+                allowed, probe = self._coordinator.permit_google()
+                if not allowed:
+                    self.last_provider = 'gemini'
+                    return False
+                lock_ctx = contextlib.nullcontext()
+            else:
+                probe = False
+                lock_ctx = _GOOGLE_RETRY_STAGE_LOCK
+
+            with lock_ctx:
                 try:
                     candidate = self._client.translate(t)
                     if not candidate or not _translation_quality_ok(t, candidate):
@@ -1715,93 +1741,103 @@ class _Translator:
                         re.sub(r'\s+', ' ', result_plain).strip().casefold()):
                         raise ValueError('teks dikembalikan tanpa diterjemahkan')
                     result = candidate
-                    self.last_provider = 'google'
+                    self.last_provider = f'google-{stage_no}'
                     self.last_error_code = None
-                    self._coordinator.success(was_probe)
-                    break
+                    self._coordinator.success(probe)
+                    return True
                 except Exception as exc:
                     last_error = exc
                     code = _google_error_code(exc)
                     self.last_error_code = code
-                    # 429/5xx/network membuka circuit untuk SEMUA worker.
-                    if code in (408, 409, 429, 500, 502, 503, 504) or was_probe:
-                        self._coordinator.failure(code, was_probe)
-                        break
-                    if attempt < attempts:
-                        time.sleep(0.45 + random.uniform(0.05, 0.25))
-        else:
-            self.last_provider = 'gemini'
+                    self._coordinator.failure(code, probe)
+                    return False
 
-        # Rantai fallback per elemen:
-        # Google -> Gemini -> Argos (lokal) -> MyMemory -> gagal.
-        # Setiap provider memiliki circuit breaker global sehingga kegagalan pada
-        # satu worker membuat worker lain tidak membombardir provider yang sama.
+        def _gemini_stage(stage_no: int) -> tuple[bool, tuple[str, list[str]] | None]:
+            nonlocal last_error
+            if not worker_gemini_keys:
+                last_error = RuntimeError('Gemini API key belum tersedia')
+                return False, None
+            try:
+                # Instance baru = kembali ke API key awal worker pada setiap gelombang.
+                gemini = _GeminiRecoveryTranslator(
+                    self.source, self.target, self.custom_dict, self.italic_dict,
+                    self.dictionary_fingerprint, api_keys=worker_gemini_keys,
+                )
+                gemini_result, gemini_terms = gemini.translate_one(text, italic_map or {})
+                if not gemini_result or gemini_result == text:
+                    raise RuntimeError('Gemini tidak menghasilkan terjemahan valid')
+                self.last_provider = f'gemini-{stage_no}'
+                self.last_error_code = None
+                return True, (gemini_result, gemini_terms)
+            except Exception as exc:
+                last_error = exc
+                self.last_error_code = _gemini_status_code(exc)
+                return False, None
+
+        def _argos_stage(stage_no: int) -> bool:
+            nonlocal result, last_error
+            try:
+                candidate = _argos_translate(t, self.source, self.target)
+                if not _fallback_candidate_ok(t, candidate, expected_tokens):
+                    raise RuntimeError('Argos tidak lolos quality gate')
+                result = candidate
+                self.last_provider = f'argos-{stage_no}'
+                self.last_error_code = None
+                return True
+            except Exception as exc:
+                last_error = exc
+                self.last_error_code = _google_error_code(exc)
+                return False
+
+        # GELOMBANG 1: Google -> Gemini seluruh key.
+        _google_stage(1)
         if result is None:
-            gemini_allowed, gemini_probe = _GEMINI_COORDINATOR.permit()
-            if gemini_allowed:
-                try:
-                    if self._gemini_fallback is None:
-                        keys = _get_gemini_api_keys()
-                        if keys:
-                            start_idx = _next_gemini_worker_key_index(len(keys))
-                            ordered = keys[start_idx:] + keys[:start_idx]
-                            self._gemini_fallback = _GeminiRecoveryTranslator(
-                                self.source, self.target, self.custom_dict, self.italic_dict,
-                                self.dictionary_fingerprint, api_keys=ordered,
-                            )
-                    if self._gemini_fallback is None:
-                        raise RuntimeError('Gemini API key belum tersedia')
-                    gemini_result, gemini_terms = self._gemini_fallback.translate_one(
-                        text, italic_map or {}
-                    )
-                    if not gemini_result or gemini_result == text:
-                        raise RuntimeError('Gemini tidak menghasilkan terjemahan valid')
-                    _GEMINI_COORDINATOR.success(gemini_probe)
-                    if owns_flight:
-                        _ENGINE8_TRANSLATION_CACHE.finish(cache_key)
-                    self.last_provider = 'gemini'
-                    return gemini_result, gemini_terms
-                except Exception as gemini_error:
-                    last_error = gemini_error
-                    self.last_error_code = _gemini_status_code(gemini_error)
-                    _GEMINI_COORDINATOR.failure(self.last_error_code, gemini_probe)
+            ok, gemini_payload = _gemini_stage(1)
+            if ok and gemini_payload is not None:
+                if owns_flight:
+                    _ENGINE8_TRANSLATION_CACHE.finish(cache_key)
+                return gemini_payload
+
+        # GELOMBANG 2: Google lagi -> Gemini seluruh key -> Argos.
+        if result is None:
+            time.sleep(0.35 + random.uniform(0.05, 0.20))
+            _google_stage(2)
+        if result is None:
+            ok, gemini_payload = _gemini_stage(2)
+            if ok and gemini_payload is not None:
+                if owns_flight:
+                    _ENGINE8_TRANSLATION_CACHE.finish(cache_key)
+                return gemini_payload
+        if result is None:
+            _argos_stage(2)
+
+        # GELOMBANG 3: Google lagi -> Gemini seluruh key -> Argos -> MyMemory.
+        if result is None:
+            time.sleep(0.55 + random.uniform(0.05, 0.25))
+            _google_stage(3)
+        if result is None:
+            ok, gemini_payload = _gemini_stage(3)
+            if ok and gemini_payload is not None:
+                if owns_flight:
+                    _ENGINE8_TRANSLATION_CACHE.finish(cache_key)
+                return gemini_payload
+        if result is None:
+            _argos_stage(3)
 
         if result is None:
-            argos_allowed, argos_probe = _ARGOS_COORDINATOR.permit()
-            if argos_allowed:
-                try:
-                    candidate = _argos_translate(t, self.source, self.target)
-                    if not _fallback_candidate_ok(t, candidate, expected_tokens):
-                        raise RuntimeError('Argos tidak lolos quality gate')
-                    result = candidate
-                    self.last_provider = 'argos'
-                    self.last_error_code = None
-                    _ARGOS_COORDINATOR.success(argos_probe)
-                except Exception as argos_error:
-                    last_error = argos_error
-                    self.last_error_code = _google_error_code(argos_error)
-                    _ARGOS_COORDINATOR.failure(self.last_error_code, argos_probe)
-
-        if result is None:
-            mm_allowed, mm_probe = _MYMEMORY_COORDINATOR.permit()
-            if mm_allowed:
-                try:
-                    from deep_translator import MyMemoryTranslator
-                    # MyMemory tidak mendukung source='auto' secara konsisten.
-                    mm_source = 'en-GB' if self.source in ('auto', 'en') else self.source
-                    mm_target = 'id-ID' if self.target == 'id' else self.target
-                    mm_client = MyMemoryTranslator(source=mm_source, target=mm_target)
-                    candidate = mm_client.translate(t)
-                    if not _fallback_candidate_ok(t, candidate, expected_tokens):
-                        raise RuntimeError('MyMemory tidak lolos quality gate')
-                    result = candidate
-                    self.last_provider = 'mymemory'
-                    self.last_error_code = None
-                    _MYMEMORY_COORDINATOR.success(mm_probe)
-                except Exception as mm_error:
-                    last_error = mm_error
-                    self.last_error_code = _google_error_code(mm_error)
-                    _MYMEMORY_COORDINATOR.failure(self.last_error_code, mm_probe)
+            try:
+                from deep_translator import MyMemoryTranslator
+                mm_source = 'en-GB' if self.source in ('auto', 'en') else self.source
+                mm_target = 'id-ID' if self.target == 'id' else self.target
+                candidate = MyMemoryTranslator(source=mm_source, target=mm_target).translate(t)
+                if not _fallback_candidate_ok(t, candidate, expected_tokens):
+                    raise RuntimeError('MyMemory tidak lolos quality gate')
+                result = candidate
+                self.last_provider = 'mymemory-3'
+                self.last_error_code = None
+            except Exception as exc:
+                last_error = exc
+                self.last_error_code = _google_error_code(exc)
 
         if result is None:
             # Judul standar lazim terdiri dari beberapa klausa yang dipisahkan
