@@ -16,7 +16,6 @@ Fitur utama:
 from pipeline_utils import validate_docx, atomic_save_docx
 import re
 import copy
-import contextlib
 import time
 import uuid
 import traceback
@@ -1765,7 +1764,7 @@ class _Translator:
                 if not allowed:
                     self.last_provider = 'gemini'
                     return False
-                lock_ctx = contextlib.nullcontext()
+                lock_ctx = threading.Lock()
             else:
                 probe = False
                 lock_ctx = _GOOGLE_RETRY_STAGE_LOCK
@@ -3156,14 +3155,30 @@ class DocxFinalTranslatorEngine:
                 pending = set()
                 for _ in range(min(worker_count, total)):
                     try:
-                        pending.add(pool.submit(_translate_job, next(items)))
+                        _item = next(items)
+                        _future = pool.submit(_translate_job, _item)
+                        _future._engine8_item = _item
+                        pending.add(_future)
                     except StopIteration:
                         break
 
                 while pending:
                     future = next(as_completed(pending))
                     pending.remove(future)
-                    index, para, found, failed, provider = future.result()
+                    try:
+                        index, para, found, failed, provider = future.result()
+                    except Exception as worker_exc:
+                        # Satu worker/provider tidak boleh menjatuhkan seluruh Engine 8.
+                        # Ambil unit yang terkait dari metadata future lalu masukkan
+                        # ke antrean pemulihan serial.
+                        index, para = getattr(future, "_engine8_item", (-1, None))
+                        found = []
+                        failed = True
+                        provider = "Worker recovery"
+                        if para is None:
+                            raise RuntimeError(
+                                f"Worker Engine 8 gagal tanpa metadata unit: {worker_exc}"
+                            ) from worker_exc
                     current_provider = _provider_label(provider)
                     done += 1
                     italic_count += len(found)
@@ -3185,7 +3200,10 @@ class DocxFinalTranslatorEngine:
                     # sudah diproses. Jika failure guard menunggu, submission ikut
                     # berhenti sehingga tidak terjadi request bombing tersembunyi.
                     try:
-                        pending.add(pool.submit(_translate_job, next(items)))
+                        _item = next(items)
+                        _future = pool.submit(_translate_job, _item)
+                        _future._engine8_item = _item
+                        pending.add(_future)
                     except StopIteration:
                         pass
 
