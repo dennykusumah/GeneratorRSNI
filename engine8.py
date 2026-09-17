@@ -3145,105 +3145,99 @@ class DocxFinalTranslatorEngine:
                 return provider
 
             # -----------------------------------------------------------------
-            # TRANSLATE UTAMA BERULANG
+            # TRANSLATE UTAMA: SELURUH TARGET HARUS SELESAI DIPROSES DULU
             # -----------------------------------------------------------------
-            # Satu panggilan _Translator.translate_one() sudah berisi:
+            # Setiap target menjalani rantai utama lengkap di _Translator:
             #   Gelombang 1 -> Gelombang 2 -> Gelombang 3.
-            # Hanya unit yang masih gagal sesudah Gelombang 3 yang dimasukkan
-            # kembali ke putaran berikutnya. Dengan demikian putaran berikutnya
-            # benar-benar mulai lagi dari Gelombang 1, tanpa mengulang unit yang
-            # sudah sukses/cache-hit.
             #
-            # Agar outage permanen tidak membuat Streamlit menggantung selamanya,
-            # main dialihkan ke pemulihan setelah satu PUTARAN PENUH tanpa satu
-            # pun keberhasilan baru. Selama masih ada kemajuan, 1->2->3 terus
-            # berulang sampai seluruh target selesai.
+            # PENTING: X/Y pada dashboard adalah jumlah TARGET UNIK yang sudah
+            # selesai diproses oleh translate utama, bukan hanya yang sukses.
+            # Karena itu Recovery TIDAK BOLEH dimulai sebelum X == Y.
+            # Target yang gagal setelah Gelombang 3 disimpan di failed_paras,
+            # tetapi translate utama tetap menyelesaikan seluruh target lain
+            # sampai, misalnya, 1000/1000. Barulah kegagalan masuk Recovery.
+            #
+            # `berhasil` = target unik yang berhasil pada translate utama.
+            # `gagal`    = attempt gagal aktual (kumulatif, tidak pernah turun).
             remaining_main = list(enumerate(translation_queue))
-            main_round = 0
-            main_stagnant_rounds = 0
+            failed_paras = []
+            main_completed_indices = set()
+            main_success_count = 0
+            current_provider = f'Google Translate {worker_count} worker'
+            items = iter(remaining_main)
 
-            while remaining_main:
-                main_round += 1
-                round_success = 0
-                round_failed = []
-                current_provider = f'Google Translate {worker_count} worker'
-                items = iter(remaining_main)
+            with ThreadPoolExecutor(max_workers=worker_count,
+                                    thread_name_prefix='translate') as pool:
+                pending = {}
+                for _ in range(min(worker_count, len(remaining_main))):
+                    try:
+                        item = next(items)
+                        pending[pool.submit(_translate_job, item)] = item
+                    except StopIteration:
+                        break
 
-                with ThreadPoolExecutor(max_workers=worker_count,
-                                        thread_name_prefix='translate') as pool:
-                    pending = set()
-                    for _ in range(min(worker_count, len(remaining_main))):
-                        try:
-                            pending.add(pool.submit(_translate_job, next(items)))
-                        except StopIteration:
-                            break
-
-                    while pending:
-                        future = next(as_completed(pending))
-                        pending.remove(future)
-                        try:
-                            index, para, found, failed, provider = future.result()
-                        except Exception:
-                            # Exception worker tidak boleh menjatuhkan Engine 8.
-                            # Item yang tidak diketahui hasilnya diproses ulang pada
-                            # putaran utama berikutnya/pemulihan.
-                            index = -1
-                            para = None
-                            found = []
-                            failed = True
-                            provider = current_provider
-
-                        current_provider = _provider_label(provider)
-                        if failed:
-                            _wait_failure_slot()
-                            failure_times.append(time.monotonic())
-                            main_failed_attempts += 1
-                            if para is not None:
-                                round_failed.append((index, para))
-                        else:
-                            translated_count += 1
-                            round_success += 1
-                            italic_count += len(found)
-
-                        # `gagal` pada translate utama adalah jumlah attempt gagal
-                        # aktual. Counter dimulai dari 0, hanya naik saat suatu
-                        # attempt benar-benar gagal, dan tidak pernah turun ketika
-                        # retry berikutnya berhasil. Progress X/Y tetap menghitung
-                        # target unik yang sudah berhasil diterjemahkan.
-                        _notify(
-                            progress_callback,
-                            10 + int(translated_count / max(total, 1) * 80),
-                            f"[{current_provider} | {translated_count}/{total} | "
-                            f"berhasil={translated_count} | gagal={main_failed_attempts}]",
+                while pending:
+                    future = next(as_completed(tuple(pending)))
+                    original_item = pending.pop(future)
+                    try:
+                        index, para, found, failed, provider = future.result()
+                    except Exception as exc:
+                        # Pertahankan identitas item walaupun worker melempar
+                        # exception, sehingga progress tetap mencapai Y/Y dan
+                        # item tersebut pasti masuk Recovery (tidak pernah hilang).
+                        index, para = original_item
+                        found = []
+                        failed = True
+                        provider = current_provider
+                        tr.diagnostics.append(
+                            f'MainWorkerUnhandled:{type(exc).__name__}:{exc}'
                         )
 
-                        try:
-                            pending.add(pool.submit(_translate_job, next(items)))
-                        except StopIteration:
-                            pass
+                    current_provider = _provider_label(provider)
+                    if failed:
+                        _wait_failure_slot()
+                        failure_times.append(time.monotonic())
+                        main_failed_attempts += 1
+                        if para is not None and index >= 0:
+                            failed_paras.append((index, para))
+                    else:
+                        main_success_count += 1
+                        translated_count += 1
+                        italic_count += len(found)
 
-                # Stabilkan urutan dokumen dan hanya retry item gagal.
-                remaining_main = sorted(round_failed, key=lambda item: item[0])
-                if not remaining_main:
-                    break
+                    if index >= 0:
+                        main_completed_indices.add(index)
 
-                if round_success == 0:
-                    main_stagnant_rounds += 1
-                else:
-                    main_stagnant_rounds = 0
+                    main_completed = len(main_completed_indices)
+                    _notify(
+                        progress_callback,
+                        10 + int(main_completed / max(total, 1) * 80),
+                        f"[{current_provider} | {main_completed}/{total} | "
+                        f"berhasil={main_success_count} | gagal={main_failed_attempts}]",
+                    )
 
-                # Cooldown antar-siklus sebelum kembali ke Gelombang 1.
-                # Putaran dengan kemajuan akan terus diulang.
-                if main_stagnant_rounds == 0:
-                    time.sleep(1.0 + random.uniform(0.10, 0.40))
-                    continue
+                    try:
+                        item = next(items)
+                        pending[pool.submit(_translate_job, item)] = item
+                    except StopIteration:
+                        pass
 
-                # Tidak ada kemajuan satu putaran penuh: provider utama sedang
-                # benar-benar buntu. Serahkan hanya sisa gagal ke recovery agar
-                # pipeline tidak infinite-loop dan Engine 9 tetap dapat dicapai.
-                break
+            # Safety net: secara normal seluruh index pasti selesai sehingga
+            # main_completed == total. Jika ada Future yang meledak sebelum
+            # mengembalikan identitas item, jangan mulai Recovery dengan data
+            # yang tidak lengkap; hentikan dengan pesan diagnostik yang jelas.
+            if len(main_completed_indices) != total:
+                missing = total - len(main_completed_indices)
+                raise RuntimeError(
+                    f'Translate utama belum menyelesaikan seluruh target: '
+                    f'{len(main_completed_indices)}/{total}; hilang={missing}. '
+                    'Recovery tidak dijalankan agar target tidak terlewat.'
+                )
 
-            failed_paras = remaining_main
+            # Recovery hanya boleh dimulai setelah dashboard utama sudah Y/Y.
+            # Hanya target yang gagal setelah rantai Gelombang 1->2->3 yang
+            # diteruskan ke Recovery.
+            failed_paras = sorted(failed_paras, key=lambda item: item[0])
 
             # -----------------------------------------------------------------
             # PEMULIHAN BERULANG, SERIAL 1 WORKER
