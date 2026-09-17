@@ -28,7 +28,7 @@ import sqlite3
 import tempfile
 import threading
 import random
-from collections import OrderedDict
+from collections import OrderedDict, deque
 
 from docx import Document
 from docx.shared import Pt
@@ -1786,7 +1786,7 @@ class _Translator:
                         re.sub(r'\s+', ' ', result_plain).strip().casefold()):
                         raise ValueError('teks dikembalikan tanpa diterjemahkan')
                     result = candidate
-                    self.last_provider = f'google-{stage_no}'
+                    self.last_provider = 'Google Translate'
                     self.last_error_code = None
                     self._coordinator.success(probe)
                     return True
@@ -1811,7 +1811,7 @@ class _Translator:
                 gemini_result, gemini_terms = gemini.translate_one(text, italic_map or {})
                 if not gemini_result or gemini_result == text:
                     raise RuntimeError('Gemini tidak menghasilkan terjemahan valid')
-                self.last_provider = f'gemini-{stage_no}'
+                self.last_provider = f'Gemini Flash API {gemini.active_key_number}'
                 self.last_error_code = None
                 return True, (gemini_result, gemini_terms)
             except Exception as exc:
@@ -1826,7 +1826,7 @@ class _Translator:
                 if not _fallback_candidate_ok(t, candidate, expected_tokens):
                     raise RuntimeError('Argos tidak lolos quality gate')
                 result = candidate
-                self.last_provider = f'argos-{stage_no}'
+                self.last_provider = 'Argos Translate'
                 self.last_error_code = None
                 return True
             except Exception as exc:
@@ -1878,7 +1878,7 @@ class _Translator:
                 if not _fallback_candidate_ok(t, candidate, expected_tokens):
                     raise RuntimeError('MyMemory tidak lolos quality gate')
                 result = candidate
-                self.last_provider = 'mymemory-3'
+                self.last_provider = 'MyMemory Translate'
                 self.last_error_code = None
             except Exception as exc:
                 last_error = exc
@@ -2438,7 +2438,7 @@ class _RecoveryFallbackTranslator:
             candidate = self._google.translate(protected)
             if not _fallback_candidate_ok(protected, candidate, expected_tokens):
                 raise RuntimeError('Google tidak lolos quality gate')
-            result = candidate; self.last_provider = 'google'; self.last_error_code = None
+            result = candidate; self.last_provider = 'Google Translate'; self.last_error_code = None
         except Exception as exc:
             errors.append(f'Google:{_google_error_code(exc) or type(exc).__name__}')
             self.last_error_code = _google_error_code(exc)
@@ -2457,7 +2457,7 @@ class _RecoveryFallbackTranslator:
                 candidate = answers.get('R000001', '')
                 if not _fallback_candidate_ok(protected, candidate, expected_tokens):
                     raise RuntimeError('Gemini tidak lolos quality gate')
-                result = candidate; self.last_provider = 'gemini'; self.last_error_code = None
+                result = candidate; self.last_provider = f'Gemini Flash API {self._gemini.active_key_number}'; self.last_error_code = None
             except Exception as exc:
                 errors.append(f'Gemini:{_gemini_status_code(exc) or type(exc).__name__}')
                 self.last_error_code = _gemini_status_code(exc)
@@ -2468,7 +2468,7 @@ class _RecoveryFallbackTranslator:
                 candidate = _argos_translate(protected, self.source, self.target)
                 if not _fallback_candidate_ok(protected, candidate, expected_tokens):
                     raise RuntimeError('Argos tidak lolos quality gate')
-                result = candidate; self.last_provider = 'argos'; self.last_error_code = None
+                result = candidate; self.last_provider = 'Argos Translate'; self.last_error_code = None
             except Exception as exc:
                 errors.append(f'Argos:{type(exc).__name__}')
 
@@ -2481,7 +2481,7 @@ class _RecoveryFallbackTranslator:
                 candidate = MyMemoryTranslator(source=mm_source, target=mm_target).translate(protected)
                 if not _fallback_candidate_ok(protected, candidate, expected_tokens):
                     raise RuntimeError('MyMemory tidak lolos quality gate')
-                result = candidate; self.last_provider = 'mymemory'; self.last_error_code = None
+                result = candidate; self.last_provider = 'MyMemory Translate'; self.last_error_code = None
             except Exception as exc:
                 errors.append(f'MyMemory:{_google_error_code(exc) or type(exc).__name__}')
 
@@ -2491,7 +2491,7 @@ class _RecoveryFallbackTranslator:
                 candidate = _deepl_translate(protected, self.source, self.target)
                 if not _fallback_candidate_ok(protected, candidate, expected_tokens):
                     raise RuntimeError('DeepL tidak lolos quality gate')
-                result = candidate; self.last_provider = 'deepl'; self.last_error_code = None
+                result = candidate; self.last_provider = 'DeepL translator'; self.last_error_code = None
             except Exception as exc:
                 errors.append(f'DeepL:{_google_error_code(exc) or type(exc).__name__}')
 
@@ -3107,36 +3107,86 @@ class DocxFinalTranslatorEngine:
                     self.custom_dict, self.italic_dict, dictionary_fingerprint,
                 )
                 found = _translate_para(para, worker_tr)
-                return index, para, found, bool(worker_tr.failed_texts)
+                return (index, para, found, bool(worker_tr.failed_texts),
+                        worker_tr.last_provider or 'Google Translate')
 
             # Tahap utama: jumlah worker dipilih user dari UI (1--4).
+            # Antrean dibuat BOUNDED: hanya <= worker_count request yang hidup.
+            # Ini penting karena submit seluruh dokumen sekaligus membuat ratusan
+            # future tetap menekan provider walaupun failure surge sudah terdeteksi.
             try:
                 worker_count = int(worker_count)
             except (TypeError, ValueError):
                 worker_count = 2
             worker_count = max(1, min(worker_count, 4))
+
+            # Hard failure-rate guard: maksimum 5 kegagalan FINAL yang boleh
+            # dikomit dalam rolling window 1 detik. Saat ambang tercapai, pipeline
+            # menahan submission request baru sampai window aman lagi. Jadi bukan
+            # sekadar angka dashboard yang diperlambat; tekanan ke provider juga turun.
+            failure_times = deque()
+
+            def _wait_failure_slot():
+                while True:
+                    now = time.monotonic()
+                    while failure_times and now - failure_times[0] >= 1.0:
+                        failure_times.popleft()
+                    if len(failure_times) < 5:
+                        return
+                    time.sleep(max(0.02, 1.0 - (now - failure_times[0]) + 0.01))
+
+            def _provider_label(provider):
+                provider = (provider or 'Google Translate').strip()
+                if provider.lower().startswith('google'):
+                    return f'Google Translate {worker_count} worker'
+                if provider.lower().startswith('gemini flash api'):
+                    return provider
+                if provider.lower().startswith('argos'):
+                    return 'Argos Translate'
+                if provider.lower().startswith('mymemory'):
+                    return 'MyMemory Translate'
+                if provider.lower().startswith('deepl'):
+                    return 'DeepL translator'
+                return provider
+
+            current_provider = f'Google Translate {worker_count} worker'
+            items = iter(enumerate(translation_queue))
             with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix='translate') as pool:
-                futures = [pool.submit(_translate_job, item)
-                           for item in enumerate(translation_queue)]
-                for future in as_completed(futures):
-                    index, para, found, failed = future.result()
+                pending = set()
+                for _ in range(min(worker_count, total)):
+                    try:
+                        pending.add(pool.submit(_translate_job, next(items)))
+                    except StopIteration:
+                        break
+
+                while pending:
+                    future = next(as_completed(pending))
+                    pending.remove(future)
+                    index, para, found, failed, provider = future.result()
+                    current_provider = _provider_label(provider)
                     done += 1
                     italic_count += len(found)
                     if failed:
+                        _wait_failure_slot()
+                        failure_times.append(time.monotonic())
                         failed_paras.append((index, para))
                     else:
                         translated_count += 1
-                    # Translate normal memakai rentang 10%--90%, dihitung
-                    # murni dari counter done/total (XXX/XXX).
+
                     pct = 10 + int(done / max(total, 1) * 80)
                     _notify(
                         progress_callback, pct,
-                        f"[translate {worker_count} worker] {done}/{total} | "
-                        f"berhasil={translated_count} | "
-                        f"gagal={len(failed_paras)} | "
-                        f"provider={_GOOGLE_TRANSLATE_COORDINATOR.state()} | "
-                        f"[progres-total] {done}/{total + len(failed_paras)}",
+                        f"[{current_provider} | {done}/{total} | "
+                        f"berhasil={translated_count} | gagal={len(failed_paras)}]",
                     )
+
+                    # Submit hanya satu pekerjaan pengganti setelah hasil di atas
+                    # sudah diproses. Jika failure guard menunggu, submission ikut
+                    # berhenti sehingga tidak terjadi request bombing tersembunyi.
+                    try:
+                        pending.add(pool.submit(_translate_job, next(items)))
+                    except StopIteration:
+                        pass
 
             # PEMULIHAN SERIAL (1 worker): Google -> Gemini API 1..15 ->
             # Argos -> MyMemory -> DeepL -> gagal. Tidak memakai Microsoft/Yandex.
@@ -3162,13 +3212,11 @@ class DocxFinalTranslatorEngine:
                     italic_count += len(found)
 
                 pct = 90 + int(recovery_done / max(recovery_total, 1) * 8)
+                recovery_provider = recovery_tr.last_provider or 'Google Translate'
                 _notify(
                     progress_callback, pct,
-                    f"[pemulihan 1 worker: Google→Gemini(1-15)→Argos→MyMemory→DeepL] "
-                    f"{recovery_done}/{recovery_total} | berhasil={recovery_success} | "
-                    f"gagal={recovery_total - recovery_done + len(still_failed)} | "
-                    f"provider={recovery_tr.last_provider or '-'} | "
-                    f"[progres-total] {total + recovery_done}/{total + recovery_total}"
+                    f"[{recovery_provider} | {recovery_done}/{recovery_total} | "
+                    f"berhasil={recovery_success} | gagal={len(still_failed)}]"
                 )
 
             # Dipakai ringkasan dan UI peringatan. Dokumen parsial tetap
