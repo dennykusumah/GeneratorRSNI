@@ -2482,45 +2482,46 @@ if st.session_state.get('_run_process') and st.session_state.get('_target_file')
         _engine8_progress_state = {'pct': 10}
 
         def _engine8_progress(pct, msg):
-            # Counter translate normal dan pemulihan dihitung TERPISAH:
-            #   [translate ...]  XXX/XXX -> 10% sampai 90%
-            #   [pemulihan ...]  YY/YY   -> 90% sampai 98%
-            # Pesan lain (pra-scan, sinkronisasi, saving) tidak mengubah
-            # pemetaan ini dan mempertahankan progres terakhir.
+            # Engine 8 mengirim dua bentuk progress:
+            #   [Google Translate 4 worker | XX/YY | berhasil=A | gagal=B]
+            #   [Gemini API N | XX/YY | berhasil=A | gagal=B]
+            #   [Recovery: Gemini API N | AA/ZZ | berhasil=C | gagal=D]
+            # Translate utama dipetakan 10-90%; Recovery 90-98%.
             text = msg or ''
-            translate_match = re.search(
-                r'\[translate[^\]]*\]\s*(\d+)\s*/\s*(\d+)',
-                text, re.IGNORECASE,
-            )
+
             recovery_match = re.search(
-                r'\[pemulihan[^\]]*\]\s*(\d+)\s*/\s*(\d+)',
+                r'\[Recovery:\s*[^|\]]+\|\s*(\d+)\s*/\s*(\d+)\s*\|',
                 text, re.IGNORECASE,
             )
+            main_match = None
+            if not recovery_match:
+                main_match = re.search(
+                    r'\[(?!Recovery:)[^|\]]+\|\s*(\d+)\s*/\s*(\d+)\s*\|',
+                    text, re.IGNORECASE,
+                )
 
             calculated_pct = _engine8_progress_state['pct']
-            if translate_match and int(translate_match.group(2)) > 0:
-                translate_ratio = min(
-                    int(translate_match.group(1))
-                    / int(translate_match.group(2)),
-                    1.0,
-                )
-                calculated_pct = 10 + int(translate_ratio * 80)
-            elif recovery_match and int(recovery_match.group(2)) > 0:
-                recovery_ratio = min(
-                    int(recovery_match.group(1))
-                    / int(recovery_match.group(2)),
-                    1.0,
-                )
-                calculated_pct = 90 + int(recovery_ratio * 8)
+            if recovery_match and int(recovery_match.group(2)) > 0:
+                done = int(recovery_match.group(1))
+                total_recovery = int(recovery_match.group(2))
+                ratio = min(max(done / total_recovery, 0.0), 1.0)
+                calculated_pct = 90 + int(ratio * 8)
+            elif main_match and int(main_match.group(2)) > 0:
+                done = int(main_match.group(1))
+                total_main = int(main_match.group(2))
+                ratio = min(max(done / total_main, 0.0), 1.0)
+                calculated_pct = 10 + int(ratio * 80)
+            elif isinstance(pct, (int, float)):
+                # Pesan non-counter seperti sinkronisasi/saving tetap boleh
+                # membawa progress Engine 8, tetapi dibatasi maksimum 98%.
+                calculated_pct = int(pct)
 
             calculated_pct = max(10, min(calculated_pct, 98))
-            # Callback paralel dapat tiba sangat berdekatan; progres tidak
-            # boleh mundur ketika berganti fase atau saat saving.
             mapped_pct = max(_engine8_progress_state['pct'], calculated_pct)
             _engine8_progress_state['pct'] = mapped_pct
             display_msg = re.sub(
                 r'\s*\|\s*\[progres-total\]\s*\d+\s*/\s*\d+\s*$',
-                '', msg or '', flags=re.IGNORECASE,
+                '', text, flags=re.IGNORECASE,
             )
             update_ui(mapped_pct, f"Menerjemahkan dokumen...\n{display_msg}")
 
