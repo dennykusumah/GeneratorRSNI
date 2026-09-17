@@ -16,6 +16,7 @@ Fitur utama:
 from pipeline_utils import validate_docx, atomic_save_docx
 import re
 import copy
+import contextlib
 import time
 import uuid
 import traceback
@@ -1764,7 +1765,7 @@ class _Translator:
                 if not allowed:
                     self.last_provider = 'gemini'
                     return False
-                lock_ctx = threading.Lock()
+                lock_ctx = contextlib.nullcontext()
             else:
                 probe = False
                 lock_ctx = _GOOGLE_RETRY_STAGE_LOCK
@@ -3096,9 +3097,8 @@ class DocxFinalTranslatorEngine:
                 f"| [progres-total] 0/{total}",
             )
 
-            done = translated_count = 0
+            translated_count = 0
             italic_count = 0
-            failed_paras = []
 
             def _translate_job(index_para):
                 index, para = index_para
@@ -3110,23 +3110,17 @@ class DocxFinalTranslatorEngine:
                 return (index, para, found, bool(worker_tr.failed_texts),
                         worker_tr.last_provider or 'Google Translate')
 
-            # Tahap utama: jumlah worker dipilih user dari UI (1--4).
-            # Antrean dibuat BOUNDED: hanya <= worker_count request yang hidup.
-            # Ini penting karena submit seluruh dokumen sekaligus membuat ratusan
-            # future tetap menekan provider walaupun failure surge sudah terdeteksi.
             try:
                 worker_count = int(worker_count)
             except (TypeError, ValueError):
                 worker_count = 2
             worker_count = max(1, min(worker_count, 4))
 
-            # Hard failure-rate guard: maksimum 5 kegagalan FINAL yang boleh
-            # dikomit dalam rolling window 1 detik. Saat ambang tercapai, pipeline
-            # menahan submission request baru sampai window aman lagi. Jadi bukan
-            # sekadar angka dashboard yang diperlambat; tekanan ke provider juga turun.
             failure_times = deque()
 
             def _wait_failure_slot():
+                # Maksimum lima kegagalan yang dikomit ke dashboard per rolling
+                # satu detik. Submission ikut tertahan agar provider tidak dibombardir.
                 while True:
                     now = time.monotonic()
                     while failure_times and now - failure_times[0] >= 1.0:
@@ -3149,95 +3143,179 @@ class DocxFinalTranslatorEngine:
                     return 'DeepL translator'
                 return provider
 
-            current_provider = f'Google Translate {worker_count} worker'
-            items = iter(enumerate(translation_queue))
-            with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix='translate') as pool:
-                pending = set()
-                for _ in range(min(worker_count, total)):
-                    try:
-                        _item = next(items)
-                        _future = pool.submit(_translate_job, _item)
-                        _future._engine8_item = _item
-                        pending.add(_future)
-                    except StopIteration:
-                        break
+            # -----------------------------------------------------------------
+            # TRANSLATE UTAMA BERULANG
+            # -----------------------------------------------------------------
+            # Satu panggilan _Translator.translate_one() sudah berisi:
+            #   Gelombang 1 -> Gelombang 2 -> Gelombang 3.
+            # Hanya unit yang masih gagal sesudah Gelombang 3 yang dimasukkan
+            # kembali ke putaran berikutnya. Dengan demikian putaran berikutnya
+            # benar-benar mulai lagi dari Gelombang 1, tanpa mengulang unit yang
+            # sudah sukses/cache-hit.
+            #
+            # Agar outage permanen tidak membuat Streamlit menggantung selamanya,
+            # main dialihkan ke pemulihan setelah satu PUTARAN PENUH tanpa satu
+            # pun keberhasilan baru. Selama masih ada kemajuan, 1->2->3 terus
+            # berulang sampai seluruh target selesai.
+            remaining_main = list(enumerate(translation_queue))
+            main_round = 0
+            main_stagnant_rounds = 0
 
-                while pending:
-                    future = next(as_completed(pending))
-                    pending.remove(future)
-                    try:
-                        index, para, found, failed, provider = future.result()
-                    except Exception as worker_exc:
-                        # Satu worker/provider tidak boleh menjatuhkan seluruh Engine 8.
-                        # Ambil unit yang terkait dari metadata future lalu masukkan
-                        # ke antrean pemulihan serial.
-                        index, para = getattr(future, "_engine8_item", (-1, None))
-                        found = []
-                        failed = True
-                        provider = "Worker recovery"
-                        if para is None:
-                            raise RuntimeError(
-                                f"Worker Engine 8 gagal tanpa metadata unit: {worker_exc}"
-                            ) from worker_exc
-                    current_provider = _provider_label(provider)
-                    done += 1
-                    italic_count += len(found)
-                    if failed:
-                        _wait_failure_slot()
-                        failure_times.append(time.monotonic())
-                        failed_paras.append((index, para))
-                    else:
-                        translated_count += 1
+            while remaining_main:
+                main_round += 1
+                round_success = 0
+                round_failed = []
+                current_provider = f'Google Translate {worker_count} worker'
+                items = iter(remaining_main)
 
-                    pct = 10 + int(done / max(total, 1) * 80)
-                    _notify(
-                        progress_callback, pct,
-                        f"[{current_provider} | {done}/{total} | "
-                        f"berhasil={translated_count} | gagal={len(failed_paras)}]",
-                    )
+                with ThreadPoolExecutor(max_workers=worker_count,
+                                        thread_name_prefix='translate') as pool:
+                    pending = set()
+                    for _ in range(min(worker_count, len(remaining_main))):
+                        try:
+                            pending.add(pool.submit(_translate_job, next(items)))
+                        except StopIteration:
+                            break
 
-                    # Submit hanya satu pekerjaan pengganti setelah hasil di atas
-                    # sudah diproses. Jika failure guard menunggu, submission ikut
-                    # berhenti sehingga tidak terjadi request bombing tersembunyi.
-                    try:
-                        _item = next(items)
-                        _future = pool.submit(_translate_job, _item)
-                        _future._engine8_item = _item
-                        pending.add(_future)
-                    except StopIteration:
-                        pass
+                    while pending:
+                        future = next(as_completed(pending))
+                        pending.remove(future)
+                        try:
+                            index, para, found, failed, provider = future.result()
+                        except Exception:
+                            # Exception worker tidak boleh menjatuhkan Engine 8.
+                            # Item yang tidak diketahui hasilnya diproses ulang pada
+                            # putaran utama berikutnya/pemulihan.
+                            index = -1
+                            para = None
+                            found = []
+                            failed = True
+                            provider = current_provider
 
-            # PEMULIHAN SERIAL (1 worker): Google -> Gemini API 1..15 ->
-            # Argos -> MyMemory -> DeepL -> gagal. Tidak memakai Microsoft/Yandex.
+                        current_provider = _provider_label(provider)
+                        if failed:
+                            _wait_failure_slot()
+                            failure_times.append(time.monotonic())
+                            if para is not None:
+                                round_failed.append((index, para))
+                        else:
+                            translated_count += 1
+                            round_success += 1
+                            italic_count += len(found)
+
+                        unresolved_now = len(round_failed) + max(
+                            0, len(remaining_main) - round_success - len(round_failed)
+                        )
+                        _notify(
+                            progress_callback,
+                            10 + int(translated_count / max(total, 1) * 80),
+                            f"[{current_provider} | {translated_count}/{total} | "
+                            f"berhasil={translated_count} | gagal={unresolved_now}]",
+                        )
+
+                        try:
+                            pending.add(pool.submit(_translate_job, next(items)))
+                        except StopIteration:
+                            pass
+
+                # Stabilkan urutan dokumen dan hanya retry item gagal.
+                remaining_main = sorted(round_failed, key=lambda item: item[0])
+                if not remaining_main:
+                    break
+
+                if round_success == 0:
+                    main_stagnant_rounds += 1
+                else:
+                    main_stagnant_rounds = 0
+
+                # Cooldown antar-siklus sebelum kembali ke Gelombang 1.
+                # Putaran dengan kemajuan akan terus diulang.
+                if main_stagnant_rounds == 0:
+                    time.sleep(1.0 + random.uniform(0.10, 0.40))
+                    continue
+
+                # Tidak ada kemajuan satu putaran penuh: provider utama sedang
+                # benar-benar buntu. Serahkan hanya sisa gagal ke recovery agar
+                # pipeline tidak infinite-loop dan Engine 9 tetap dapat dicapai.
+                break
+
+            failed_paras = remaining_main
+
+            # -----------------------------------------------------------------
+            # PEMULIHAN BERULANG, SERIAL 1 WORKER
+            # -----------------------------------------------------------------
+            # Recovery hanya menerima unit yang gagal dari translate utama.
+            # Setiap putaran mencoba seluruh rantai:
+            # Google -> Gemini 1..15 -> Argos -> MyMemory -> DeepL.
+            # Yang sukses dikeluarkan permanen; hanya yang masih gagal di-loop.
+            # Selama ada kemajuan, loop terus. Untuk outage permanen, tiga putaran
+            # recovery penuh tanpa kemajuan menjadi fail-safe agar aplikasi tidak
+            # menggantung tanpa batas dan dokumen parsial tetap bisa ke Engine 9.
             recovery_total = len(failed_paras)
-            still_failed = []
+            recovery_pending = sorted(failed_paras, key=lambda item: item[0])
             recovery_success = 0
+            recovery_round = 0
+            recovery_stagnant_rounds = 0
             recovery_tr = _RecoveryFallbackTranslator(
                 self.source_lang, self.target_lang, self.custom_dict,
                 self.italic_dict, dictionary_fingerprint
             ) if recovery_total else None
 
-            # Sengaja serial: tidak ada ThreadPoolExecutor pada tahap pemulihan.
-            for recovery_done, (index, para) in enumerate(
-                    sorted(failed_paras, key=lambda item: item[0]), start=1):
-                before = len(recovery_tr.failed_texts)
-                found = _translate_para(para, recovery_tr)
-                failed = len(recovery_tr.failed_texts) > before
-                if failed:
-                    still_failed.append(para)
+            while recovery_pending:
+                recovery_round += 1
+                next_pending = []
+                round_success = 0
+
+                for index, para in recovery_pending:
+                    before = len(recovery_tr.failed_texts)
+                    try:
+                        found = _translate_para(para, recovery_tr)
+                        failed = len(recovery_tr.failed_texts) > before
+                    except Exception as exc:
+                        found = []
+                        failed = True
+                        recovery_tr.last_provider = recovery_tr.last_provider or 'Google Translate'
+                        recovery_tr.diagnostics.append(
+                            f'Unhandled:{type(exc).__name__}:{exc}'
+                        )
+
+                    if failed:
+                        next_pending.append((index, para))
+                    else:
+                        round_success += 1
+                        recovery_success += 1
+                        translated_count += 1
+                        italic_count += len(found)
+
+                    recovery_provider = recovery_tr.last_provider or 'Google Translate'
+                    unresolved = len(next_pending) + max(
+                        0, len(recovery_pending) - round_success - len(next_pending)
+                    )
+                    pct = 90 + int(recovery_success / max(recovery_total, 1) * 8)
+                    _notify(
+                        progress_callback, pct,
+                        f"[{recovery_provider} | {recovery_success}/{recovery_total} | "
+                        f"berhasil={recovery_success} | gagal={unresolved}]"
+                    )
+
+                recovery_pending = sorted(next_pending, key=lambda item: item[0])
+                if not recovery_pending:
+                    break
+
+                if round_success == 0:
+                    recovery_stagnant_rounds += 1
                 else:
-                    recovery_success += 1
-                    translated_count += 1
-                    italic_count += len(found)
+                    recovery_stagnant_rounds = 0
 
-                pct = 90 + int(recovery_done / max(recovery_total, 1) * 8)
-                recovery_provider = recovery_tr.last_provider or 'Google Translate'
-                _notify(
-                    progress_callback, pct,
-                    f"[{recovery_provider} | {recovery_done}/{recovery_total} | "
-                    f"berhasil={recovery_success} | gagal={len(still_failed)}]"
-                )
+                if recovery_stagnant_rounds >= 3:
+                    break
 
+                # Cooldown bertahap antarputaran recovery. Maksimum 30 detik;
+                # memberi kesempatan circuit breaker/provider pulih tanpa spam.
+                recovery_cooldown = min(30.0, 5.0 * (2 ** min(recovery_round - 1, 3)))
+                time.sleep(recovery_cooldown + random.uniform(0.10, 0.50))
+
+            still_failed = [para for _, para in recovery_pending]
             # Dipakai ringkasan dan UI peringatan. Dokumen parsial tetap
             # disimpan agar dapat di-download atau dipaksa lanjut ke Engine 9.
             tr.failed_texts = [
