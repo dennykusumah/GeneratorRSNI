@@ -1907,7 +1907,7 @@ def _render_header_with_live_kamus():
                 </div>
                 <div class="stat-divider"></div>
                 <div class="stat-item">
-                    <div class="stat-num">{len(LANG_OPTIONS)}</div>
+                    <div class="stat-num">{len(LANG_OPTIONS)-1}</div>
                     <div class="stat-lbl">Bahasa</div>
                 </div>
             </div>
