@@ -1,3 +1,4 @@
+#             'position:absolute;right:52px;top:50%;transform:translateY(-50%);' +
 #             'background:linear-gradient(135deg,#6366f1,#4f46e5);' +
 #             'border:none;color:#fff;font-size:0.78rem;font-weight:700;' +
 #             'padding:7px 14px;border-radius:99px;cursor:pointer;' +
@@ -110,5 +111,6 @@
 # halaman. Saat proses aktif fungsi ini no-op karena sudah dirender di bawah
 # progress/timer sebelum pekerjaan berat dimulai.
 if not globals().get('_footer_rendered_this_run', False):
+    import streamlit as st  # local safety import: mencegah NameError walau blok dipindahkan
     st.markdown(_FOOTER_HTML, unsafe_allow_html=True)
     _footer_rendered_this_run = True
