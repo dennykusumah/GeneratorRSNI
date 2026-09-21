@@ -1,15 +1,3 @@
-#     rec.start();
-#   };
-
-#   function setupParentBtn() {
-#     try {
-#       var pw = window.parent;
-#       if (pw === window) throw new Error('no parent');
-
-#       if (!pw.document.getElementById('_mic_style')) {
-#         var s = pw.document.createElement('style');
-#         s.id = '_mic_style';
-#         s.textContent =
 #           'div[data-testid="stChatInput"]{position:relative !important;}' +
 #           'div[data-testid="stChatInput"] textarea{padding-right:128px !important;}' +
 #           '#_mic_btn{' +
@@ -125,4 +113,4 @@
 # Kondisi tanpa proses aktif atau halaman hasil: footer berada di akhir alur
 # halaman. Saat proses aktif fungsi ini no-op karena sudah dirender di bawah
 # progress/timer sebelum pekerjaan berat dimulai.
-_render_footer_once()
+st.markdown(_FOOTER_HTML, unsafe_allow_html=True)
