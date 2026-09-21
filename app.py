@@ -1,3 +1,15 @@
+#   function setupParentBtn() {
+#     try {
+#       var pw = window.parent;
+#       if (pw === window) throw new Error('no parent');
+
+#       if (!pw.document.getElementById('_mic_style')) {
+#         var s = pw.document.createElement('style');
+#         s.id = '_mic_style';
+#         s.textContent =
+#           'div[data-testid="stChatInput"]{position:relative !important;}' +
+#           'div[data-testid="stChatInput"] textarea{padding-right:128px !important;}' +
+#           '#_mic_btn{' +
 #             'position:absolute;right:52px;top:50%;transform:translateY(-50%);' +
 #             'background:linear-gradient(135deg,#6366f1,#4f46e5);' +
 #             'border:none;color:#fff;font-size:0.78rem;font-weight:700;' +
@@ -110,7 +122,4 @@
 # Kondisi tanpa proses aktif atau halaman hasil: footer berada di akhir alur
 # halaman. Saat proses aktif fungsi ini no-op karena sudah dirender di bawah
 # progress/timer sebelum pekerjaan berat dimulai.
-if not globals().get('_footer_rendered_this_run', False):
-    import streamlit as st  # local safety import: mencegah NameError walau blok dipindahkan
-    st.markdown(_FOOTER_HTML, unsafe_allow_html=True)
-    _footer_rendered_this_run = True
+_render_footer_once()
