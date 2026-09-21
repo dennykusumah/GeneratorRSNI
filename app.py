@@ -1,10 +1,3 @@
-#         var s = pw.document.createElement('style');
-#         s.id = '_mic_style';
-#         s.textContent =
-#           'div[data-testid="stChatInput"]{position:relative !important;}' +
-#           'div[data-testid="stChatInput"] textarea{padding-right:128px !important;}' +
-#           '#_mic_btn{' +
-#             'position:absolute;right:52px;top:50%;transform:translateY(-50%);' +
 #             'background:linear-gradient(135deg,#6366f1,#4f46e5);' +
 #             'border:none;color:#fff;font-size:0.78rem;font-weight:700;' +
 #             'padding:7px 14px;border-radius:99px;cursor:pointer;' +
@@ -116,4 +109,6 @@
 # Kondisi tanpa proses aktif atau halaman hasil: footer berada di akhir alur
 # halaman. Saat proses aktif fungsi ini no-op karena sudah dirender di bawah
 # progress/timer sebelum pekerjaan berat dimulai.
-_render_footer_once()
+if not globals().get('_footer_rendered_this_run', False):
+    st.markdown(_FOOTER_HTML, unsafe_allow_html=True)
+    _footer_rendered_this_run = True
