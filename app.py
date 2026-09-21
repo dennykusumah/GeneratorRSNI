@@ -1,3 +1,5 @@
+#         var s = pw.document.createElement('style');
+#         s.id = '_mic_style';
 #         s.textContent =
 #           'div[data-testid="stChatInput"]{position:relative !important;}' +
 #           'div[data-testid="stChatInput"] textarea{padding-right:128px !important;}' +
