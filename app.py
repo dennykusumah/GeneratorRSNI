@@ -1677,7 +1677,7 @@ LANG_OPTIONS = {
     "fr": "🇫🇷 Prancis", "de": "🇩🇪 Jerman", "es": "🇪🇸 Spanyol",
     "it": "🇮🇹 Italia", "nl": "🇳🇱 Belanda", "pt": "🇵🇹 Portugis",
     "ru": "🇷🇺 Rusia", "ja": "🇯🇵 Jepang", "zh-CN": "🇨🇳 Mandarin",
-    "ko": "🇰🇷 Korea", "ar": "🇸🇦 Arab",
+    "ko": "🇰🇷 Korea", "ar": "🇸🇦 Arab", "id": "🇮🇩 Indonesia",
 }
 
 _ENGINE_COUNT = 9
@@ -1892,7 +1892,7 @@ def _render_header_with_live_kamus():
                 </div>
                 <div class="stat-divider"></div>
                 <div class="stat-item">
-                    <div class="stat-num">13</div>
+                    <div class="stat-num">{len(LANG_OPTIONS)}</div>
                     <div class="stat-lbl">Bahasa</div>
                 </div>
             </div>
@@ -2048,12 +2048,15 @@ div[class*="st-key-grp_acc_btns"] > * {
 
 /* Label rata kiri dengan tombol pertama */
 div[class*="st-key-grp_speed"] .speed-label,
-div[class*="st-key-grp_acc"] .speed-label {
+div[class*="st-key-grp_acc"] .speed-label,
+div[class*="st-key-grp_lang"] .speed-label {
     margin: 0 !important;
     padding: 0 !important;
     text-align: left !important;
     white-space: nowrap !important;
 }
+/* Label "Bahasa Sumber" memakai style .speed-label yang SAMA dengan label
+   "Akurasi" (ukuran, warna, font, ikon) — tanpa override tersendiri. */
 
 /* Grup BAHASA SUMBER: mengisi sisa lebar di kanan tombol Akurasi 4, ujung
    kanannya rata dengan ujung kanan kotak input ICS. */
@@ -2070,28 +2073,7 @@ div[class*="st-key-grp_lang"] {
     width: 100% !important;
     min-width: 0 !important;
 }
-div[class*="st-key-grp_lang"] .speed-label {
-    margin: 0 !important;
-    padding: 0 !important;
-    text-align: left !important;
-    white-space: nowrap !important;
-    /* Tinggi baris dikunci = label Kecepatan/Akurasi (16.4px) supaya kotak
-       pilihan tetap sejajar dengan tombol 1-4, walau hurufnya lebih besar. */
-    height: 16.4px !important;
-    line-height: 16.4px !important;
-    display: flex !important;
-    align-items: center !important;
-    font-size: 1.02rem !important;
-    font-weight: 500 !important;
-    letter-spacing: 0.3px !important;
-    color: rgba(255,255,255,0.88) !important;
-    overflow: visible !important;
-}
-div[class*="st-key-grp_lang"] .speed-label .speed-stopwatch {
-    font-size: 1.12rem !important;
-    margin-right: 0.35rem !important;
-    line-height: 1 !important;
-}
+
 /* Selectbox setinggi tombol 1-4 (42px) supaya sejajar */
 div[class*="st-key-lang_main"] {
     width: 100% !important;
@@ -2115,11 +2097,14 @@ div[class*="st-key-lang_main"] div[data-baseweb="select"] > div:focus-within {
 div[class*="st-key-lang_main"] input,
 div[class*="st-key-lang_main"] div[data-baseweb="select"] div,
 div[class*="st-key-lang_main"] div[data-baseweb="select"] span {
-    color: #f1f5f9 !important;
-    -webkit-text-fill-color: #f1f5f9 !important;
+    /* Sama dengan angka 1/2/3/4 pada tombol Akurasi/Kecepatan */
+    color: rgba(165,180,252,0.85) !important;
+    -webkit-text-fill-color: rgba(165,180,252,0.85) !important;
     opacity: 1 !important;
-    font-size: 1.12rem !important;
-    font-weight: 500 !important;
+    font-size: 0.95rem !important;
+    font-weight: 800 !important;
+    line-height: 1 !important;
+    letter-spacing: 0 !important;
     font-family: 'Outfit', sans-serif !important;
 }
 div[class*="st-key-lang_main"] div[role="group"] > div,
@@ -2127,9 +2112,9 @@ div[class*="st-key-lang_main"] div[data-baseweb="select"] > div > div {
     padding-left: 0.35rem !important;
 }
 div[class*="st-key-lang_main"] svg {
-    color: rgba(199,210,254,0.85) !important;
-    width: 22px !important;
-    height: 22px !important;
+    color: rgba(165,180,252,0.85) !important;
+    width: 20px !important;
+    height: 20px !important;
 }
 
 /* Layar menengah: Bahasa Sumber turun ke baris sendiri (lebar penuh) */
