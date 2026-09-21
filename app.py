@@ -1,3 +1,6 @@
+#     rec.start();
+#   };
+
 #   function setupParentBtn() {
 #     try {
 #       var pw = window.parent;
