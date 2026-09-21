@@ -1965,7 +1965,20 @@ if '_engine8_workers' not in st.session_state:
 if '_engine8_accuracy' not in st.session_state:
     st.session_state['_engine8_accuracy'] = 5 - int(st.session_state['_engine8_workers'])
 
-col_speed_label, col_accuracy_label = st.columns(2)
+# Rasio kolom dipakai bersama oleh baris label DAN baris tombol, supaya label
+# "Akurasi" selalu tepat di atas grup tombol Akurasi apa pun ukuran jarak
+# antar-grupnya. _BTN = lebar 1 kotak tombol (rasio yang terbukti pas untuk
+# tombol 42px). _GAP = jarak antar grup Kecepatan-Akurasi, sengaja dibuat
+# SAMA dengan _BTN supaya jaraknya terasa seperti "1 kotak tombol". _TAIL =
+# sisa ruang kosong di ujung kanan baris.
+_BTN = 0.48
+_GAP = 0.48
+_TAIL = 2.0
+_GROUP = _BTN * 4  # lebar total 4 kotak tombol (dipakai sebagai lebar label)
+
+col_speed_label, _col_gap_label, col_accuracy_label, _col_tail_label = st.columns(
+    [_GROUP, _GAP, _GROUP, _TAIL]
+)
 with col_speed_label:
     st.markdown('<div class="section-label speed-label"><span class="speed-stopwatch">⏱️</span> Kecepatan</div>', unsafe_allow_html=True)
 with col_accuracy_label:
@@ -2032,11 +2045,10 @@ div[class~="st-key-settings_worker_row"] {
 """, unsafe_allow_html=True)
 
 with st.container(key='settings_worker_row'):
-    # 4 kolom Kecepatan (0.48 masing-masing) + jarak (2.0) + 4 kolom Akurasi
-    # (0.48 masing-masing) + sisa ruang (2.0). Jarak & sisa dibuat SAMA (2.0)
-    # supaya grup Akurasi jatuh persis di titik tengah (50%) baris.
+    # Rasio persis sama dengan baris label di atas (_BTN, _GAP, _TAIL) supaya
+    # posisi horizontal tombol selalu sejajar dengan label di atasnya.
     _row_cols = st.columns(
-        [0.48, 0.48, 0.48, 0.48, 2.0, 0.48, 0.48, 0.48, 0.48, 2.0],
+        [_BTN, _BTN, _BTN, _BTN, _GAP, _BTN, _BTN, _BTN, _BTN, _TAIL],
         gap="small",
     )
     for _worker_no, _col in zip(range(1, 5), _row_cols[0:4]):
