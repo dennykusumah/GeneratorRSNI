@@ -1353,6 +1353,21 @@ div[class*="st-key-accuracy_"] .stButton > button {
     transform: none !important;
 }
 
+/* Teks angka 1/2/3/4 (elemen <p> di dalam tombol): ukuran, weight, dan font
+   dikunci eksplisit. Nilainya SAMA dengan teks "Deteksi Otomatis" pada kotak
+   Bahasa Sumber (0.8rem, weight 500, Outfit). Warna tidak dikunci di sini
+   karena tombol terpilih memakai putih. */
+div[class*="st-key-worker_"] button p,
+div[class*="st-key-worker_"] button span,
+div[class*="st-key-accuracy_"] button p,
+div[class*="st-key-accuracy_"] button span {
+    font-size: 0.8rem !important;
+    font-weight: 500 !important;
+    line-height: 1 !important;
+    letter-spacing: 0 !important;
+    font-family: 'Outfit', sans-serif !important;
+}
+
 /* Belum dipilih: gelap/netral dengan angka terang. */
 div[class*="st-key-worker_"] button[data-testid="baseButton-secondary"],
 div[class*="st-key-accuracy_"] button[data-testid="baseButton-secondary"] {
@@ -2097,12 +2112,14 @@ div[class*="st-key-lang_main"] div[data-baseweb="select"] > div:focus-within {
 div[class*="st-key-lang_main"] input,
 div[class*="st-key-lang_main"] div[data-baseweb="select"] div,
 div[class*="st-key-lang_main"] div[data-baseweb="select"] span {
-    /* Sama dengan angka 1/2/3/4 pada tombol Akurasi/Kecepatan */
-    color: rgba(165,180,252,0.85) !important;
-    -webkit-text-fill-color: rgba(165,180,252,0.85) !important;
+    /* IDENTIK dengan angka 1/2/3/4 pada tombol Akurasi/Kecepatan.
+       Nilai yang sama dipakai di blok "teks angka tombol" di atas:
+       warna #c8c8ce, ukuran 0.8rem, weight 500 (tidak bold), font Outfit. */
+    color: #c8c8ce !important;
+    -webkit-text-fill-color: #c8c8ce !important;
     opacity: 1 !important;
-    font-size: 0.95rem !important;
-    font-weight: 800 !important;
+    font-size: 0.8rem !important;
+    font-weight: 500 !important;
     line-height: 1 !important;
     letter-spacing: 0 !important;
     font-family: 'Outfit', sans-serif !important;
@@ -2112,7 +2129,7 @@ div[class*="st-key-lang_main"] div[data-baseweb="select"] > div > div {
     padding-left: 0.35rem !important;
 }
 div[class*="st-key-lang_main"] svg {
-    color: rgba(165,180,252,0.85) !important;
+    color: #c8c8ce !important;
     width: 20px !important;
     height: 20px !important;
 }
