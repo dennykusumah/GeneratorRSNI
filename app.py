@@ -113,4 +113,4 @@
 # Kondisi tanpa proses aktif atau halaman hasil: footer berada di akhir alur
 # halaman. Saat proses aktif fungsi ini no-op karena sudah dirender di bawah
 # progress/timer sebelum pekerjaan berat dimulai.
-st.markdown(_FOOTER_HTML, unsafe_allow_html=True)
+_render_footer_once()
