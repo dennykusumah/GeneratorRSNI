@@ -2004,14 +2004,20 @@ for _prefix, _selected in (('worker', _selected_worker), ('accuracy', _selected_
             ''')
 st.markdown('<style>' + ''.join(_worker_css) + '</style>', unsafe_allow_html=True)
 
-# Empat kolom kecil di kiri + satu spacer fleksibel. Ukuran tombol dikunci 42x42 px via CSS.
-# Container khusus memungkinkan gap vertikal dikontrol tanpa mengganggu widget lain.
+# Empat tombol ditempatkan dalam satu container per baris (bukan st.columns
+# bertingkat) lalu dipaksa jadi flex-row via CSS. Pendekatan st.columns
+# sebelumnya bisa "wrap" ke baris baru saat containernya sempit (mis. saat
+# Kecepatan & Akurasi berdampingan dalam 2 kolom), sehingga tombol tumpang
+# tindih/pecah baris. Flex-row + nowrap menjamin 1 baris, apa pun lebar
+# containernya, dan jarak antar tombol pasti (gap eksplisit, bukan sisa ruang
+# kolom). Selector dibuat berlapis (data-testid + fallback generik) supaya
+# tetap kena walau markup internal Streamlit sedikit berbeda antarversi.
 st.markdown("""
 <style>
 div.st-key-speed_worker_row,
 div[class~="st-key-speed_worker_row"],
-div.st-key-accuracy_worker_row,
-div[class~="st-key-accuracy_worker_row"] {
+div.st-key-akurasi_row,
+div[class~="st-key-akurasi_row"] {
     /* Geser row tombol secara nyata ke atas. Margin saja tidak cukup karena
        Streamlit menambahkan gap pada parent vertical-block. */
     position: relative !important;
@@ -2020,6 +2026,48 @@ div[class~="st-key-accuracy_worker_row"] {
     margin-bottom: -2.70rem !important;
     padding-top: 0 !important;
     padding-bottom: 0 !important;
+    overflow: visible !important;
+}
+/* Target utama: elemen dengan data-testid Streamlit saat ini. */
+div.st-key-speed_worker_row div[data-testid="stVerticalBlock"],
+div.st-key-akurasi_row div[data-testid="stVerticalBlock"],
+div.st-key-speed_worker_row div[data-testid="stHorizontalBlock"],
+div.st-key-akurasi_row div[data-testid="stHorizontalBlock"] {
+    display: flex !important;
+    flex-direction: row !important;
+    flex-wrap: nowrap !important;
+    align-items: center !important;
+    /* Jarak antar tombol setara ~2 spasi. */
+    gap: 0.7em !important;
+    width: max-content !important;
+    max-width: none !important;
+}
+div.st-key-speed_worker_row div[data-testid="stElementContainer"],
+div.st-key-akurasi_row div[data-testid="stElementContainer"],
+div.st-key-speed_worker_row div[data-testid="stColumn"],
+div.st-key-akurasi_row div[data-testid="stColumn"] {
+    flex: 0 0 auto !important;
+    width: auto !important;
+    min-width: 0 !important;
+    max-width: none !important;
+    margin: 0 !important;
+}
+/* Fallback generik: jaga-jaga bila Streamlit mengubah nama data-testid.
+   Semua div langsung di dalam row tombol dipaksa berjajar horizontal. */
+div.st-key-speed_worker_row > div,
+div.st-key-akurasi_row > div {
+    display: flex !important;
+    flex-direction: row !important;
+    flex-wrap: nowrap !important;
+    align-items: center !important;
+    gap: 0.7em !important;
+    width: max-content !important;
+}
+div.st-key-speed_worker_row > div > div,
+div.st-key-akurasi_row > div > div {
+    flex: 0 0 auto !important;
+    width: auto !important;
+    min-width: 0 !important;
 }
 </style>
 """, unsafe_allow_html=True)
@@ -2027,32 +2075,28 @@ div[class~="st-key-accuracy_worker_row"] {
 col_speed_btns, col_accuracy_btns = st.columns(2)
 with col_speed_btns:
     with st.container(key='speed_worker_row'):
-        _worker_cols = st.columns([0.48, 0.48, 0.48, 0.48, 5.6], gap="small")[:4]
-        for _worker_no, _worker_col in enumerate(_worker_cols, start=1):
-            with _worker_col:
-                if st.button(
-                    str(_worker_no),
-                    key=f'worker_{_worker_no}',
-                    type='primary' if st.session_state['_engine8_workers'] == _worker_no else 'secondary',
-                    use_container_width=False,
-                ):
-                    st.session_state['_engine8_workers'] = _worker_no
-                    st.session_state['_engine8_accuracy'] = 5 - _worker_no
-                    st.rerun()
+        for _worker_no in range(1, 5):
+            if st.button(
+                str(_worker_no),
+                key=f'worker_{_worker_no}',
+                type='primary' if st.session_state['_engine8_workers'] == _worker_no else 'secondary',
+                use_container_width=False,
+            ):
+                st.session_state['_engine8_workers'] = _worker_no
+                st.session_state['_engine8_accuracy'] = 5 - _worker_no
+                st.rerun()
 with col_accuracy_btns:
-    with st.container(key='accuracy_worker_row'):
-        _accuracy_cols = st.columns([0.48, 0.48, 0.48, 0.48, 5.6], gap="small")[:4]
-        for _accuracy_no, _accuracy_col in enumerate(_accuracy_cols, start=1):
-            with _accuracy_col:
-                if st.button(
-                    str(_accuracy_no),
-                    key=f'accuracy_{_accuracy_no}',
-                    type='primary' if st.session_state['_engine8_accuracy'] == _accuracy_no else 'secondary',
-                    use_container_width=False,
-                ):
-                    st.session_state['_engine8_accuracy'] = _accuracy_no
-                    st.session_state['_engine8_workers'] = 5 - _accuracy_no
-                    st.rerun()
+    with st.container(key='akurasi_row'):
+        for _accuracy_no in range(1, 5):
+            if st.button(
+                str(_accuracy_no),
+                key=f'accuracy_{_accuracy_no}',
+                type='primary' if st.session_state['_engine8_accuracy'] == _accuracy_no else 'secondary',
+                use_container_width=False,
+            ):
+                st.session_state['_engine8_accuracy'] = _accuracy_no
+                st.session_state['_engine8_workers'] = 5 - _accuracy_no
+                st.rerun()
 
 # --- TOMBOL PROSES ---
 btn_process = st.button("🚀 Proses", key="btn_main", use_container_width=True)
