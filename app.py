@@ -1354,9 +1354,8 @@ div[class*="st-key-accuracy_"] .stButton > button {
 }
 
 /* Teks angka 1/2/3/4 (elemen <p> di dalam tombol): ukuran, weight, dan font
-   dikunci eksplisit. Nilainya SAMA dengan teks "Deteksi Otomatis" pada kotak
-   Bahasa Sumber (0.8rem, weight 500, Outfit). Warna tidak dikunci di sini
-   karena tombol terpilih memakai putih. */
+   dikunci eksplisit (0.8rem, weight 500, font bawaan Streamlit). Warna tidak
+   dikunci di sini karena tombol terpilih memakai putih. */
 div[class*="st-key-worker_"] button p,
 div[class*="st-key-worker_"] button span,
 div[class*="st-key-accuracy_"] button p,
@@ -1365,7 +1364,6 @@ div[class*="st-key-accuracy_"] button span {
     font-weight: 500 !important;
     line-height: 1 !important;
     letter-spacing: 0 !important;
-    font-family: 'Outfit', sans-serif !important;
 }
 
 /* Belum dipilih: gelap/netral dengan angka terang. */
@@ -1892,7 +1890,7 @@ def _render_header_with_live_kamus():
             <p>Memformat & Menerjemahan Dokumen Standar ISO Menjadi Draft RSNI Secara Otomatis</p>
             <div class="stats-row">
                 <div class="stat-item">
-                    <div class="stat-num">{_ENGINE_COUNT}</div>
+                    <div class="stat-num">{_ENGINE_COUNT+1}</div>
                     <div class="stat-lbl">Engine</div>
                 </div>
                 <div class="stat-divider"></div>
@@ -1907,7 +1905,7 @@ def _render_header_with_live_kamus():
                 </div>
                 <div class="stat-divider"></div>
                 <div class="stat-item">
-                    <div class="stat-num">{len(LANG_OPTIONS)}</div>
+                    <div class="stat-num">{len(LANG_OPTIONS)-1}</div>
                     <div class="stat-lbl">Bahasa</div>
                 </div>
             </div>
@@ -2089,6 +2087,20 @@ div[class*="st-key-grp_lang"] {
     min-width: 0 !important;
 }
 
+/* Label "ICS" / "No. SNI": ukuran 0.875rem, weight 400, warna #c5c3c6,
+   letter-spacing 0.3px, font bawaan Streamlit (tidak dipaksa Outfit). */
+div[class*="st-key-ics_main"] label,
+div[class*="st-key-ics_main"] label p,
+div[class*="st-key-ics_main"] label div,
+div[class*="st-key-title_main"] label,
+div[class*="st-key-title_main"] label p,
+div[class*="st-key-title_main"] label div {
+    font-size: 0.875rem !important;
+    font-weight: 400 !important;
+    letter-spacing: 0.3px !important;
+    color: #c5c3c6 !important;
+}
+
 /* Selectbox setinggi tombol 1-4 (42px) supaya sejajar */
 div[class*="st-key-lang_main"] {
     width: 100% !important;
@@ -2112,24 +2124,23 @@ div[class*="st-key-lang_main"] div[data-baseweb="select"] > div:focus-within {
 div[class*="st-key-lang_main"] input,
 div[class*="st-key-lang_main"] div[data-baseweb="select"] div,
 div[class*="st-key-lang_main"] div[data-baseweb="select"] span {
-    /* IDENTIK dengan angka 1/2/3/4 pada tombol Akurasi/Kecepatan.
-       Nilai yang sama dipakai di blok "teks angka tombol" di atas:
-       warna #c8c8ce, ukuran 0.8rem, weight 500 (tidak bold), font Outfit. */
-    color: #c8c8ce !important;
-    -webkit-text-fill-color: #c8c8ce !important;
+    /* FONT sama dengan label "Kecepatan" (.speed-label): font bawaan Streamlit
+       "Source Sans", weight 500, letter-spacing 0.3px. Warna & ukuran tetap. */
+    color: #c5c3c6 !important;
+    -webkit-text-fill-color: #c5c3c6 !important;
     opacity: 1 !important;
-    font-size: 0.8rem !important;
+    font-size: 0.875rem !important;
     font-weight: 500 !important;
     line-height: 1 !important;
-    letter-spacing: 0 !important;
-    font-family: 'Outfit', sans-serif !important;
+    letter-spacing: 0.3px !important;
+    font-family: "Source Sans", "Source Sans Pro", sans-serif !important;
 }
 div[class*="st-key-lang_main"] div[role="group"] > div,
 div[class*="st-key-lang_main"] div[data-baseweb="select"] > div > div {
     padding-left: 0.35rem !important;
 }
 div[class*="st-key-lang_main"] svg {
-    color: #c8c8ce !important;
+    color: #c5c3c6 !important;
     width: 20px !important;
     height: 20px !important;
 }
