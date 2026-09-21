@@ -2004,20 +2004,21 @@ for _prefix, _selected in (('worker', _selected_worker), ('accuracy', _selected_
             ''')
 st.markdown('<style>' + ''.join(_worker_css) + '</style>', unsafe_allow_html=True)
 
-# Empat tombol ditempatkan dalam satu container per baris (bukan st.columns
-# bertingkat) lalu dipaksa jadi flex-row via CSS. Pendekatan st.columns
-# sebelumnya bisa "wrap" ke baris baru saat containernya sempit (mis. saat
-# Kecepatan & Akurasi berdampingan dalam 2 kolom), sehingga tombol tumpang
-# tindih/pecah baris. Flex-row + nowrap menjamin 1 baris, apa pun lebar
-# containernya, dan jarak antar tombol pasti (gap eksplisit, bukan sisa ruang
-# kolom). Selector dibuat berlapis (data-testid + fallback generik) supaya
-# tetap kena walau markup internal Streamlit sedikit berbeda antarversi.
+# Empat tombol untuk masing-masing baris ditempatkan lewat kolom Streamlit asli
+# (st.columns) — BUKAN CSS flex buatan sendiri. Percobaan CSS sebelumnya
+# (data-testid tebakan, lalu :has()) tidak konsisten karena bergantung pada
+# struktur DOM internal Streamlit yang ternyata berubah/berbeda di server ini.
+# Solusi ini terbukti bekerja: rasio kolom 0.48 per tombol sudah terbukti
+# menghasilkan 1 baris rapi tanpa wrap saat dipakai di lebar penuh (seperti
+# pada versi awal Kecepatan sebelum Akurasi ditambahkan). Supaya Kecepatan &
+# Akurasi tetap sejajar & tidak overlap, KEDUANYA sekarang dirender dalam SATU
+# st.columns() yang sama (tidak dibagi dua kolom besar dulu baru di-nest lagi),
+# dengan rasio yang dihitung agar grup Akurasi mulai tepat di 50% lebar —
+# persis di bawah label "Akurasi" yang juga berada di 50% lebar.
 st.markdown("""
 <style>
-div.st-key-speed_worker_row,
-div[class~="st-key-speed_worker_row"],
-div.st-key-akurasi_row,
-div[class~="st-key-akurasi_row"] {
+div.st-key-settings_worker_row,
+div[class~="st-key-settings_worker_row"] {
     /* Geser row tombol secara nyata ke atas. Margin saja tidak cukup karena
        Streamlit menambahkan gap pada parent vertical-block. */
     position: relative !important;
@@ -2026,56 +2027,20 @@ div[class~="st-key-akurasi_row"] {
     margin-bottom: -2.70rem !important;
     padding-top: 0 !important;
     padding-bottom: 0 !important;
-    overflow: visible !important;
-}
-/* Target utama: elemen dengan data-testid Streamlit saat ini. */
-div.st-key-speed_worker_row div[data-testid="stVerticalBlock"],
-div.st-key-akurasi_row div[data-testid="stVerticalBlock"],
-div.st-key-speed_worker_row div[data-testid="stHorizontalBlock"],
-div.st-key-akurasi_row div[data-testid="stHorizontalBlock"] {
-    display: flex !important;
-    flex-direction: row !important;
-    flex-wrap: nowrap !important;
-    align-items: center !important;
-    /* Jarak antar tombol setara ~2 spasi. */
-    gap: 0.7em !important;
-    width: max-content !important;
-    max-width: none !important;
-}
-div.st-key-speed_worker_row div[data-testid="stElementContainer"],
-div.st-key-akurasi_row div[data-testid="stElementContainer"],
-div.st-key-speed_worker_row div[data-testid="stColumn"],
-div.st-key-akurasi_row div[data-testid="stColumn"] {
-    flex: 0 0 auto !important;
-    width: auto !important;
-    min-width: 0 !important;
-    max-width: none !important;
-    margin: 0 !important;
-}
-/* Fallback generik: jaga-jaga bila Streamlit mengubah nama data-testid.
-   Semua div langsung di dalam row tombol dipaksa berjajar horizontal. */
-div.st-key-speed_worker_row > div,
-div.st-key-akurasi_row > div {
-    display: flex !important;
-    flex-direction: row !important;
-    flex-wrap: nowrap !important;
-    align-items: center !important;
-    gap: 0.7em !important;
-    width: max-content !important;
-}
-div.st-key-speed_worker_row > div > div,
-div.st-key-akurasi_row > div > div {
-    flex: 0 0 auto !important;
-    width: auto !important;
-    min-width: 0 !important;
 }
 </style>
 """, unsafe_allow_html=True)
 
-col_speed_btns, col_accuracy_btns = st.columns(2)
-with col_speed_btns:
-    with st.container(key='speed_worker_row'):
-        for _worker_no in range(1, 5):
+with st.container(key='settings_worker_row'):
+    # 4 kolom Kecepatan (0.48 masing-masing) + jarak (2.0) + 4 kolom Akurasi
+    # (0.48 masing-masing) + sisa ruang (2.0). Jarak & sisa dibuat SAMA (2.0)
+    # supaya grup Akurasi jatuh persis di titik tengah (50%) baris.
+    _row_cols = st.columns(
+        [0.48, 0.48, 0.48, 0.48, 2.0, 0.48, 0.48, 0.48, 0.48, 2.0],
+        gap="small",
+    )
+    for _worker_no, _col in zip(range(1, 5), _row_cols[0:4]):
+        with _col:
             if st.button(
                 str(_worker_no),
                 key=f'worker_{_worker_no}',
@@ -2085,9 +2050,8 @@ with col_speed_btns:
                 st.session_state['_engine8_workers'] = _worker_no
                 st.session_state['_engine8_accuracy'] = 5 - _worker_no
                 st.rerun()
-with col_accuracy_btns:
-    with st.container(key='akurasi_row'):
-        for _accuracy_no in range(1, 5):
+    for _accuracy_no, _col in zip(range(1, 5), _row_cols[5:9]):
+        with _col:
             if st.button(
                 str(_accuracy_no),
                 key=f'accuracy_{_accuracy_no}',
