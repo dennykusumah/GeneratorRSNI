@@ -8,6 +8,7 @@ import atexit
 import threading
 import uuid
 import importlib.util
+import inspect
 import shutil
 import subprocess
 import csv
@@ -1784,6 +1785,23 @@ def load_engines():
 
 engine1, engine2, engine3, engine4, engine5, engine6, engine7, engine8, engine9 = load_engines()
 
+def _engine8_lang_kwargs() -> dict:
+    """Teruskan pilihan Bahasa Sumber ke Engine 8 HANYA jika Engine 8 menerimanya.
+
+    Dicek lewat signature, sehingga aman walau engine8.process belum punya
+    parameter `source_lang` (tidak akan error; pilihan diabaikan).
+    """
+    try:
+        _params = inspect.signature(engine8.process).parameters
+    except (TypeError, ValueError):
+        return {}
+    _lang = st.session_state.get('_src_lang', 'auto')
+    for _name in ('source_lang', 'src_lang'):
+        if _name in _params:
+            return {_name: _lang}
+    return {}
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # HEADER PERSISTEN
 # Header dirender oleh app utama, bukan fragment terpisah, sehingga kotak info
@@ -2037,6 +2055,95 @@ div[class*="st-key-grp_acc"] .speed-label {
     white-space: nowrap !important;
 }
 
+/* Grup BAHASA SUMBER: mengisi sisa lebar di kanan tombol Akurasi 4, ujung
+   kanannya rata dengan ujung kanan kotak input ICS. */
+div[class*="st-key-spd_acc_row"] > *:last-child {
+    flex: 1 1 auto !important;
+    width: calc(100% - 470px) !important;   /* 235 + 184.5 + 50.5 = mulai kolom bahasa */
+    min-width: 0 !important;
+}
+div[class*="st-key-grp_lang"] {
+    display: flex !important;
+    flex-direction: column !important;
+    align-items: stretch !important;
+    gap: 5px !important;
+    width: 100% !important;
+    min-width: 0 !important;
+}
+div[class*="st-key-grp_lang"] .speed-label {
+    margin: 0 !important;
+    padding: 0 !important;
+    text-align: left !important;
+    white-space: nowrap !important;
+    /* Tinggi baris dikunci = label Kecepatan/Akurasi (16.4px) supaya kotak
+       pilihan tetap sejajar dengan tombol 1-4, walau hurufnya lebih besar. */
+    height: 16.4px !important;
+    line-height: 16.4px !important;
+    display: flex !important;
+    align-items: center !important;
+    font-size: 1.02rem !important;
+    font-weight: 500 !important;
+    letter-spacing: 0.3px !important;
+    color: rgba(255,255,255,0.88) !important;
+    overflow: visible !important;
+}
+div[class*="st-key-grp_lang"] .speed-label .speed-stopwatch {
+    font-size: 1.12rem !important;
+    margin-right: 0.35rem !important;
+    line-height: 1 !important;
+}
+/* Selectbox setinggi tombol 1-4 (42px) supaya sejajar */
+div[class*="st-key-lang_main"] {
+    width: 100% !important;
+    margin: 0 !important;
+}
+div[class*="st-key-lang_main"] div[data-baseweb="select"] > div,
+div[class*="st-key-lang_main"] div[role="group"] {
+    min-height: 42px !important;
+    height: 42px !important;
+    border-radius: 12px !important;
+    background: rgba(15,23,42,0.8) !important;
+    border: 1.5px solid rgba(99,102,241,0.4) !important;
+    color: #e2e8f0 !important;
+    font-size: 0.9rem !important;
+}
+div[class*="st-key-lang_main"] div[data-baseweb="select"] > div:hover,
+div[class*="st-key-lang_main"] div[data-baseweb="select"] > div:focus-within {
+    border-color: rgba(99,102,241,0.6) !important;
+}
+/* Teks pilihan terang (versi Streamlit baru memakai <input> berwarna gelap) */
+div[class*="st-key-lang_main"] input,
+div[class*="st-key-lang_main"] div[data-baseweb="select"] div,
+div[class*="st-key-lang_main"] div[data-baseweb="select"] span {
+    color: #f1f5f9 !important;
+    -webkit-text-fill-color: #f1f5f9 !important;
+    opacity: 1 !important;
+    font-size: 1.12rem !important;
+    font-weight: 500 !important;
+    font-family: 'Outfit', sans-serif !important;
+}
+div[class*="st-key-lang_main"] div[role="group"] > div,
+div[class*="st-key-lang_main"] div[data-baseweb="select"] > div > div {
+    padding-left: 0.35rem !important;
+}
+div[class*="st-key-lang_main"] svg {
+    color: rgba(199,210,254,0.85) !important;
+    width: 22px !important;
+    height: 22px !important;
+}
+
+/* Layar menengah: Bahasa Sumber turun ke baris sendiri (lebar penuh) */
+@media (max-width: 720px) {
+    div[class*="st-key-spd_acc_row"] {
+        flex-wrap: wrap !important;
+        row-gap: 14px !important;
+    }
+    div[class*="st-key-spd_acc_row"] > *:last-child {
+        flex: 1 1 100% !important;
+        width: 100% !important;
+    }
+}
+
 /* Layar sempit (HP): grup boleh turun ke baris berikutnya, tidak terpotong */
 @media (max-width: 460px) {
     div[class*="st-key-spd_acc_row"] {
@@ -2118,6 +2225,23 @@ with st.container(key='spd_acc_row'):
                     st.session_state['_engine8_accuracy'] = _accuracy_no
                     st.session_state['_engine8_workers'] = 5 - _accuracy_no
                     st.rerun()
+
+    # ── Grup BAHASA SUMBER (di kanan tombol Akurasi 4) ──
+    with st.container(key='grp_lang'):
+        st.markdown(
+            '<div class="section-label speed-label"><span class="speed-stopwatch">🌐</span> Bahasa Sumber</div>',
+            unsafe_allow_html=True,
+        )
+        src_lang = st.selectbox(
+            "Bahasa Sumber",
+            options=list(LANG_OPTIONS.keys()),
+            index=0,
+            format_func=lambda x: LANG_OPTIONS[x],
+            key="lang_main",
+            label_visibility="collapsed",
+        )
+        # Salinan nilai terakhir; dibaca saat Proses/Lanjutkan berjalan.
+        st.session_state['_src_lang'] = src_lang
 
 # --- TOMBOL PROSES ---
 btn_process = st.button("🚀 Proses", key="btn_main", use_container_width=True)
@@ -2250,7 +2374,7 @@ if (st.session_state.get('_run_process') and
                 sni_number=_sni,
             )
         elif _resume == 8:
-            _ok, _unused, _msg = engine8.process(_resume_input, _resume_output, worker_count=st.session_state.get('_engine8_workers', 2))
+            _ok, _unused, _msg = engine8.process(_resume_input, _resume_output, worker_count=st.session_state.get('_engine8_workers', 2), **_engine8_lang_kwargs())
         elif _resume == 9:
             _ok, _unused, _msg = engine9.process(_resume_input, _resume_output)
         else:
@@ -2637,6 +2761,7 @@ if st.session_state.get('_run_process') and st.session_state.get('_target_file')
             output_docx=engine8_out,
             progress_callback=_engine8_progress,
             worker_count=st.session_state.get('_engine8_workers', 2),
+            **_engine8_lang_kwargs(),
         )
         if not ok_e8:
             _remember_engine_output(8, engine8_out)
