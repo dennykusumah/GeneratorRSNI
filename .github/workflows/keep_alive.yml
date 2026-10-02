@@ -2,9 +2,7 @@ name: Keep Streamlit Awake
 
 on:
   schedule:
-    # Run every 4 hours to reduce the chance of the Streamlit app
-    # remaining asleep for a long period.
-    - cron: "0 */4 * * *"
+    - cron: "0 */6 * * *"
   workflow_dispatch:
 
 jobs:
@@ -12,11 +10,9 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
+      - uses: actions/setup-node@v4
         with:
           node-version: 20
 
@@ -29,123 +25,93 @@ jobs:
       - name: Create Playwright script
         run: |
           cat > wake.js <<'EOF'
-          const { chromium } = require("playwright");
-
-          const URL = "https://generator-rsni.streamlit.app";
-          const WAKE_TEXT = "Yes, get this app back up!";
+          const { chromium } = require('playwright');
 
           (async () => {
-            const browser = await chromium.launch({ headless: true });
+            const browser = await chromium.launch({
+              headless: true
+            });
+
+            const page = await browser.newPage({
+              viewport: {
+                width: 1400,
+                height: 900
+              }
+            });
+
+            page.setDefaultTimeout(120000);
+
+            console.log("Opening Streamlit...");
 
             try {
-              const context = await browser.newContext({
-                viewport: { width: 1400, height: 900 },
-              });
 
-              const page = await context.newPage();
+              await page.goto(
+                "https://generator-rsni-1.streamlit.app",
+                {
+                  waitUntil: "domcontentloaded",
+                  timeout: 120000
+                }
+              );
 
-              page.setDefaultTimeout(120000);
+              await page.waitForTimeout(5000);
 
-              console.log("Opening Streamlit:", URL);
-
-              await page.goto(URL, {
-                waitUntil: "domcontentloaded",
-                timeout: 120000,
-              });
-
-              console.log("Initial URL:", page.url());
-              console.log("Initial title:", await page.title());
-
-              // Give Streamlit time to render the sleep page.
-              await page.waitForTimeout(8000);
-
-              const bodyText = await page.locator("body").innerText().catch(() => "");
-              console.log("Page text preview:");
-              console.log(bodyText.slice(0, 2000));
-
-              // The current Streamlit sleep page uses this exact button text.
-              const wakeButton = page.getByRole("button", {
-                name: WAKE_TEXT,
-                exact: true,
-              });
+              const wakeButton = page.locator(
+                'button:has-text("Yes, get this app back up!")'
+              );
 
               if (await wakeButton.count() > 0) {
-                console.log("Sleep page detected.");
-                console.log("Clicking:", WAKE_TEXT);
+
+                console.log("App sleeping.");
 
                 await wakeButton.first().click();
 
-                console.log("Wake button clicked.");
-                console.log("Waiting for Streamlit application to start...");
+                console.log("Waiting for app to start...");
 
-                // Streamlit can take a while to restart.
-                await page.waitForTimeout(15000);
+                await page.waitForLoadState("networkidle");
 
-                // Wait for the sleep button to disappear.
-                try {
-                  await wakeButton.first().waitFor({
-                    state: "hidden",
-                    timeout: 120000,
-                  });
-                  console.log("Sleep button disappeared.");
-                } catch {
-                  console.log("Sleep button is still present after waiting.");
-                }
+                await page.waitForTimeout(60000);
 
-                // Allow the app to finish rendering.
-                await page.waitForTimeout(30000);
               } else {
-                console.log("Wake button not found.");
-                console.log("The app may already be awake.");
+
+                console.log("App already awake.");
+
               }
-
-              // Final verification.
-              const finalText = await page.locator("body").innerText().catch(() => "");
-              const stillSleeping = finalText.includes(WAKE_TEXT);
-
-              console.log("Final URL:", page.url());
-              console.log("Final title:", await page.title());
-              console.log("Still showing sleep button:", stillSleeping);
 
               await page.screenshot({
-                path: stillSleeping ? "error.png" : "success.png",
-                fullPage: true,
+                path: "success.png",
+                fullPage: true
               });
 
-              if (stillSleeping) {
-                throw new Error(
-                  "Streamlit is still showing the sleep page after the wake attempt."
-                );
-              }
+              console.log("Finished.");
 
-              console.log("SUCCESS: Streamlit app is awake.");
             } catch (err) {
-              console.error("KEEP-ALIVE FAILED:");
-              console.error(err);
 
-              try {
-                await page.screenshot({
-                  path: "error.png",
-                  fullPage: true,
-                });
-              } catch {}
+              console.log(err);
+
+              await page.screenshot({
+                path: "error.png",
+                fullPage: true
+              });
 
               throw err;
+
             } finally {
+
               await browser.close();
+
             }
+
           })();
           EOF
 
-      - name: Run keep-alive
+      - name: Run script
         run: node wake.js
 
       - name: Upload screenshots
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: streamlit-keep-alive-screenshots
+          name: screenshots
           path: |
             success.png
             error.png
-          if-no-files-found: ignore
