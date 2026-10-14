@@ -2381,12 +2381,69 @@ def _deepl_translate(text: str, source: str = 'auto', target: str = 'id') -> str
     return str(rows[0]['text'])
 
 
+def _get_google_translate_api_key() -> str:
+    """Ambil Google Cloud Translation API key (OPSIONAL).
+
+    Dibaca dari environment lebih dahulu, lalu Streamlit Secrets. Nama yang
+    didukung: GOOGLE_TRANSLATE_API_KEY atau GOOGLE_CLOUD_TRANSLATE_API_KEY.
+    Jika tidak ada, string kosong dikembalikan dan tahap ini dilewati.
+    """
+    names = ("GOOGLE_TRANSLATE_API_KEY", "GOOGLE_CLOUD_TRANSLATE_API_KEY")
+    for name in names:
+        value = str(os.getenv(name, "") or "").strip()
+        if value:
+            return value
+    try:
+        import streamlit as st
+        for name in names:
+            try:
+                value = str(st.secrets.get(name, "") or "").strip()
+                if value:
+                    return value
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return ""
+
+
+def _google_cloud_translate(text: str, source: str = 'auto', target: str = 'id',
+                            api_key: str = "") -> str:
+    """Google Cloud Translation API (Basic/v2) dengan API key.
+
+    Key dikirim lewat header (bukan query string) agar tidak pernah muncul
+    pada pesan error/log. Pesan exception hanya memuat kode HTTP.
+    """
+    import requests
+    key = (api_key or _get_google_translate_api_key()).strip()
+    if not key:
+        raise RuntimeError('GOOGLE_TRANSLATE_API_KEY belum tersedia')
+    body = {'q': text, 'target': str(target or 'id'), 'format': 'text'}
+    if source not in ('auto', '', None):
+        body['source'] = str(source)
+    response = requests.post(
+        'https://translation.googleapis.com/language/translate/v2',
+        headers={'X-goog-api-key': key, 'Content-Type': 'application/json; charset=utf-8'},
+        json=body,
+        timeout=25,
+    )
+    if response.status_code >= 400:
+        raise RuntimeError(f'Google Cloud Translation HTTP {response.status_code}')
+    payload = response.json()
+    rows = ((payload or {}).get('data') or {}).get('translations') or []
+    if not rows or not rows[0].get('translatedText'):
+        raise RuntimeError('Google Cloud Translation tidak mengembalikan hasil terjemahan')
+    return str(rows[0]['translatedText'])
+
+
 class _RecoveryFallbackTranslator:
     """Pemulihan serial (1 worker): Google -> Gemini key 1..15 -> Argos ->
-    MyMemory -> DeepL -> gagal.
+    MyMemory -> DeepL -> Google Cloud Translation API (opsional) -> gagal.
 
     Setiap unit teks melewati provider secara berurutan. Gemini selalu mulai
     dari API key 1; 401/403/429 akan mencoba key berikutnya sampai pool habis.
+    Google Cloud Translation API hanya dipakai bila GOOGLE_TRANSLATE_API_KEY
+    tersedia (env / Streamlit Secrets); jika tidak, tahap itu dilewati.
     Microsoft Translator dan Yandex tidak digunakan.
     """
     def __init__(self, source='auto', target='id', custom_dict=None,
@@ -2403,6 +2460,8 @@ class _RecoveryFallbackTranslator:
         self.last_error_code = None
         self.diagnostics = []
         self._google = GoogleTranslator(source=source, target=target)
+        # Opsional: kosong => tahap Google Cloud Translation API dilewati.
+        self._google_cloud_key = _get_google_translate_api_key()
         keys = _get_gemini_api_keys()
         self._gemini = (_GeminiRecoveryTranslator(
             source, target, custom_dict, italic_dict,
@@ -2502,6 +2561,20 @@ class _RecoveryFallbackTranslator:
                 result = candidate; self.last_provider = 'DeepL translator'; self.last_error_code = None
             except Exception as exc:
                 errors.append(f'DeepL:{_google_error_code(exc) or type(exc).__name__}')
+
+        # 6) Google Cloud Translation API -- OPSIONAL. Hanya dijalankan bila
+        #    API key tersedia di env/Streamlit Secrets; jika tidak, dilewati
+        #    tanpa error dan tanpa mengubah perilaku rantai sebelumnya.
+        if result is None and self._google_cloud_key:
+            try:
+                candidate = _google_cloud_translate(
+                    protected, self.source, self.target, self._google_cloud_key
+                )
+                if not _fallback_candidate_ok(protected, candidate, expected_tokens):
+                    raise RuntimeError('Google Cloud Translation tidak lolos quality gate')
+                result = candidate; self.last_provider = 'Google Cloud Translation API'; self.last_error_code = None
+            except Exception as exc:
+                errors.append(f'GoogleCloud:{_google_error_code(exc) or type(exc).__name__}')
 
         if result is None:
             self.failed_texts.append(re.sub(r'\s+', ' ', original).strip()[:100])
@@ -3139,6 +3212,8 @@ class DocxFinalTranslatorEngine:
 
             def _provider_label(provider):
                 provider = (provider or 'Google Translate').strip()
+                if provider.lower().startswith('google cloud'):
+                    return 'Google Cloud Translation API'
                 if provider.lower().startswith('google'):
                     return f'Google Translate {worker_count} worker'
                 if provider.lower().startswith('gemini api') or provider.lower().startswith('gemini flash api'):
@@ -3252,7 +3327,7 @@ class DocxFinalTranslatorEngine:
             # Recovery HANYA menerima target yang gagal dari translate utama.
             # Setiap target recovery dikerjakan SATU KALI melalui seluruh rantai
             # recovery yang tersedia:
-            # Google -> Gemini 1..15 -> Argos -> MyMemory -> DeepL.
+            # Google -> Gemini 1..15 -> Argos -> MyMemory -> DeepL -> Google Cloud (opsional).
             #
             # Tidak ada lagi batas 10 loop dan tidak ada pengulangan recovery
             # terhadap target yang sama. Recovery berakhir tepat ketika seluruh
@@ -3336,7 +3411,7 @@ class DocxFinalTranslatorEngine:
             if still_failed:
                 return False, (
                     f"{len(still_failed)} bagian masih belum berhasil "
-                    "diterjemahkan setelah pemulihan multilevel Google/Gemini/Argos/MyMemory/DeepL. Dokumen parsial "
+                    "diterjemahkan setelah pemulihan multilevel Google/Gemini/Argos/MyMemory/DeepL/Google Cloud (opsional). Dokumen parsial "
                     "Engine 8 sudah disimpan; teks sumber yang gagal diberi "
                     "font merah dan dapat di-download atau "
                     "dipaksa lanjut ke Engine 9."
