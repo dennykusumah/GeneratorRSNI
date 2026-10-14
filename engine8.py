@@ -1692,6 +1692,8 @@ class _Translator:
         self.dictionary_fingerprint = dictionary_fingerprint or _canonical_dictionary_fingerprint(custom_dict, italic_dict)
         self._coordinator = _GOOGLE_TRANSLATE_COORDINATOR
         self._gemini_fallback = None
+        # Opsional: kosong => gelombang 4 (Google Cloud Translation API) dilewati.
+        self._google_cloud_key = _get_google_translate_main_api_key()
         self.last_provider = 'google'
         self.last_error_code = None
 
@@ -1740,10 +1742,12 @@ class _Translator:
         result = None
         last_error = None
 
-        # Translator utama memakai tiga gelombang terkontrol:
+        # Translator utama memakai empat gelombang terkontrol:
         # 1) Google -> seluruh pool Gemini
         # 2) Google -> seluruh pool Gemini -> Argos
         # 3) Google -> seluruh pool Gemini -> Argos -> MyMemory
+        # 4) Google -> seluruh pool Gemini -> Argos -> MyMemory -> Google Cloud
+        #    Translation API (key UTAMA, opsional: tanpa key gelombang 4 dilewati)
         # Jika semuanya gagal, unit masuk tahap pemulihan.
         #
         # Gemini dibuat ulang pada setiap gelombang agar selalu mulai dari API key
@@ -1842,6 +1846,43 @@ class _Translator:
                 self.last_error_code = _google_error_code(exc)
                 return False
 
+        def _mymemory_stage(stage_no: int) -> bool:
+            nonlocal result, last_error
+            try:
+                from deep_translator import MyMemoryTranslator
+                mm_source = 'en-GB' if self.source in ('auto', 'en') else self.source
+                mm_target = 'id-ID' if self.target == 'id' else self.target
+                candidate = MyMemoryTranslator(source=mm_source, target=mm_target).translate(t)
+                if not _fallback_candidate_ok(t, candidate, expected_tokens):
+                    raise RuntimeError('MyMemory tidak lolos quality gate')
+                result = candidate
+                self.last_provider = 'MyMemory Translate'
+                self.last_error_code = None
+                return True
+            except Exception as exc:
+                last_error = exc
+                self.last_error_code = _google_error_code(exc)
+                return False
+
+        def _google_cloud_stage() -> bool:
+            # Google Cloud Translation API dengan key UTAMA (terpisah dari key
+            # pemulihan). Hasil tetap melewati quality gate yang sama.
+            nonlocal result, last_error
+            try:
+                candidate = _google_cloud_translate(
+                    t, self.source, self.target, self._google_cloud_key
+                )
+                if not _fallback_candidate_ok(t, candidate, expected_tokens):
+                    raise RuntimeError('Google Cloud Translation tidak lolos quality gate')
+                result = candidate
+                self.last_provider = 'Google Cloud Translation API'
+                self.last_error_code = None
+                return True
+            except Exception as exc:
+                last_error = exc
+                self.last_error_code = _google_error_code(exc)
+                return False
+
         # GELOMBANG 1: Google -> Gemini seluruh key.
         _google_stage(1)
         if result is None:
@@ -1878,19 +1919,27 @@ class _Translator:
             _argos_stage(3)
 
         if result is None:
-            try:
-                from deep_translator import MyMemoryTranslator
-                mm_source = 'en-GB' if self.source in ('auto', 'en') else self.source
-                mm_target = 'id-ID' if self.target == 'id' else self.target
-                candidate = MyMemoryTranslator(source=mm_source, target=mm_target).translate(t)
-                if not _fallback_candidate_ok(t, candidate, expected_tokens):
-                    raise RuntimeError('MyMemory tidak lolos quality gate')
-                result = candidate
-                self.last_provider = 'MyMemory Translate'
-                self.last_error_code = None
-            except Exception as exc:
-                last_error = exc
-                self.last_error_code = _google_error_code(exc)
+            _mymemory_stage(3)
+
+        # GELOMBANG 4 (hanya bila API key Google Cloud UTAMA tersedia):
+        # Google lagi -> Gemini lagi -> Argos lagi -> MyMemory lagi ->
+        # Google Cloud Translation API. Tanpa key, rantai tetap berhenti di
+        # gelombang 3 seperti sebelumnya.
+        if result is None and self._google_cloud_key:
+            time.sleep(0.75 + random.uniform(0.05, 0.30))
+            _google_stage(4)
+            if result is None:
+                ok, gemini_payload = _gemini_stage(4)
+                if ok and gemini_payload is not None:
+                    if owns_flight:
+                        _ENGINE8_TRANSLATION_CACHE.finish(cache_key)
+                    return gemini_payload
+            if result is None:
+                _argos_stage(4)
+            if result is None:
+                _mymemory_stage(4)
+            if result is None:
+                _google_cloud_stage()
 
         if result is None:
             # Judul standar lazim terdiri dari beberapa klausa yang dipisahkan
@@ -2381,30 +2430,54 @@ def _deepl_translate(text: str, source: str = 'auto', target: str = 'id') -> str
     return str(rows[0]['text'])
 
 
-def _get_google_translate_api_key() -> str:
-    """Ambil Google Cloud Translation API key (OPSIONAL).
+# Nama secret/env. API key Google Cloud Translation UTAMA dan PEMULIHAN
+# dibaca dari nama yang BERBEDA sehingga boleh berisi key yang berbeda.
+_GOOGLE_TRANSLATE_MAIN_KEY_NAMES = ("GOOGLE_TRANSLATE_API_KEY_UTAMA",)
+_GOOGLE_TRANSLATE_RECOVERY_KEY_NAMES = (
+    "GOOGLE_TRANSLATE_API_KEY_PEMULIHAN",
+    "GOOGLE_TRANSLATE_API_KEY",           # nama lama, tetap didukung
+    "GOOGLE_CLOUD_TRANSLATE_API_KEY",     # nama lama, tetap didukung
+)
 
-    Dibaca dari environment lebih dahulu, lalu Streamlit Secrets. Nama yang
-    didukung: GOOGLE_TRANSLATE_API_KEY atau GOOGLE_CLOUD_TRANSLATE_API_KEY.
-    Jika tidak ada, string kosong dikembalikan dan tahap ini dilewati.
+
+def _read_optional_secret(names) -> str:
+    """Baca secret opsional: environment dulu, lalu Streamlit Secrets.
+
+    Tidak pernah melempar error; mengembalikan string kosong bila tidak ada.
     """
-    names = ("GOOGLE_TRANSLATE_API_KEY", "GOOGLE_CLOUD_TRANSLATE_API_KEY")
     for name in names:
-        value = str(os.getenv(name, "") or "").strip()
+        try:
+            value = str(os.getenv(name, "") or "").strip()
+        except Exception:
+            value = ""
         if value:
             return value
-    try:
-        import streamlit as st
-        for name in names:
-            try:
-                value = str(st.secrets.get(name, "") or "").strip()
-                if value:
-                    return value
-            except Exception:
-                pass
-    except Exception:
-        pass
+        try:
+            import streamlit as st
+            value = str(st.secrets.get(name, "") or "").strip()
+        except Exception:
+            value = ""
+        if value:
+            return value
     return ""
+
+
+def _get_google_translate_main_api_key() -> str:
+    """API key Google Cloud Translation untuk TRANSLATE UTAMA (opsional).
+
+    Secret: GOOGLE_TRANSLATE_API_KEY_UTAMA. Kosong => gelombang 4 dilewati.
+    """
+    return _read_optional_secret(_GOOGLE_TRANSLATE_MAIN_KEY_NAMES)
+
+
+def _get_google_translate_api_key() -> str:
+    """API key Google Cloud Translation untuk PEMULIHAN (opsional).
+
+    Secret: GOOGLE_TRANSLATE_API_KEY_PEMULIHAN (nama lama GOOGLE_TRANSLATE_API_KEY
+    dan GOOGLE_CLOUD_TRANSLATE_API_KEY juga tetap dibaca). Kosong => tahap
+    Google Cloud pada pemulihan dilewati.
+    """
+    return _read_optional_secret(_GOOGLE_TRANSLATE_RECOVERY_KEY_NAMES)
 
 
 def _google_cloud_translate(text: str, source: str = 'auto', target: str = 'id',
@@ -2415,9 +2488,9 @@ def _google_cloud_translate(text: str, source: str = 'auto', target: str = 'id',
     pada pesan error/log. Pesan exception hanya memuat kode HTTP.
     """
     import requests
-    key = (api_key or _get_google_translate_api_key()).strip()
+    key = str(api_key or '').strip()
     if not key:
-        raise RuntimeError('GOOGLE_TRANSLATE_API_KEY belum tersedia')
+        raise RuntimeError('API key Google Cloud Translation belum tersedia')
     body = {'q': text, 'target': str(target or 'id'), 'format': 'text'}
     if source not in ('auto', '', None):
         body['source'] = str(source)
@@ -2442,8 +2515,9 @@ class _RecoveryFallbackTranslator:
 
     Setiap unit teks melewati provider secara berurutan. Gemini selalu mulai
     dari API key 1; 401/403/429 akan mencoba key berikutnya sampai pool habis.
-    Google Cloud Translation API hanya dipakai bila GOOGLE_TRANSLATE_API_KEY
-    tersedia (env / Streamlit Secrets); jika tidak, tahap itu dilewati.
+    Google Cloud Translation API hanya dipakai bila GOOGLE_TRANSLATE_API_KEY_PEMULIHAN
+    (atau nama lama GOOGLE_TRANSLATE_API_KEY) tersedia di env / Streamlit Secrets;
+    jika tidak, tahap itu dilewati. Key ini terpisah dari key translate utama.
     Microsoft Translator dan Yandex tidak digunakan.
     """
     def __init__(self, source='auto', target='id', custom_dict=None,
@@ -3231,12 +3305,13 @@ class DocxFinalTranslatorEngine:
             # TRANSLATE UTAMA: SELURUH TARGET HARUS SELESAI DIPROSES DULU
             # -----------------------------------------------------------------
             # Setiap target menjalani rantai utama lengkap di _Translator:
-            #   Gelombang 1 -> Gelombang 2 -> Gelombang 3.
+            #   Gelombang 1 -> Gelombang 2 -> Gelombang 3 (-> Gelombang 4 bila
+            #   API key Google Cloud UTAMA tersedia).
             #
             # PENTING: X/Y pada dashboard adalah jumlah TARGET UNIK yang sudah
             # selesai diproses oleh translate utama, bukan hanya yang sukses.
             # Karena itu Recovery TIDAK BOLEH dimulai sebelum X == Y.
-            # Target yang gagal setelah Gelombang 3 disimpan di failed_paras,
+            # Target yang gagal setelah Gelombang terakhir disimpan di failed_paras,
             # tetapi translate utama tetap menyelesaikan seluruh target lain
             # sampai, misalnya, 1000/1000. Barulah kegagalan masuk Recovery.
             #
@@ -3318,7 +3393,7 @@ class DocxFinalTranslatorEngine:
                 )
 
             # Recovery hanya boleh dimulai setelah dashboard utama sudah Y/Y.
-            # Hanya target yang gagal setelah rantai Gelombang 1->2->3 yang
+            # Hanya target yang gagal setelah rantai Gelombang 1->2->3(->4) yang
             # diteruskan ke Recovery.
             failed_paras = sorted(failed_paras, key=lambda item: item[0])
 
