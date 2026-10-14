@@ -2437,8 +2437,8 @@ def _google_cloud_translate(text: str, source: str = 'auto', target: str = 'id',
 
 
 class _RecoveryFallbackTranslator:
-    """Pemulihan serial (1 worker): Google -> Gemini key 1..15 -> Argos ->
-    MyMemory -> DeepL -> Google Cloud Translation API (opsional) -> gagal.
+    """Pemulihan serial (1 worker): Google -> Google Cloud API key (opsional) ->
+    Gemini key 1..15 -> Argos -> MyMemory -> DeepL -> gagal.
 
     Setiap unit teks melewati provider secara berurutan. Gemini selalu mulai
     dari API key 1; 401/403/429 akan mencoba key berikutnya sampai pool habis.
@@ -2510,7 +2510,22 @@ class _RecoveryFallbackTranslator:
             errors.append(f'Google:{_google_error_code(exc) or type(exc).__name__}')
             self.last_error_code = _google_error_code(exc)
 
-        # 2) Gemini -- mulai key 1 dan failover 429/auth sampai key 15/pool habis.
+        # 2) Google Cloud Translation API (API key) -- OPSIONAL. Hanya dijalankan
+        #    bila GOOGLE_TRANSLATE_API_KEY tersedia di env/Streamlit Secrets;
+        #    jika tidak, dilewati tanpa error dan langsung lanjut ke Gemini.
+        if result is None and self._google_cloud_key:
+            try:
+                candidate = _google_cloud_translate(
+                    protected, self.source, self.target, self._google_cloud_key
+                )
+                if not _fallback_candidate_ok(protected, candidate, expected_tokens):
+                    raise RuntimeError('Google Cloud Translation tidak lolos quality gate')
+                result = candidate; self.last_provider = 'Google Cloud Translation API'; self.last_error_code = None
+            except Exception as exc:
+                errors.append(f'GoogleCloud:{_google_error_code(exc) or type(exc).__name__}')
+                self.last_error_code = _google_error_code(exc)
+
+        # 3) Gemini -- mulai key 1 dan failover 429/auth sampai key 15/pool habis.
         if result is None and self._gemini is not None:
             try:
                 # Setiap unit pemulihan selalu mulai lagi dari API key 1.
@@ -2529,7 +2544,7 @@ class _RecoveryFallbackTranslator:
                 errors.append(f'Gemini:{_gemini_status_code(exc) or type(exc).__name__}')
                 self.last_error_code = _gemini_status_code(exc)
 
-        # 3) Argos Translate.
+        # 4) Argos Translate.
         if result is None:
             try:
                 candidate = _argos_translate(protected, self.source, self.target)
@@ -2539,7 +2554,7 @@ class _RecoveryFallbackTranslator:
             except Exception as exc:
                 errors.append(f'Argos:{type(exc).__name__}')
 
-        # 4) MyMemory.
+        # 5) MyMemory.
         if result is None:
             try:
                 from deep_translator import MyMemoryTranslator
@@ -2552,7 +2567,7 @@ class _RecoveryFallbackTranslator:
             except Exception as exc:
                 errors.append(f'MyMemory:{_google_error_code(exc) or type(exc).__name__}')
 
-        # 5) DeepL -- provider terakhir sebelum dinyatakan gagal.
+        # 6) DeepL -- provider terakhir sebelum dinyatakan gagal.
         if result is None:
             try:
                 candidate = _deepl_translate(protected, self.source, self.target)
@@ -2561,20 +2576,6 @@ class _RecoveryFallbackTranslator:
                 result = candidate; self.last_provider = 'DeepL translator'; self.last_error_code = None
             except Exception as exc:
                 errors.append(f'DeepL:{_google_error_code(exc) or type(exc).__name__}')
-
-        # 6) Google Cloud Translation API -- OPSIONAL. Hanya dijalankan bila
-        #    API key tersedia di env/Streamlit Secrets; jika tidak, dilewati
-        #    tanpa error dan tanpa mengubah perilaku rantai sebelumnya.
-        if result is None and self._google_cloud_key:
-            try:
-                candidate = _google_cloud_translate(
-                    protected, self.source, self.target, self._google_cloud_key
-                )
-                if not _fallback_candidate_ok(protected, candidate, expected_tokens):
-                    raise RuntimeError('Google Cloud Translation tidak lolos quality gate')
-                result = candidate; self.last_provider = 'Google Cloud Translation API'; self.last_error_code = None
-            except Exception as exc:
-                errors.append(f'GoogleCloud:{_google_error_code(exc) or type(exc).__name__}')
 
         if result is None:
             self.failed_texts.append(re.sub(r'\s+', ' ', original).strip()[:100])
@@ -3327,7 +3328,7 @@ class DocxFinalTranslatorEngine:
             # Recovery HANYA menerima target yang gagal dari translate utama.
             # Setiap target recovery dikerjakan SATU KALI melalui seluruh rantai
             # recovery yang tersedia:
-            # Google -> Gemini 1..15 -> Argos -> MyMemory -> DeepL -> Google Cloud (opsional).
+            # Google -> Google Cloud API key (opsional) -> Gemini 1..15 -> Argos -> MyMemory -> DeepL.
             #
             # Tidak ada lagi batas 10 loop dan tidak ada pengulangan recovery
             # terhadap target yang sama. Recovery berakhir tepat ketika seluruh
@@ -3411,7 +3412,7 @@ class DocxFinalTranslatorEngine:
             if still_failed:
                 return False, (
                     f"{len(still_failed)} bagian masih belum berhasil "
-                    "diterjemahkan setelah pemulihan multilevel Google/Gemini/Argos/MyMemory/DeepL/Google Cloud (opsional). Dokumen parsial "
+                    "diterjemahkan setelah pemulihan multilevel Google/Google Cloud (opsional)/Gemini/Argos/MyMemory/DeepL. Dokumen parsial "
                     "Engine 8 sudah disimpan; teks sumber yang gagal diberi "
                     "font merah dan dapat di-download atau "
                     "dipaksa lanjut ke Engine 9."
