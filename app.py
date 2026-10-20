@@ -1815,6 +1815,26 @@ def _engine8_lang_kwargs() -> dict:
     return {}
 
 
+def _skip_engine8() -> bool:
+    """True bila Bahasa Sumber = Indonesia.
+
+    Dokumen sudah berbahasa Indonesia sehingga Engine 8 (penerjemahan) dilewati
+    dan hanya Engine 1-7 (formatting) serta Engine 9 (style final + TOC) yang
+    berjalan. Untuk pilihan lain, termasuk "Deteksi Otomatis", alur tidak berubah.
+    """
+    return st.session_state.get('_src_lang', 'auto') == 'id'
+
+
+def _engine8_passthrough(input_docx: str, output_docx: str) -> None:
+    """Pengganti Engine 8 saat dilewati: salin output Engine 7 apa adanya.
+
+    Output disalin ke nama berkas engine8_* agar Engine 9, tombol Lanjutkan,
+    dan pembersihan berkas sementara tetap bekerja seperti biasa.
+    """
+    if os.path.abspath(input_docx) != os.path.abspath(output_docx):
+        shutil.copyfile(input_docx, output_docx)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # HEADER PERSISTEN
 # Header dirender oleh app utama, bukan fragment terpisah, sehingga kotak info
@@ -2387,7 +2407,11 @@ if (st.session_state.get('_run_process') and
                 sni_number=_sni,
             )
         elif _resume == 8:
-            _ok, _unused, _msg = engine8.process(_resume_input, _resume_output, worker_count=st.session_state.get('_engine8_workers', 2), **_engine8_lang_kwargs())
+            if _skip_engine8():
+                _engine8_passthrough(_resume_input, _resume_output)
+                _ok, _unused, _msg = True, _resume_output, 'Bahasa sumber Indonesia — Engine 8 dilewati.'
+            else:
+                _ok, _unused, _msg = engine8.process(_resume_input, _resume_output, worker_count=st.session_state.get('_engine8_workers', 2), **_engine8_lang_kwargs())
         elif _resume == 9:
             _ok, _unused, _msg = engine9.process(_resume_input, _resume_output)
         else:
@@ -2722,66 +2746,72 @@ if st.session_state.get('_run_process') and st.session_state.get('_target_file')
         update_ui(10, f"Format dasar selesai ✓\n{msg_e7}")
 
         engine8_out = f"engine8_{_sid}_{original_name}"
-        update_ui(10, "Memulai penerjemahan dokumen...")
-        _engine8_progress_state = {'pct': 10}
+        if _skip_engine8():
+            update_ui(10, "Bahasa sumber Indonesia — penerjemahan (Engine 8) dilewati...")
+            _engine8_passthrough(engine7_out, engine8_out)
+            _remember_engine_output(8, engine8_out)
+            msg_e8 = "Engine 8 dilewati (bahasa sumber Indonesia)."
+        else:
+            update_ui(10, "Memulai penerjemahan dokumen...")
+            _engine8_progress_state = {'pct': 10}
 
-        def _engine8_progress(pct, msg):
-            # Engine 8 mengirim dua bentuk progress:
-            #   [Google Translate 4 worker | XX/YY | berhasil=A | gagal=B]
-            #   [Gemini API N | XX/YY | berhasil=A | gagal=B]
-            #   [Recovery: Gemini API N | AA/ZZ | berhasil=C | gagal=D]
-            # Translate utama dipetakan 10-90%; Recovery 90-98%.
-            text = msg or ''
+            def _engine8_progress(pct, msg):
+                # Engine 8 mengirim dua bentuk progress:
+                #   [Google Translate 4 worker | XX/YY | berhasil=A | gagal=B]
+                #   [Gemini API N | XX/YY | berhasil=A | gagal=B]
+                #   [Recovery: Gemini API N | AA/ZZ | berhasil=C | gagal=D]
+                # Translate utama dipetakan 10-90%; Recovery 90-98%.
+                text = msg or ''
 
-            recovery_match = re.search(
-                r'\[Recovery:\s*[^|\]]+\|\s*(\d+)\s*/\s*(\d+)\s*\|',
-                text, re.IGNORECASE,
-            )
-            main_match = None
-            if not recovery_match:
-                main_match = re.search(
-                    r'\[(?!Recovery:)[^|\]]+\|\s*(\d+)\s*/\s*(\d+)\s*\|',
+                recovery_match = re.search(
+                    r'\[Recovery:\s*[^|\]]+\|\s*(\d+)\s*/\s*(\d+)\s*\|',
                     text, re.IGNORECASE,
                 )
+                main_match = None
+                if not recovery_match:
+                    main_match = re.search(
+                        r'\[(?!Recovery:)[^|\]]+\|\s*(\d+)\s*/\s*(\d+)\s*\|',
+                        text, re.IGNORECASE,
+                    )
 
-            calculated_pct = _engine8_progress_state['pct']
-            if recovery_match and int(recovery_match.group(2)) > 0:
-                done = int(recovery_match.group(1))
-                total_recovery = int(recovery_match.group(2))
-                ratio = min(max(done / total_recovery, 0.0), 1.0)
-                calculated_pct = 90 + int(ratio * 8)
-            elif main_match and int(main_match.group(2)) > 0:
-                done = int(main_match.group(1))
-                total_main = int(main_match.group(2))
-                ratio = min(max(done / total_main, 0.0), 1.0)
-                calculated_pct = 10 + int(ratio * 80)
-            elif isinstance(pct, (int, float)):
-                # Pesan non-counter seperti sinkronisasi/saving tetap boleh
-                # membawa progress Engine 8, tetapi dibatasi maksimum 98%.
-                calculated_pct = int(pct)
+                calculated_pct = _engine8_progress_state['pct']
+                if recovery_match and int(recovery_match.group(2)) > 0:
+                    done = int(recovery_match.group(1))
+                    total_recovery = int(recovery_match.group(2))
+                    ratio = min(max(done / total_recovery, 0.0), 1.0)
+                    calculated_pct = 90 + int(ratio * 8)
+                elif main_match and int(main_match.group(2)) > 0:
+                    done = int(main_match.group(1))
+                    total_main = int(main_match.group(2))
+                    ratio = min(max(done / total_main, 0.0), 1.0)
+                    calculated_pct = 10 + int(ratio * 80)
+                elif isinstance(pct, (int, float)):
+                    # Pesan non-counter seperti sinkronisasi/saving tetap boleh
+                    # membawa progress Engine 8, tetapi dibatasi maksimum 98%.
+                    calculated_pct = int(pct)
 
-            calculated_pct = max(10, min(calculated_pct, 98))
-            mapped_pct = max(_engine8_progress_state['pct'], calculated_pct)
-            _engine8_progress_state['pct'] = mapped_pct
-            display_msg = re.sub(
-                r'\s*\|\s*\[progres-total\]\s*\d+\s*/\s*\d+\s*$',
-                '', text, flags=re.IGNORECASE,
+                calculated_pct = max(10, min(calculated_pct, 98))
+                mapped_pct = max(_engine8_progress_state['pct'], calculated_pct)
+                _engine8_progress_state['pct'] = mapped_pct
+                display_msg = re.sub(
+                    r'\s*\|\s*\[progres-total\]\s*\d+\s*/\s*\d+\s*$',
+                    '', text, flags=re.IGNORECASE,
+                )
+                update_ui(mapped_pct, f"Menerjemahkan dokumen...\n{display_msg}")
+
+            ok_e8, _path_e8, msg_e8 = engine8.process(
+                input_docx=engine7_out,
+                output_docx=engine8_out,
+                progress_callback=_engine8_progress,
+                worker_count=st.session_state.get('_engine8_workers', 2),
+                **_engine8_lang_kwargs(),
             )
-            update_ui(mapped_pct, f"Menerjemahkan dokumen...\n{display_msg}")
-
-        ok_e8, _path_e8, msg_e8 = engine8.process(
-            input_docx=engine7_out,
-            output_docx=engine8_out,
-            progress_callback=_engine8_progress,
-            worker_count=st.session_state.get('_engine8_workers', 2),
-            **_engine8_lang_kwargs(),
-        )
-        if not ok_e8:
+            if not ok_e8:
+                _remember_engine_output(8, engine8_out)
+                raise Exception(f"Engine 8: {msg_e8}")
             _remember_engine_output(8, engine8_out)
-            raise Exception(f"Engine 8: {msg_e8}")
-        _remember_engine_output(8, engine8_out)
 
-        update_ui(98, f"Penerjemahan selesai ✓\n{msg_e8}")
+        update_ui(98, f"Penerjemahan dilewati ✓\n{msg_e8}" if _skip_engine8() else f"Penerjemahan selesai ✓\n{msg_e8}")
 
         engine9_download_name = _engine9_download_filename(doc_title_val)
         engine9_out = f"engine9_{_sid}_{engine9_download_name}"
