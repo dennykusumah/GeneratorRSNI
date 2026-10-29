@@ -850,7 +850,9 @@ class CoverPageEngine:
         """
         doc = Document(input_docx)
         scope_index = None
-        scope_re = re.compile(r"^\s*(?:1\s+)?scope\s*$", re.IGNORECASE)
+        scope_re = re.compile(
+            r"^\s*(?:1\s+)?(?:scope|ruang\s+lingkup)\s*$", re.IGNORECASE
+        )
 
         for index, paragraph in enumerate(doc.paragraphs):
             text = re.sub(r"\s+", " ", paragraph.text or "").strip()
