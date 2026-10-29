@@ -22,10 +22,12 @@ from docx.shared import Pt
 
 class IntroductionContentTrimmerEngine:
     INTRO_RE = re.compile(r"^\s*introduction\s*$", re.IGNORECASE)
-    # Edisi IEC lama memakai heading resmi "Scope and object". Keduanya
-    # merupakan Pasal 1 dan harus diterima sebagai awal Content.
+    # Edisi IEC lama memakai heading resmi "Scope and object". Dokumen
+    # berbahasa Indonesia memakai "Ruang lingkup". Semuanya merupakan Pasal 1
+    # dan harus diterima sebagai awal Content.
     SCOPE_RE = re.compile(
-        r"^\s*(?:\d+(?:\.0)?\s+)?scope(?:\s+and\s+object)?\s*$",
+        r"^\s*(?:\d+(?:\.0)?\s+)?"
+        r"(?:scope(?:\s+and\s+object)?|ruang\s+lingkup)\s*$",
         re.IGNORECASE,
     )
     BIBLIO_RE = re.compile(r"^\s*bibliograph(?:y|ie)\s*$", re.IGNORECASE)
@@ -447,7 +449,7 @@ class IntroductionContentTrimmerEngine:
 
         if scope_idx is None and self._numbered_content_start(doc) is None:
             raise ValueError(
-                "Halaman Content tidak ditemukan: pasal 'Scope' tidak ada dan "
+                "Halaman Content tidak ditemukan: pasal 'Scope' / 'Ruang lingkup' tidak ada dan "
                 "section dengan penomoran halaman mulai dari 1 tidak ditemukan."
             )
         if biblio_idx is not None and scope_idx is not None and biblio_idx < scope_idx:
