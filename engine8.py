@@ -3528,7 +3528,19 @@ class SelectiveTranslationEngine(DocxFinalTranslatorEngine):
         progress_callback=None,
         translate_headers: bool = False,
         worker_count: int = 2,
+        source_lang: str | None = None,
+        src_lang: str | None = None,
     ) -> tuple[bool, str, str]:
+        # Bahasa Sumber = Indonesia: dokumen sudah berbahasa Indonesia, jadi
+        # TIDAK ADA penerjemahan di halaman mana pun (cover, hak cipta, daftar
+        # isi, prakata, pendahuluan, content, lampiran, bibliografi, informasi
+        # perumus SNI). Dokumen disalin apa adanya. Bahasa lain tidak berubah.
+        _lang = str(source_lang or src_lang or '').strip().lower()
+        if _lang in ('id', 'ind', 'indonesia', 'indonesian', 'bahasa indonesia'):
+            import shutil as _shutil
+            if os.path.abspath(input_docx) != os.path.abspath(output_docx):
+                _shutil.copyfile(input_docx, output_docx)
+            return True, output_docx, "Bahasa sumber Indonesia — penerjemahan dilewati."
         success, result = self.translate(
             input_docx=input_docx,
             output_docx=output_docx,
