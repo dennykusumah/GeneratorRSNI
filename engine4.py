@@ -114,7 +114,10 @@ class PrakataPendahuluanEngine:
     def _detect_content_title(self, doc: Document) -> str:
         scope_index = None
         for i, p in enumerate(doc.paragraphs):
-            if re.match(r"^\s*1\s{1,4}Scope\b", self._normalize(p.text), re.I):
+            if re.match(
+                r"^\s*1\s{1,4}(?:Scope|Ruang\s+lingkup)\b",
+                self._normalize(p.text), re.I,
+            ):
                 scope_index = i
                 break
         if scope_index is None:
